@@ -253,6 +253,15 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       } else {
         strcpy(reply, "Error, invalid params");
       }
+    } else if (memcmp(command, "sleep ", 6) == 0) {
+      int mins = atoi(&command[6]);
+      if (mins < 1 || mins > 1440) {
+        strcpy(reply, "Err - 1..1440 mins");
+      } else if (_callbacks->sleepFor((uint32_t)mins * 60000UL)) {
+        sprintf(reply, "OK - sleeping for %d mins", mins);
+      } else {
+        strcpy(reply, "Err - unsupported");
+      }
     } else if (memcmp(command, "password ", 9) == 0) {
       // change admin password
       StrHelper::strncpy(_prefs->password, &command[9], sizeof(_prefs->password));

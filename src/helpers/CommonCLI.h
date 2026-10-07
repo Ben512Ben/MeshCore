@@ -220,6 +220,10 @@ public:
   virtual void clearStats() = 0;
   virtual void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) = 0;
 
+  virtual bool sleepFor(uint32_t duration_ms) {
+    return false;  // unsupported unless overridden by the wrapper
+  }
+
   virtual void startRegionsLoad() {
     // no op by default
   }
