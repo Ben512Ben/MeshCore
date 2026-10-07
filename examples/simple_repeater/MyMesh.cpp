@@ -1308,10 +1308,14 @@ void MyMesh::loop() {
       return;
     }
     sleeping = false;
-    radio_driver.wakeFromSleep();
+    uint32_t saved_time = getRTCClock()->getCurrentTime();
+    radio_init();                       // full radio re-init (hardware reset), same as at boot
+    getRTCClock()->setCurrentTime(saved_time);  // radio_init() may touch the clock; keep the time
+    radio_driver.begin();               // re-arm receive state
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     radio_driver.setTxPower(_prefs.tx_power_dbm);
     radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+    radio_driver.setCADEnabled(_prefs.cad_enabled);
   }
 
 #ifdef WITH_BRIDGE
