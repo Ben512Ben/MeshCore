@@ -109,6 +109,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #endif
   CayenneLPP telemetry;
   unsigned long set_radio_at, revert_radio_at;
+  bool sleep_pending, sleeping;
+  unsigned long sleep_start_at, sleep_wake_at;
+  uint32_t sleep_duration_ms;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -200,6 +203,7 @@ public:
 
   // CommonCLICallbacks
   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override;
+  bool sleepFor(uint32_t duration_ms) override;
   bool formatFileSystem() override;
   void sendSelfAdvertisement(int delay_millis, bool flood) override;
   void updateAdvertTimer() override;

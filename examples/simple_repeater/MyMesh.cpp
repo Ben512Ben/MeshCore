@@ -878,6 +878,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
   set_radio_at = revert_radio_at = 0;
+  sleep_pending = sleeping = false;
+  sleep_start_at = sleep_wake_at = 0;
+  sleep_duration_ms = 0;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1013,6 +1016,13 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
   pending_cr = cr;
 
   revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000); // schedule when to revert radio params
+}
+
+bool MyMesh::sleepFor(uint32_t duration_ms) {
+  sleep_duration_ms = duration_ms;
+  sleep_start_at = futureMillis(3000);  // give CLI reply some time to be sent back, before the radio goes off
+  sleep_pending = true;
+  return true;
 }
 
 bool MyMesh::formatFileSystem() {
@@ -1285,6 +1295,25 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 }
 
 void MyMesh::loop() {
+  // manual sleep (CLI: "sleep <mins>"): radio fully off, no RX/TX, until the timer expires
+  if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork()) {
+    sleep_pending = false;
+    sleeping = true;
+    sleep_wake_at = futureMillis(sleep_duration_ms);
+    radio_driver.powerOff();
+  }
+  if (sleeping) {
+    if (!millisHasNowPassed(sleep_wake_at)) {
+      delay(500);  // idle; serial CLI (e.g. "reboot") is still serviced by main loop()
+      return;
+    }
+    sleeping = false;
+    radio_driver.wakeFromSleep();
+    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    radio_driver.setTxPower(_prefs.tx_power_dbm);
+    radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+  }
+
 #ifdef WITH_BRIDGE
   bridge.loop();
 #endif
