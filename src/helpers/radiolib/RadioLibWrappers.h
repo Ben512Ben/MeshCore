@@ -33,6 +33,7 @@ public:
 
   void begin() override;
   virtual void powerOff() { _radio->sleep(); }
+  void wakeFromSleep();   // call after powerOff(); re-arms receive on the next loop()
   int recvRaw(uint8_t* bytes, int sz) override;
   uint32_t getEstAirtimeFor(int len_bytes) override;
   bool startSendRaw(const uint8_t* bytes, int len) override;

@@ -43,6 +43,13 @@ void RadioLibWrapper::begin() {
   _floor_sample_sum = 0;
 }
 
+void RadioLibWrapper::wakeFromSleep() {
+  state = STATE_IDLE;   // trigger a startReceive()
+  _noise_floor = 0;
+  _num_floor_samples = 0;
+  _floor_sample_sum = 0;
+}
+
 uint32_t RadioLibWrapper::getRngSeed() {
   return _radio->random(0x7FFFFFFF);
 }
