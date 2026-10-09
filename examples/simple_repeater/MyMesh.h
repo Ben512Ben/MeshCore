@@ -80,6 +80,8 @@ struct NeighbourInfo {
 
 #define FIRMWARE_ROLE "repeater"
 
+#define MAX_BLOCKHOP 10   // max repeater IDs in the 'blockhop' list
+
 #define PACKET_LOG_FILE  "/packet_log"
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
@@ -112,6 +114,27 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool sleep_pending, sleeping;
   unsigned long sleep_start_at, sleep_wake_at;
   uint32_t sleep_duration_ms;
+
+  // sleep cycle + battery monitor (+ hourly battery log)
+  bool cycle_active, sleep_auto_enabled;
+  unsigned long cycle_awake_until;
+  bool batt_check_armed;
+  unsigned long next_batt_check;
+  uint8_t batt_low_count, batt_crit_count;
+  uint32_t batt_check_n;
+  uint16_t batt_log[24];
+  uint8_t batt_log_head, batt_log_count;
+
+  // 'blockhop' list (RAM only): repeaters whose relayed packets (first hop) we refuse to forward
+  struct BlockHopEntry {
+    uint8_t key[3];          // first bytes of the repeater's public key (= its path hash)
+    uint8_t len;             // 1..3 valid bytes in key, 0 = unused slot
+    bool is_auto;            // added automatically from an advert
+    uint32_t hits;           // packets blocked
+    unsigned long last_hit_ms;
+    unsigned long last_activity_ms;
+  };
+  BlockHopEntry blockhop[MAX_BLOCKHOP];
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -125,6 +148,16 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
+  bool handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply);
+  void startSleep(uint32_t duration_ms);
+  void radioSleep(uint32_t duration_ms);
+  void radioWake();
+  void stopSleepCycle();
+  void batteryMonitor();
+  void formatBattLog(char* reply);
+  bool blockHopCheck(const mesh::Packet* packet);
+  bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
+  void formatBlockHopList(char* reply);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);

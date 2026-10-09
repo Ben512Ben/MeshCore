@@ -1,6 +1,20 @@
 #include "MyMesh.h"
 #include <algorithm>
 
+/* ------------------- Sleep cycle / battery settings ------------------- */
+
+#define BATT_CHECK_MS     (5UL * 60UL * 1000UL)   // battery check interval
+#define BATT_LOW_MV       3500                    // start sleep cycle below this (3 checks in a row)
+#define BATT_LOW_COUNT    3
+#define BATT_CRIT_MV      3200                    // last resort: reboot below this (2 checks in a row)
+#define BATT_CRIT_COUNT   2                       //   so the board's boot lock takes over
+#define CYCLE_STOP_MV     4100                    // sleep cycle ends at/above this
+#define CYCLE_SLEEP_MS    (10UL * 60UL * 1000UL)  // sleep cycle: radio off
+#define CYCLE_AWAKE_MS    (2UL * 60UL * 1000UL)   // sleep cycle: radio on
+#define BRISBANE_UTC_OFFSET_SECS  (10L * 3600L)   // 'sleep until' uses Brisbane time (UTC+10, no DST)
+#define CLOCK_VALID_AFTER 1767225600UL            // 1 Jan 2026: any earlier clock is considered 'not set'
+#define CLI_REPLY_MAX     150                     // keep replies well inside the 160 byte CLI buffer
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -131,6 +145,8 @@ uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secr
   if (is_flood) {
     client->out_path_len = OUT_PATH_UNKNOWN;  // need to rediscover out_path
   }
+
+  if (client->isAdmin()) stopSleepCycle();   // an admin login ends a running sleep cycle
 
   uint32_t now = getRTCClock()->getCurrentTimeUnique();
   memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
@@ -433,6 +449,7 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   if (_prefs.disable_fwd) return false;
+  if (packet->isRouteFlood() && blockHopCheck(packet)) return false;   // first relay is on the blockhop list
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
     return false;
@@ -650,6 +667,15 @@ static bool isShare(const mesh::Packet *packet) {
 void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32_t timestamp,
                           const uint8_t *app_data, size_t app_data_len) {
   mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len); // chain to super impl
+
+  // blockhop auto-add: a repeater advertising a location in the northern hemisphere (we are in Brisbane)
+  {
+    AdvertDataParser loc_parser(app_data, app_data_len);
+    if (loc_parser.isValid() && loc_parser.getType() == ADV_TYPE_REPEATER
+        && loc_parser.hasLatLon() && loc_parser.getIntLat() > 0) {
+      blockHopAdd(id.pub_key, 3, true);
+    }
+  }
 
   // if this a zero hop advert (and not via 'Share'), add it to neighbours
   if (packet->getPathHashCount() == 0 && !isShare(packet)) {
@@ -881,6 +907,15 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   sleep_pending = sleeping = false;
   sleep_start_at = sleep_wake_at = 0;
   sleep_duration_ms = 0;
+  cycle_active = false;
+  sleep_auto_enabled = true;   // low-voltage auto-start is ON after every boot
+  cycle_awake_until = 0;
+  batt_check_armed = false;
+  next_batt_check = 0;
+  batt_low_count = batt_crit_count = 0;
+  batt_check_n = 0;
+  batt_log_head = batt_log_count = 0;
+  memset(blockhop, 0, sizeof(blockhop));
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1018,11 +1053,344 @@ void MyMesh::applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, 
   revert_radio_at = futureMillis(2000 + timeout_mins * 60 * 1000); // schedule when to revert radio params
 }
 
-bool MyMesh::sleepFor(uint32_t duration_ms) {
+/* ------------------------- sleep / battery / blockhop ------------------------- */
+
+static void fmtAge(char* out, size_t n, unsigned long ms) {
+  unsigned long s = ms / 1000UL;
+  if (s < 60) snprintf(out, n, "%lus", s);
+  else if (s < 3600) snprintf(out, n, "%lum", s / 60);
+  else if (s < 86400) snprintf(out, n, "%luh", s / 3600);
+  else snprintf(out, n, "%lud", s / 86400);
+}
+
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// parse 2, 4 or 6 hex chars into 1..3 bytes. returns number of bytes, or 0 if invalid
+static int parseHexId(const char* s, uint8_t* key) {
+  size_t n = strlen(s);
+  if (n != 2 && n != 4 && n != 6) return 0;
+  for (size_t i = 0; i < n; i += 2) {
+    int hi = hexNibble(s[i]);
+    int lo = hexNibble(s[i + 1]);
+    if (hi < 0 || lo < 0) return 0;
+    key[i / 2] = (uint8_t)((hi << 4) | lo);
+  }
+  return (int)(n / 2);
+}
+
+#ifdef HELTEC_T096
+// Heltec T096: switch the LoRa front-end chip (KCT8103L) fully off while the radio sleeps.
+static void t096FrontEndOff() {
+  board.loRaFEMControl.setSleepModeEnable();      // front-end shutdown pin low first
+  nrf_gpio_cfg_default(P_LORA_KCT8103L_PA_CSD);   // release control pins (no leakage into an unpowered chip)
+  nrf_gpio_cfg_default(P_LORA_KCT8103L_PA_CTX);
+  digitalWrite(P_LORA_PA_POWER, LOW);             // cut the front-end supply
+#ifdef PIN_GPS_EN
+  nrf_gpio_cfg_default(PIN_GPS_EN);               // same as T096Board::powerOff(): GPS enable pin ~363uA -> ~39uA
+#endif
+}
+
+static void t096FrontEndOn() {
+#ifdef PIN_GPS_EN
+  pinMode(PIN_GPS_EN, OUTPUT);
+  digitalWrite(PIN_GPS_EN, !PIN_GPS_EN_ACTIVE);   // GPS stays off (same state as T096Board::initiateShutdown)
+#endif
+  board.loRaFEMControl.init();                    // supply on, 1ms, enable, RX mode - same as at boot
+}
+#endif
+
+void MyMesh::startSleep(uint32_t duration_ms) {
   sleep_duration_ms = duration_ms;
   sleep_start_at = futureMillis(3000);  // give CLI reply some time to be sent back, before the radio goes off
   sleep_pending = true;
+}
+
+bool MyMesh::sleepFor(uint32_t duration_ms) {   // (CommonCLI hook; 'sleep <mins>' is handled in handleSleepCommands)
+  cycle_active = false;   // a manual sleep overrides a running cycle
+  startSleep(duration_ms);
   return true;
+}
+
+void MyMesh::radioSleep(uint32_t duration_ms) {
+  sleeping = true;
+  sleep_wake_at = futureMillis(duration_ms);
+  radio_driver.powerOff();
+#ifdef HELTEC_T096
+  t096FrontEndOff();
+#endif
+}
+
+void MyMesh::radioWake() {
+  sleeping = false;
+  uint32_t saved_time = getRTCClock()->getCurrentTime();
+#ifdef HELTEC_T096
+  t096FrontEndOn();                   // front-end chip must be powered before the radio restarts
+#endif
+  radio_init();                       // full radio re-init (hardware reset), same as at boot
+  getRTCClock()->setCurrentTime(saved_time);  // radio_init() may touch the clock; keep the time
+  radio_driver.begin();               // re-arm receive state
+  radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  radio_driver.setTxPower(_prefs.tx_power_dbm);
+  radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+  radio_driver.setCADEnabled(_prefs.cad_enabled);
+}
+
+void MyMesh::stopSleepCycle() {
+  if (!cycle_active) return;
+  if (sleep_pending) sleep_pending = false;   // cycle's first sleep hasn't started yet: cancel it
+  cycle_active = false;
+  batt_low_count = 0;   // auto-start needs 3 fresh low readings
+}
+
+void MyMesh::batteryMonitor() {
+  uint16_t mv = board.getBattMilliVolts();
+  if (mv < 1000) return;   // implausible reading (e.g. no battery): ignore
+
+  if ((batt_check_n % 12) == 0) {   // hourly log (every 12th check)
+    batt_log[batt_log_head] = mv;
+    batt_log_head = (batt_log_head + 1) % 24;
+    if (batt_log_count < 24) batt_log_count++;
+  }
+  batt_check_n++;
+
+  // last resort: reboot so the board's boot lock (below 3.3V) puts the node into deep sleep
+  if (mv < BATT_CRIT_MV) {
+    if (++batt_crit_count >= BATT_CRIT_COUNT) board.reboot();   // doesn't return
+  } else {
+    batt_crit_count = 0;
+  }
+
+  // low battery: start the sleep cycle
+  if (mv < BATT_LOW_MV) {
+    if (batt_low_count < 255) batt_low_count++;
+  } else {
+    batt_low_count = 0;
+  }
+  if (sleep_auto_enabled && batt_low_count >= BATT_LOW_COUNT && !cycle_active && !sleeping && !sleep_pending) {
+    cycle_active = true;
+    startSleep(CYCLE_SLEEP_MS);
+  }
+}
+
+void MyMesh::formatBattLog(char* reply) {
+  if (batt_log_count == 0) {
+    strcpy(reply, "battlog: no data yet (first reading 5 min after boot)");
+    return;
+  }
+  int pos = snprintf(reply, 20, "V/h old>new:");
+  for (int i = 0; i < batt_log_count; i++) {
+    int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+    unsigned mv = batt_log[idx];
+    pos += snprintf(&reply[pos], 8, " %u.%02u", mv / 1000, (mv % 1000) / 10);
+  }
+}
+
+bool MyMesh::blockHopCheck(const mesh::Packet* packet) {
+  uint8_t hs = packet->getPathHashSize();
+  if (hs == 0 || packet->getPathHashCount() == 0) return false;   // heard direct: no first hop
+  for (int i = 0; i < MAX_BLOCKHOP; i++) {
+    BlockHopEntry& e = blockhop[i];
+    if (e.len == 0) continue;
+    uint8_t n = e.len < hs ? e.len : hs;
+    if (memcmp(e.key, packet->path, n) == 0) {
+      unsigned long now = millis();
+      e.hits++;
+      e.last_hit_ms = now;
+      e.last_activity_ms = now;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool MyMesh::blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto) {
+  if (len < 1 || len > 3) return false;
+  unsigned long now = millis();
+  int free_idx = -1, oldest_idx = -1;
+  unsigned long oldest_age = 0;
+  for (int i = 0; i < MAX_BLOCKHOP; i++) {
+    BlockHopEntry& e = blockhop[i];
+    if (e.len == 0) {
+      if (free_idx < 0) free_idx = i;
+      continue;
+    }
+    if (e.len == len && memcmp(e.key, key, len) == 0) {   // already listed: refresh its activity
+      e.last_activity_ms = now;
+      if (!is_auto) e.is_auto = false;
+      return true;
+    }
+    unsigned long age = now - e.last_activity_ms;
+    if (oldest_idx < 0 || age > oldest_age) {
+      oldest_idx = i;
+      oldest_age = age;
+    }
+  }
+  int idx = (free_idx >= 0) ? free_idx : oldest_idx;   // full: replace the entry with the oldest activity
+  BlockHopEntry& e = blockhop[idx];
+  memset(&e, 0, sizeof(e));
+  memcpy(e.key, key, len);
+  e.len = len;
+  e.is_auto = is_auto;
+  e.last_activity_ms = now;
+  return true;
+}
+
+void MyMesh::formatBlockHopList(char* reply) {
+  int total = 0, shown = 0;
+  for (int i = 0; i < MAX_BLOCKHOP; i++) {
+    if (blockhop[i].len) total++;
+  }
+  if (total == 0) {
+    strcpy(reply, "blockhop: list empty");
+    return;
+  }
+  unsigned long now = millis();
+  size_t pos = 0;
+  reply[0] = 0;
+  for (int i = 0; i < MAX_BLOCKHOP; i++) {
+    const BlockHopEntry& e = blockhop[i];
+    if (e.len == 0) continue;
+    char id[8];
+    for (int j = 0; j < e.len; j++) sprintf(&id[j * 2], "%02X", e.key[j]);
+    char age[12];
+    if (e.hits) fmtAge(age, sizeof(age), now - e.last_hit_ms);
+    else strcpy(age, "-");
+    char item[48];
+    snprintf(item, sizeof(item), "%s%s x%lu %s%s", pos ? " | " : "", id, (unsigned long)e.hits, age,
+             e.is_auto ? " A" : "");
+    size_t il = strlen(item);
+    if (pos + il > CLI_REPLY_MAX - 8) break;   // keep room for the "+N" tail
+    memcpy(&reply[pos], item, il + 1);
+    pos += il;
+    shown++;
+  }
+  if (shown < total) snprintf(&reply[pos], 12, " +%d", total - shown);
+}
+
+bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply) {
+  size_t cl = strlen(command);
+  while (cl > 0 && command[cl - 1] == ' ') command[--cl] = 0;   // trim trailing spaces
+
+  if (strcmp(command, "sleep cycle on") == 0) {
+    if (cycle_active) {
+      strcpy(reply, "sleep cycle already running");
+      return true;
+    }
+    unsigned mv = board.getBattMilliVolts();
+    if (mv >= CYCLE_STOP_MV) {
+      snprintf(reply, 60, "Err - battery %u.%02uV is at/above %u.%02uV", mv / 1000, (mv % 1000) / 10,
+               CYCLE_STOP_MV / 1000, (CYCLE_STOP_MV % 1000) / 10);
+      return true;
+    }
+    cycle_active = true;
+    startSleep(CYCLE_SLEEP_MS);
+    strcpy(reply, "sleep cycle started");
+    return true;
+  }
+
+  if (strcmp(command, "sleep auto on") == 0 || strcmp(command, "sleep auto off") == 0) {
+    sleep_auto_enabled = (command[11] == 'o' && command[12] == 'n');
+    strcpy(reply, sleep_auto_enabled ? "OK - sleep auto on" : "OK - sleep auto off");
+    return true;
+  }
+
+  if (memcmp(command, "sleep until ", 12) == 0) {   // 'sleep until HH:MM' (Brisbane time)
+    const char* p = &command[12];
+    const char* colon = strchr(p, ':');
+    if (colon == NULL || p[0] < '0' || p[0] > '9' || colon[1] < '0' || colon[1] > '9') {
+      strcpy(reply, "Err - use: sleep until HH:MM (Brisbane time)");
+      return true;
+    }
+    int hh = atoi(p);
+    int mm = atoi(colon + 1);
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+      strcpy(reply, "Err - use: sleep until HH:MM (Brisbane time)");
+      return true;
+    }
+    uint32_t now = getRTCClock()->getCurrentTime();
+    bool synced = false;
+    if (sender_timestamp > now) {   // same rule as 'clock sync': only ever move the clock forward
+      getRTCClock()->setCurrentTime(sender_timestamp + 1);
+      now = getRTCClock()->getCurrentTime();
+      synced = true;
+    }
+    if (now < CLOCK_VALID_AFTER) {
+      strcpy(reply, "Err - clock not set, use: clock sync");
+      return true;
+    }
+    uint32_t sod = (now + BRISBANE_UTC_OFFSET_SECS) % 86400UL;   // seconds since local midnight
+    uint32_t target = (uint32_t)hh * 3600UL + (uint32_t)mm * 60UL;
+    uint32_t diff = (target + 86400UL - sod) % 86400UL;
+    if (diff == 0) diff = 86400UL;
+    if (diff < 60) {
+      strcpy(reply, "Err - too soon (under 1 min)");
+      return true;
+    }
+    cycle_active = false;   // a manual sleep overrides a running cycle
+    startSleep(diff * 1000UL - 3000UL);   // the radio goes off 3s after the reply
+    snprintf(reply, 100, "OK - sleeping until %02d:%02d (%lu mins)%s", hh, mm, (unsigned long)((diff + 30) / 60),
+             synced ? ", clock synced" : "");
+    return true;
+  }
+
+  if (memcmp(command, "sleep ", 6) == 0) {   // 'sleep <minutes>'
+    int mins = atoi(&command[6]);
+    if (mins < 1 || mins > 1440) {
+      strcpy(reply, "Err - 1..1440 mins");
+    } else {
+      cycle_active = false;   // a manual sleep overrides a running cycle
+      startSleep((uint32_t)mins * 60000UL);
+      sprintf(reply, "OK - sleeping for %d mins", mins);
+    }
+    return true;
+  }
+
+  if (strcmp(command, "battlog") == 0) {
+    formatBattLog(reply);
+    return true;
+  }
+
+  if (memcmp(command, "blockhop", 8) == 0 && (command[8] == 0 || command[8] == ' ')) {
+    const char* sub = command + 8;
+    while (*sub == ' ') sub++;
+    if (strcmp(sub, "list") == 0) {
+      formatBlockHopList(reply);
+    } else if (strcmp(sub, "clear") == 0) {
+      memset(blockhop, 0, sizeof(blockhop));
+      strcpy(reply, "OK - blockhop cleared");
+    } else if (memcmp(sub, "add ", 4) == 0 || memcmp(sub, "remove ", 7) == 0) {
+      bool is_add = (sub[0] == 'a');
+      const char* hex = sub + (is_add ? 4 : 7);
+      while (*hex == ' ') hex++;
+      uint8_t key[3];
+      int len = parseHexId(hex, key);
+      if (len == 0) {
+        strcpy(reply, "Err - id must be 2, 4 or 6 hex chars");
+      } else if (is_add) {
+        blockHopAdd(key, (uint8_t)len, false);
+        strcpy(reply, "OK - blocked");
+      } else {
+        int removed = 0;
+        for (int i = 0; i < MAX_BLOCKHOP; i++) {
+          if (blockhop[i].len == len && memcmp(blockhop[i].key, key, len) == 0) {
+            memset(&blockhop[i], 0, sizeof(blockhop[i]));
+            removed++;
+          }
+        }
+        strcpy(reply, removed ? "OK - removed" : "Err - not in list");
+      }
+    } else {
+      strcpy(reply, "Err - blockhop add|remove|list|clear");
+    }
+    return true;
+  }
+
+  return false;
 }
 
 bool MyMesh::formatFileSystem() {
@@ -1246,6 +1614,8 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     command += 3;
   }
 
+  if (handleSleepCommands(sender_timestamp, command, reply)) return;   // sleep*, battlog, blockhop
+
   // handle ACL related commands
   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
     char* hex = &command[8];
@@ -1295,27 +1665,39 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 }
 
 void MyMesh::loop() {
-  // manual sleep (CLI: "sleep <mins>"): radio fully off, no RX/TX, until the timer expires
+  // battery monitor: every 5 min (also runs while the radio sleeps)
+  if (!batt_check_armed) {
+    batt_check_armed = true;
+    next_batt_check = futureMillis(BATT_CHECK_MS);
+  } else if (millisHasNowPassed(next_batt_check)) {
+    next_batt_check = futureMillis(BATT_CHECK_MS);
+    batteryMonitor();
+  }
+
+  // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
   if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork()) {
     sleep_pending = false;
-    sleeping = true;
-    sleep_wake_at = futureMillis(sleep_duration_ms);
-    radio_driver.powerOff();
+    radioSleep(sleep_duration_ms);
   }
   if (sleeping) {
     if (!millisHasNowPassed(sleep_wake_at)) {
       delay(500);  // idle; serial CLI (e.g. "reboot") is still serviced by main loop()
       return;
     }
-    sleeping = false;
-    uint32_t saved_time = getRTCClock()->getCurrentTime();
-    radio_init();                       // full radio re-init (hardware reset), same as at boot
-    getRTCClock()->setCurrentTime(saved_time);  // radio_init() may touch the clock; keep the time
-    radio_driver.begin();               // re-arm receive state
-    radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    radio_driver.setTxPower(_prefs.tx_power_dbm);
-    radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
-    radio_driver.setCADEnabled(_prefs.cad_enabled);
+    radioWake();
+    if (cycle_active) {   // start of an awake window
+      cycle_awake_until = futureMillis(CYCLE_AWAKE_MS);
+      unsigned mv = board.getBattMilliVolts();
+      if (mv >= CYCLE_STOP_MV) {   // charged: leave the sleep cycle and announce we are back
+        stopSleepCycle();
+        sendSelfAdvertisement(2000, true);
+      }
+    }
+  }
+  // end of an awake window: back to sleep (an admin login stops the cycle before this)
+  if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork()) {
+    radioSleep(CYCLE_SLEEP_MS);
+    return;
   }
 
 #ifdef WITH_BRIDGE
