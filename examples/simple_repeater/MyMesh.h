@@ -123,6 +123,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t batt_low_count, batt_crit_count;
   uint32_t batt_check_n;
   uint16_t batt_log[24];
+  int16_t temp_log[24];   // chip temperature, tenths of a degree C (INT16_MIN = no reading)
   uint8_t batt_log_head, batt_log_count;
 
   // 'blockhop' list (RAM only): repeaters whose relayed packets (first hop) we refuse to forward
@@ -155,6 +156,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void stopSleepCycle();
   void batteryMonitor();
   void formatBattLog(char* reply);
+  void formatTempLog(char* reply);
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
   void formatBlockHopList(char* reply);

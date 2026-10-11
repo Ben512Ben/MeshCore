@@ -915,6 +915,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   batt_low_count = batt_crit_count = 0;
   batt_check_n = 0;
   batt_log_head = batt_log_count = 0;
+  memset(temp_log, 0, sizeof(temp_log));
   memset(blockhop, 0, sizeof(blockhop));
   _logging = false;
   region_load_active = false;
@@ -1153,6 +1154,8 @@ void MyMesh::batteryMonitor() {
 
   if ((batt_check_n % 12) == 0) {   // hourly log (every 12th check)
     batt_log[batt_log_head] = mv;
+    float t = board.getMCUTemperature();   // chip temperature (NAN on boards without a sensor)
+    temp_log[batt_log_head] = isnan(t) ? INT16_MIN : (int16_t)(t * 10.0f + (t >= 0 ? 0.5f : -0.5f));
     batt_log_head = (batt_log_head + 1) % 24;
     if (batt_log_count < 24) batt_log_count++;
   }
@@ -1187,6 +1190,25 @@ void MyMesh::formatBattLog(char* reply) {
     int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
     unsigned mv = batt_log[idx];
     pos += snprintf(&reply[pos], 8, " %u.%02u", mv / 1000, (mv % 1000) / 10);
+  }
+}
+
+void MyMesh::formatTempLog(char* reply) {
+  if (batt_log_count == 0) {
+    strcpy(reply, "templog: no data yet (first reading 5 min after boot)");
+    return;
+  }
+  int pos = snprintf(reply, 20, "C/h old>new:");
+  for (int i = 0; i < batt_log_count; i++) {
+    int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+    int v = temp_log[idx];
+    if (pos > CLI_REPLY_MAX - 10) break;   // never overrun the reply buffer
+    if (temp_log[idx] == INT16_MIN) {
+      pos += snprintf(&reply[pos], 4, " ?");
+    } else {
+      int a = v < 0 ? -v : v;
+      pos += snprintf(&reply[pos], 10, " %s%d.%d", v < 0 ? "-" : "", a / 10, a % 10);
+    }
   }
 }
 
@@ -1352,6 +1374,11 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
 
   if (strcmp(command, "battlog") == 0) {
     formatBattLog(reply);
+    return true;
+  }
+
+  if (strcmp(command, "templog") == 0) {
+    formatTempLog(reply);
     return true;
   }
 
