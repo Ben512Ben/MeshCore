@@ -81,6 +81,8 @@ struct NeighbourInfo {
 #define FIRMWARE_ROLE "repeater"
 
 #define MAX_BLOCKHOP 10   // max repeater IDs in the 'blockhop' list
+#define CHAN_Q_MAX   6    // channel messages waiting to be posted
+#define CHAN_MSG_MAX 150  // max bytes of a channel message ("name: text")
 
 #define PACKET_LOG_FILE  "/packet_log"
 
@@ -136,6 +138,32 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
     unsigned long last_activity_ms;
   };
   BlockHopEntry blockhop[MAX_BLOCKHOP];
+
+  // warnings / notices
+  uint8_t hot_count;
+  bool hot_msg_sent, crit_msg_sent;
+  uint8_t blk_pending[MAX_BLOCKHOP][3];   // newly auto-blocked IDs not yet announced
+  uint8_t blk_pending_len[MAX_BLOCKHOP];
+  uint8_t blk_pending_n;
+  bool blk_msg_armed;
+  unsigned long blk_next_msg;
+  unsigned long sleep_deadline;           // sleep starts at the latest here, even if channel messages are still queued
+
+  // channel posting (key is kept in RAM only, lost on reboot)
+  bool chan_key_set;
+  uint8_t chan_key_len;
+  mesh::GroupChannel chan;
+  struct ChanQueued {
+    char text[CHAN_MSG_MAX + 1];
+    uint32_t gap_after_ms;
+    bool is_report;
+  };
+  ChanQueued chan_q[CHAN_Q_MAX];
+  uint8_t chan_q_n;
+  bool chan_gap_on;
+  unsigned long chan_next_send_at;
+  bool report_armed;
+  unsigned long report_due_at;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -160,6 +188,14 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
   void formatBlockHopList(char* reply);
+  bool setChannelKey(const char* key);
+  bool postChannel(const char* text);
+  void chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report = false);
+  void chanDropReports();
+  void chanService();
+  void dailyReport();
+  void noteAutoBlock(const uint8_t* key, uint8_t len);
+  void blockNoticeService();
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
