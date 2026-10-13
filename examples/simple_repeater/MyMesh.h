@@ -164,6 +164,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long chan_next_send_at;
   bool report_armed;
   unsigned long report_due_at;
+  uint32_t last_cmd_ts;   // newest channel command accepted (older/equal ones are ignored: replay protection)
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -196,6 +197,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void dailyReport();
   void noteAutoBlock(const uint8_t* key, uint8_t len);
   void blockNoticeService();
+  void handleChannelCommand(const char* text, uint32_t ts);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -248,6 +250,8 @@ protected:
   void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len);
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
+  int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) override;
+  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onControlDataRecv(mesh::Packet* packet) override;
 

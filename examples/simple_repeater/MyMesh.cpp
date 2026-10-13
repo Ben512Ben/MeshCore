@@ -940,6 +940,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   chan_next_send_at = 0;
   report_armed = false;
   report_due_at = 0;
+  last_cmd_ts = 0;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1158,6 +1159,20 @@ static void trimLogToFit(char* buf, int hdr_len, int prefix_len) {
     if (p == NULL) break;
     memmove(buf + hdr_len, p, strlen(p) + 1);
   }
+}
+
+static int lowerc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+// true if s ends with " <target>" (case-insensitive). cmd_len = length of the command in front of it
+static bool endsWithTarget(const char* s, int slen, const char* target, int* cmd_len) {
+  int tl = (int)strlen(target);
+  if (tl == 0 || slen < tl + 2) return false;
+  if (s[slen - tl - 1] != ' ') return false;
+  for (int i = 0; i < tl; i++) {
+    if (lowerc(s[slen - tl + i]) != lowerc(target[i])) return false;
+  }
+  *cmd_len = slen - tl - 1;
+  return true;
 }
 
 #ifdef HELTEC_T096
@@ -1532,6 +1547,69 @@ void MyMesh::blockNoticeService() {   // at most one notice an hour, listing eve
   blk_msg_armed = true;
   blk_next_msg = futureMillis(BLOCK_NOTICE_GAP_MS);
   chanEnqueue(msg, CHAN_GAP_MS);
+}
+
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
+  if (chan_key_set && max_matches > 0 && chan.hash[0] == hash[0]) {
+    channels[0] = chan;
+    return 1;
+  }
+  return 0;   // no key set: channel messages are not read
+}
+
+void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+  if (type != PAYLOAD_TYPE_GRP_TXT || len < 6) return;
+  if ((data[4] >> 2) != 0) return;   // plain text only
+  uint32_t ts;
+  memcpy(&ts, data, 4);
+  data[len] = 0;   // text is padded with zeroes (same as BaseChatMesh::onGroupDataRecv)
+  handleChannelCommand((const char*)&data[5], ts);
+}
+
+// channel commands look like  <battlog all>  <templog Tuna>  <sleep until 21:00 all>
+void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
+  const char* body = strstr(text, ": ");   // "<sender>: <message>"
+  if (body == NULL) return;
+  body += 2;
+  while (*body == ' ') body++;
+  int n = (int)strlen(body);
+  while (n > 0 && body[n - 1] == ' ') n--;
+  if (n < 5 || body[0] != '<' || body[n - 1] != '>') return;
+  int inner = n - 2;
+  if (inner > CHAN_MSG_MAX) return;
+  char buf[CHAN_MSG_MAX + 1];
+  memcpy(buf, body + 1, inner);
+  buf[inner] = 0;
+
+  int cmd_len = -1;   // addressed to everyone, or to this repeater by name?
+  if (!endsWithTarget(buf, inner, "all", &cmd_len) && !endsWithTarget(buf, inner, _prefs.node_name, &cmd_len)) return;
+  while (cmd_len > 0 && buf[cmd_len - 1] == ' ') cmd_len--;
+  buf[cmd_len] = 0;
+
+  bool timed_sleep = (strncmp(buf, "sleep until ", 12) == 0) || (strncmp(buf, "sleep ", 6) == 0 && buf[6] >= '0' && buf[6] <= '9');
+  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "templog") == 0
+                 || strcmp(buf, "blockhop list") == 0 || strcmp(buf, "sleep cycle on") == 0
+                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0;
+  if (!allowed) return;   // only these commands can be given over the channel
+
+  if (ts <= last_cmd_ts) return;   // replayed or duplicate command
+  last_cmd_ts = ts;
+
+  char reply[192];
+  reply[0] = 0;
+  if (!handleSleepCommands(0, buf, reply)) return;   // (0 = no clock sync from channel messages)
+  if (timed_sleep && strncmp(reply, "OK", 2) == 0) reply[0] = 0;   // its "Sleeping ..." notice is already queued
+  if (reply[0] != 0) {
+    if ((reply[0] == 'V' || reply[0] == 'C') && reply[1] == '/') {   // battlog / templog line: make it fit
+      int prefix = (int)strlen(_prefs.node_name) + 2;
+      if (prefix > 39) prefix = 39;
+      trimLogToFit(reply, 12, prefix);
+    }
+    chanEnqueue(reply, CHAN_GAP_MS);
+  }
+  // every repeater answers a command for 'all': spread the replies out by a random 5..60 seconds
+  chan_gap_on = true;
+  chan_next_send_at = futureMillis(getRNG()->nextInt(5000, 60001));
 }
 
 bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply) {
