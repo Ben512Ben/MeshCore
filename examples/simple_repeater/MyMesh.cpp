@@ -947,6 +947,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   sleep_target_abs = false;
   busy_armed = false;
   busy_until = 0;
+  boot_notice_pending = true;   // announce the (re)start on the channel
+  boot_notice_armed = false;
+  boot_notice_at = 0;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1679,6 +1682,8 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
   }
   bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
+                 || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
+                 || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
                  || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
                  || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
                  || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
@@ -2214,6 +2219,18 @@ void MyMesh::loop() {
     batteryMonitor();
   }
 
+  if (boot_notice_pending) {   // 'Rebooted' notice 20 to 60 seconds after start-up (needs the saved channel key)
+    if (!boot_notice_armed) {
+      boot_notice_armed = true;
+      boot_notice_at = futureMillis(getRNG()->nextInt(20000, 60001));
+    } else if (millisHasNowPassed(boot_notice_at)) {
+      boot_notice_pending = false;
+      unsigned mv = board.getBattMilliVolts();
+      char msg[CHAN_MSG_MAX + 1];
+      snprintf(msg, sizeof(msg), "Rebooted, battery %u.%02uV", mv / 1000, (mv % 1000) / 10);
+      chanEnqueue(msg, CHAN_GAP_MS);
+    }
+  }
   dailyReport();           // 24h report timer (counts while asleep too)
   blockNoticeService();    // announce newly auto-blocked repeaters
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
@@ -2260,6 +2277,13 @@ void MyMesh::loop() {
         chan_gap_on = true;
         chan_next_send_at = futureMillis(getRNG()->nextInt(2000, 20001));   // spread out nodes that wake together
       }
+    } else {   // woke from "sleep <minutes>" or "sleep until"
+      unsigned mv = board.getBattMilliVolts();
+      char msg[CHAN_MSG_MAX + 1];
+      snprintf(msg, sizeof(msg), "Awake from sleep, battery %u.%02uV", mv / 1000, (mv % 1000) / 10);
+      chanEnqueue(msg, CHAN_GAP_MS);
+      chan_gap_on = true;
+      chan_next_send_at = futureMillis(getRNG()->nextInt(2000, 20001));   // spread out nodes that wake together
     }
   }
   // end of an awake window: back to sleep (an admin login stops the cycle before this)

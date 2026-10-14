@@ -172,6 +172,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool sleep_target_abs;
   bool busy_armed;                 // sending seen recently ...
   unsigned long busy_until;        // ... radio stays on until a quiet period has passed
+  bool boot_notice_pending, boot_notice_armed;   // 'Rebooted' channel message after start-up
+  unsigned long boot_notice_at;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
