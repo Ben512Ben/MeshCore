@@ -9,8 +9,8 @@
 #define BATT_CRIT_MV      3200                    // last resort: reboot below this (2 checks in a row)
 #define BATT_CRIT_COUNT   2                       //   so the board's boot lock takes over
 #define CYCLE_STOP_MV     4100                    // sleep cycle ends at/above this
-#define CYCLE_SLEEP_MS    (10UL * 60UL * 1000UL)  // sleep cycle: radio off
-#define CYCLE_AWAKE_MS    (2UL * 60UL * 1000UL)   // sleep cycle: radio on
+#define CYCLE_SLEEP_MS    (57UL * 60UL * 1000UL)  // sleep cycle: radio off
+#define CYCLE_AWAKE_MS    (3UL * 60UL * 1000UL)   // sleep cycle: radio on
 #define BRISBANE_UTC_OFFSET_SECS  (10L * 3600L)   // 'sleep until' uses Brisbane time (UTC+10, no DST)
 #define CLOCK_VALID_AFTER 1767225600UL            // 1 Jan 2026: any earlier clock is considered 'not set'
 #define CLI_REPLY_MAX     150                     // keep replies well inside the 160 byte CLI buffer
@@ -23,6 +23,7 @@
 #define CHAN_PAIR_GAP_MS  10000                   // gap between the two daily report messages
 #define BLOCK_NOTICE_GAP_MS (60UL * 60UL * 1000UL)  // at most one auto-block notice per hour
 #define SLEEP_MSG_WAIT_MS 120000                  // sleep waits at most this long for queued channel messages
+#define TX_QUIET_MS       6000                    // radio never goes to sleep until this long after the last queued send
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -941,6 +942,11 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   report_armed = false;
   report_due_at = 0;
   last_cmd_ts = 0;
+  from_channel = false;
+  sleep_target_at = 0;
+  sleep_target_abs = false;
+  busy_armed = false;
+  busy_until = 0;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1011,6 +1017,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   // TODO: key_store.begin();
   region_map.load(_fs);
+  loadChannelKey();   // channel key saved by 'channel set'
 
   // establish default-scope
   {
@@ -1196,8 +1203,10 @@ static void t096FrontEndOn() {
 }
 #endif
 
-void MyMesh::startSleep(uint32_t duration_ms) {
+void MyMesh::startSleep(uint32_t duration_ms, bool absolute) {
   sleep_duration_ms = duration_ms;
+  sleep_target_abs = absolute;                    // 'sleep until': wake time counts from the command, not from when the radio goes off
+  sleep_target_at = futureMillis(duration_ms);
   sleep_start_at = futureMillis(3000);  // give CLI reply some time to be sent back, before the radio goes off
   sleep_deadline = futureMillis(3000 + SLEEP_MSG_WAIT_MS);   // ... and queued channel messages some time to go out
   sleep_pending = true;
@@ -1285,11 +1294,13 @@ void MyMesh::batteryMonitor() {
   }
 
   // last resort: reboot so the board's boot lock (below 3.3V) puts the node into deep sleep
+#ifdef NRF52_POWER_MANAGEMENT   // (only boards with the nRF52 boot lock; elsewhere a reboot would not help)
   if (mv < BATT_CRIT_MV) {
     if (++batt_crit_count >= BATT_CRIT_COUNT) board.reboot();   // doesn't return
   } else {
     batt_crit_count = 0;
   }
+#endif
 
   // low battery: start the sleep cycle
   if (mv < BATT_LOW_MV) {
@@ -1389,8 +1400,8 @@ bool MyMesh::blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto) {
   return true;
 }
 
-void MyMesh::formatBlockHopList(char* reply) {
-  int total = 0, shown = 0;
+void MyMesh::formatBlockHopList(char* reply, int page) {
+  int total = 0;
   for (int i = 0; i < MAX_BLOCKHOP; i++) {
     if (blockhop[i].len) total++;
   }
@@ -1398,12 +1409,22 @@ void MyMesh::formatBlockHopList(char* reply) {
     strcpy(reply, "blockhop: list empty");
     return;
   }
+  int pages = (total + BLOCKHOP_PER_PAGE - 1) / BLOCKHOP_PER_PAGE;
+  if (page < 1) page = 1;
+  if (page > pages) page = pages;
+  int skip = (page - 1) * BLOCKHOP_PER_PAGE;
+  int shown = 0;
   unsigned long now = millis();
   size_t pos = 0;
   reply[0] = 0;
   for (int i = 0; i < MAX_BLOCKHOP; i++) {
     const BlockHopEntry& e = blockhop[i];
     if (e.len == 0) continue;
+    if (skip > 0) {
+      skip--;
+      continue;
+    }
+    if (shown >= BLOCKHOP_PER_PAGE) break;
     char id[8];
     for (int j = 0; j < e.len; j++) sprintf(&id[j * 2], "%02X", e.key[j]);
     char age[12];
@@ -1413,12 +1434,52 @@ void MyMesh::formatBlockHopList(char* reply) {
     snprintf(item, sizeof(item), "%s%s x%lu %s%s", pos ? " | " : "", id, (unsigned long)e.hits, age,
              e.is_auto ? " A" : "");
     size_t il = strlen(item);
-    if (pos + il > CLI_REPLY_MAX - 8) break;   // keep room for the "+N" tail
+    if (pos + il > CLI_REPLY_MAX - 8) break;
     memcpy(&reply[pos], item, il + 1);
     pos += il;
     shown++;
   }
-  if (shown < total) snprintf(&reply[pos], 12, " +%d", total - shown);
+  if (pages > 1) snprintf(&reply[pos], 12, " p%d/%d", page, pages);
+}
+
+void MyMesh::saveChannelKey() {   // /chan_key: 1 byte key length + 32 bytes key
+  if (_fs == NULL || !chan_key_set) return;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(CHAN_KEY_FILE);
+  File f = _fs->open(CHAN_KEY_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(CHAN_KEY_FILE, "w");
+#else
+  File f = _fs->open(CHAN_KEY_FILE, "w", true);
+#endif
+  if (f) {
+    uint8_t buf[33];
+    buf[0] = chan_key_len;
+    memcpy(&buf[1], chan.secret, 32);
+    f.write(buf, sizeof(buf));
+    f.close();
+  }
+}
+
+void MyMesh::loadChannelKey() {
+  if (_fs == NULL || !_fs->exists(CHAN_KEY_FILE)) return;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(CHAN_KEY_FILE, "r");
+#else
+  File f = _fs->open(CHAN_KEY_FILE);
+#endif
+  if (f) {
+    uint8_t buf[33];
+    int n = f.read(buf, sizeof(buf));
+    f.close();
+    if (n == 33 && (buf[0] == 16 || buf[0] == 32)) {
+      memset(&chan, 0, sizeof(chan));
+      memcpy(chan.secret, &buf[1], 32);
+      mesh::Utils::sha256(chan.hash, sizeof(chan.hash), chan.secret, buf[0]);
+      chan_key_len = buf[0];
+      chan_key_set = true;
+    }
+  }
 }
 
 bool MyMesh::setChannelKey(const char* key) {
@@ -1510,6 +1571,10 @@ void MyMesh::dailyReport() {   // every 24h from boot: battlog line, then templo
   if (!millisHasNowPassed(report_due_at)) return;
   report_due_at = futureMillis(REPORT_INTERVAL_MS);   // the next report is always 24h after this one
   chanDropReports();
+  queueReport();
+}
+
+void MyMesh::queueReport() {   // battlog line, then templog line (skipped without a key or without data)
   if (!chan_key_set || batt_log_count == 0) return;
   char buf[CHAN_MSG_MAX + 1];
   int prefix = (int)strlen(_prefs.node_name) + 2;
@@ -1520,6 +1585,25 @@ void MyMesh::dailyReport() {   // every 24h from boot: battlog line, then templo
   formatTempLog(buf);
   trimLogToFit(buf, 12, prefix);
   chanEnqueue(buf, CHAN_GAP_MS, true);
+}
+
+void MyMesh::formatStatus(char* reply) {
+  unsigned mv = board.getBattMilliVolts();
+  float t = board.getMCUTemperature();
+  int blocked = 0;
+  for (int i = 0; i < MAX_BLOCKHOP; i++) {
+    if (blockhop[i].len) blocked++;
+  }
+  unsigned long up = (unsigned long)(uptime_millis / 1000ULL);
+  int pos = snprintf(reply, 24, "Bat %u.%02uV", mv / 1000, (mv % 1000) / 10);
+  if (!isnan(t)) {
+    int t10 = (int)(t * 10.0f + (t >= 0 ? 0.5f : -0.5f));
+    int a = t10 < 0 ? -t10 : t10;
+    pos += snprintf(&reply[pos], 16, ", %s%d.%dC", t10 < 0 ? "-" : "", a / 10, a % 10);
+  }
+  snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, up %lud%luh%lum",
+           cycle_active ? "on" : "off", sleep_auto_enabled ? "on" : "off", blocked,
+           chan_key_set ? "set" : "not set", up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
 }
 
 void MyMesh::noteAutoBlock(const uint8_t* key, uint8_t len) {
@@ -1587,8 +1671,17 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
   buf[cmd_len] = 0;
 
   bool timed_sleep = (strncmp(buf, "sleep until ", 12) == 0) || (strncmp(buf, "sleep ", 6) == 0 && buf[6] >= '0' && buf[6] <= '9');
+  bool secret_get = false;   // never hand out the private key or passwords over the channel
+  if (strncmp(buf, "get ", 4) == 0) {
+    for (const char* p = buf + 4; *p; p++) {
+      if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
+    }
+  }
   bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "templog") == 0
-                 || strcmp(buf, "blockhop list") == 0 || strcmp(buf, "sleep cycle on") == 0
+                 || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
+                 || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
+                 || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
+                 || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
                  || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0;
   if (!allowed) return;   // only these commands can be given over the channel
 
@@ -1597,8 +1690,14 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
 
   char reply[192];
   reply[0] = 0;
-  if (!handleSleepCommands(0, buf, reply)) return;   // (0 = no clock sync from channel messages)
-  if (timed_sleep && strncmp(reply, "OK", 2) == 0) reply[0] = 0;   // its "Sleeping ..." notice is already queued
+  from_channel = true;
+  if (strcmp(buf, "advert") == 0) {   // flood advert, delayed at random so repeaters don't all send at once
+    sendSelfAdvertisement(getRNG()->nextInt(2000, 60001), true);
+    strcpy(reply, "OK - advert sent");
+  } else {
+    handleCommand(0, buf, reply);   // (0 = no clock sync from channel messages)
+  }
+  from_channel = false;
   if (reply[0] != 0) {
     if ((reply[0] == 'V' || reply[0] == 'C') && reply[1] == '/') {   // battlog / templog line: make it fit
       int prefix = (int)strlen(_prefs.node_name) + 2;
@@ -1630,6 +1729,16 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     cycle_active = true;
     startSleep(CYCLE_SLEEP_MS);
     strcpy(reply, "sleep cycle started");
+    return true;
+  }
+
+  if (strcmp(command, "sleep cycle off") == 0) {
+    if (cycle_active) {
+      stopSleepCycle();
+      strcpy(reply, "sleep cycle stopped");
+    } else {
+      strcpy(reply, "sleep cycle not running");
+    }
     return true;
   }
 
@@ -1672,8 +1781,8 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       return true;
     }
     cycle_active = false;   // a manual sleep overrides a running cycle
-    startSleep(diff * 1000UL - 3000UL);   // the radio goes off 3s after the reply
-    {
+    startSleep(diff * 1000UL, true);   // wakes exactly at the requested time, however long the radio stays on first
+    if (!from_channel) {   // (a command given on the channel gets its normal reply posted instead)
       char note[48];
       snprintf(note, sizeof(note), "Sleeping until %02d:%02d", hh, mm);
       chanEnqueue(note, CHAN_GAP_MS);
@@ -1691,7 +1800,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       cycle_active = false;   // a manual sleep overrides a running cycle
       startSleep((uint32_t)mins * 60000UL);
       sprintf(reply, "OK - sleeping for %d mins", mins);
-      {
+      if (!from_channel) {
         char note[48];
         snprintf(note, sizeof(note), "Sleeping for %d mins", mins);
         chanEnqueue(note, CHAN_GAP_MS);
@@ -1705,6 +1814,25 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     return true;
   }
 
+  if (strcmp(command, "status") == 0) {
+    formatStatus(reply);
+    return true;
+  }
+
+  if (strcmp(command, "report") == 0) {   // post the daily report now
+    if (!chan_key_set) {
+      strcpy(reply, "Err - channel key not set");
+    } else if (batt_log_count == 0) {
+      strcpy(reply, "Err - no log data yet");
+    } else {
+      chanDropReports();
+      queueReport();
+      if (from_channel) reply[0] = 0;   // the two report messages are the answer
+      else strcpy(reply, "OK - report queued");
+    }
+    return true;
+  }
+
   if (memcmp(command, "channel ", 8) == 0 || strcmp(command, "channel") == 0) {
     const char* sub = command + (command[7] == ' ' ? 8 : 7);
     while (*sub == ' ') sub++;
@@ -1712,7 +1840,8 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       const char* key = sub + 4;
       while (*key == ' ') key++;
       if (setChannelKey(key)) {
-        strcpy(reply, "OK - channel key set");
+        saveChannelKey();
+        strcpy(reply, "OK - channel key set and saved");
       } else {
         strcpy(reply, "Err - key must be base64 or hex, 16 or 32 bytes");
       }
@@ -1729,6 +1858,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       chan_key_len = 0;
       memset(&chan, 0, sizeof(chan));
       chan_q_n = 0;
+      if (_fs) _fs->remove(CHAN_KEY_FILE);
       strcpy(reply, "OK - channel key cleared");
     } else {
       strcpy(reply, "Err - channel set <key>|get|clear");
@@ -1768,8 +1898,8 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
   if (memcmp(command, "blockhop", 8) == 0 && (command[8] == 0 || command[8] == ' ')) {
     const char* sub = command + 8;
     while (*sub == ' ') sub++;
-    if (strcmp(sub, "list") == 0) {
-      formatBlockHopList(reply);
+    if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
+      formatBlockHopList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
     } else if (strcmp(sub, "clear") == 0) {
       memset(blockhop, 0, sizeof(blockhop));
       strcpy(reply, "OK - blockhop cleared");
@@ -2088,11 +2218,22 @@ void MyMesh::loop() {
   blockNoticeService();    // announce newly auto-blocked repeaters
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
 
+  // A packet leaves the send queue when its transmission STARTS, and the transmission takes seconds.
+  // So after the last queued send, stay awake for a quiet period before the radio may go to sleep.
+  if (!sleeping && hasPendingWork()) {
+    busy_armed = true;
+    busy_until = futureMillis(TX_QUIET_MS);
+  }
+  bool radio_quiet = !busy_armed || millisHasNowPassed(busy_until);
+
   // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
-  if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork()
+  if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork() && radio_quiet
       && (chan_q_n == 0 || millisHasNowPassed(sleep_deadline))) {
     sleep_pending = false;
-    radioSleep(sleep_duration_ms);
+    if (!(sleep_target_abs && millisHasNowPassed(sleep_target_at))) {   // (target already passed: nothing to sleep)
+      radioSleep(sleep_duration_ms);
+      if (sleep_target_abs) sleep_wake_at = sleep_target_at;
+    }
   }
   if (sleeping) {
     if (!millisHasNowPassed(sleep_wake_at)) {
@@ -2112,11 +2253,17 @@ void MyMesh::loop() {
         chanEnqueue(msg, CHAN_GAP_MS);
         chan_gap_on = true;
         chan_next_send_at = futureMillis(CHAN_PAIR_GAP_MS);   // message follows the advert by ~10s
+      } else {   // still cycling: tell the channel that the repeater is awake now
+        char msg[CHAN_MSG_MAX + 1];
+        snprintf(msg, sizeof(msg), "Awake for %lu mins", (unsigned long)(CYCLE_AWAKE_MS / 60000UL));
+        chanEnqueue(msg, CHAN_GAP_MS);
+        chan_gap_on = true;
+        chan_next_send_at = futureMillis(getRNG()->nextInt(2000, 20001));   // spread out nodes that wake together
       }
     }
   }
   // end of an awake window: back to sleep (an admin login stops the cycle before this)
-  if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork()) {
+  if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet) {
     radioSleep(CYCLE_SLEEP_MS);
     return;
   }

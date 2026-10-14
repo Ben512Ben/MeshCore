@@ -80,7 +80,9 @@ struct NeighbourInfo {
 
 #define FIRMWARE_ROLE "repeater"
 
-#define MAX_BLOCKHOP 10   // max repeater IDs in the 'blockhop' list
+#define MAX_BLOCKHOP 20   // max repeater IDs in the 'blockhop' list
+#define BLOCKHOP_PER_PAGE 5   // entries shown by one 'blockhop list'
+#define CHAN_KEY_FILE "/chan_key"
 #define CHAN_Q_MAX   6    // channel messages waiting to be posted
 #define CHAN_MSG_MAX 150  // max bytes of a channel message ("name: text")
 
@@ -165,6 +167,11 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool report_armed;
   unsigned long report_due_at;
   uint32_t last_cmd_ts;   // newest channel command accepted (older/equal ones are ignored: replay protection)
+  bool from_channel;      // true while a command received on the channel is being run
+  unsigned long sleep_target_at;   // 'sleep until': the wake time, counted from the command
+  bool sleep_target_abs;
+  bool busy_armed;                 // sending seen recently ...
+  unsigned long busy_until;        // ... radio stays on until a quiet period has passed
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -179,7 +186,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   bool handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply);
-  void startSleep(uint32_t duration_ms);
+  void startSleep(uint32_t duration_ms, bool absolute = false);
   void radioSleep(uint32_t duration_ms);
   void radioWake();
   void stopSleepCycle();
@@ -188,8 +195,12 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void formatTempLog(char* reply);
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
-  void formatBlockHopList(char* reply);
+  void formatBlockHopList(char* reply, int page);
   bool setChannelKey(const char* key);
+  void saveChannelKey();
+  void loadChannelKey();
+  void queueReport();
+  void formatStatus(char* reply);
   bool postChannel(const char* text);
   void chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report = false);
   void chanDropReports();
