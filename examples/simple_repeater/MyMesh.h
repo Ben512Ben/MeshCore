@@ -85,6 +85,10 @@ struct NeighbourInfo {
 #define CHAN_KEY_FILE "/chan_key"
 #define CHAN_Q_MAX   6    // channel messages waiting to be posted
 #define CHAN_MSG_MAX 150  // max bytes of a channel message ("name: text")
+#define MAX_BLOCKNAME 20        // names in the 'blockname' list
+#define BLOCKNAME_LEN 32        // 31 characters + terminator
+#define BLOCKNAME_PER_PAGE 5    // most entries shown by one 'blockname list'
+#define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
 
 #define PACKET_LOG_FILE  "/packet_log"
 
@@ -140,6 +144,30 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
     unsigned long last_activity_ms;
   };
   BlockHopEntry blockhop[MAX_BLOCKHOP];
+
+  // 'blockname' list (RAM only): senders on the Public / filter channels whose messages we refuse to relay
+  struct BlockNameEntry {
+    char name[BLOCKNAME_LEN];   // as typed, "" = unused slot. A trailing '*' matches any name starting with the text before it
+    uint32_t hits;              // messages blocked
+    unsigned long last_hit_ms;
+  };
+  BlockNameEntry blockname[MAX_BLOCKNAME];
+  bool block_name_hit;          // set while ONE packet is processed: its sender is on the blockname list (cleared in onRecvPacket)
+  mesh::GroupChannel public_chan;   // built-in Public channel key. Read-only: name check only, never commands
+  struct FilterKey {
+    bool set;
+    uint8_t len;
+    mesh::GroupChannel ch;
+  };
+  FilterKey filter_keys[MAX_FILTER_KEYS];   // extra read-only channel keys (RAM only)
+
+  // 'chanallow' relay whitelist (RAM only, off after every boot)
+  bool chanallow_on, chanallow_extra_set;
+  uint8_t chanallow_extra_hash;
+  uint32_t chanallow_dropped;
+
+  int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
+  bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
 
   // warnings / notices
   uint8_t hot_count;
@@ -198,6 +226,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
   void formatBlockHopList(char* reply, int page);
+  uint8_t blockNameCount() const;
+  void blockNameCheckText(const char* text);
+  void formatBlockNameList(char* reply, int page);
+  bool chanAllowBlocks(const mesh::Packet* packet);
   bool setChannelKey(const char* key);
   void saveChannelKey();
   void loadChannelKey();
@@ -210,7 +242,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void dailyReport();
   void noteAutoBlock(const uint8_t* key, uint8_t len);
   void blockNoticeService();
-  void handleChannelCommand(const char* text, uint32_t ts);
+  void handleChannelCommand(const char* text, uint32_t ts, int hops);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -344,6 +376,15 @@ public:
 
   // To check if there is pending work
   bool hasPendingWork() const;
+
+  // true while timed channel work is waiting (ESP32 only): the main loop must not light-sleep for up to 30 s then
+  bool needsFastLoop() const {
+#if defined(ESP32)
+    return sleep_pending || (chan_q_n > 0 && !sleeping);
+#else
+    return false;
+#endif
+  }
 
   bool setRxBoostedGain(bool enable) override;
 

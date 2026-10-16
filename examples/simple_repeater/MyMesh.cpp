@@ -1,5 +1,8 @@
 #include "MyMesh.h"
 #include <algorithm>
+#ifdef HELTEC_LORA_V4
+#include <driver/gpio.h>   // gpio_pulldown_en() for DIO1 while the radio sleeps
+#endif
 
 /* ------------------- Sleep cycle / battery settings ------------------- */
 
@@ -22,8 +25,12 @@
 #define CHAN_GAP_MS       60000                   // gap between automatic channel messages
 #define CHAN_PAIR_GAP_MS  10000                   // gap between the two daily report messages
 #define BLOCK_NOTICE_GAP_MS (60UL * 60UL * 1000UL)  // at most one auto-block notice per hour
-#define SLEEP_MSG_WAIT_MS 120000                  // sleep waits at most this long for queued channel messages
+#define SLEEP_MSG_WAIT_MS 150000                  // sleep waits at most this long for queued channel messages
 #define TX_QUIET_MS       6000                    // radio never goes to sleep until this long after the last queued send
+#define STAGGER_BASE_S    112                     // reply delay of a sleep command sent to 'all': 112 s at 0 hops ...
+#define STAGGER_STEP_S    10                      //   ... 10 s less per hop ...
+#define STAGGER_SPREAD_S  8                       //   ... plus a random 0..8 s ...
+#define STAGGER_FLOOR_S   5                       //   ... and never less than 5 s (so the furthest repeaters sleep first)
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -459,6 +466,8 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   if (_prefs.disable_fwd) return false;
+  if (block_name_hit) return false;                // sender is on the blockname list (Public / filter channels)
+  if (chanAllowBlocks(packet)) return false;       // channel is not on the chanallow whitelist
   if (packet->isRouteFlood() && blockHopCheck(packet)) return false;   // first relay is on the blockhop list
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -581,6 +590,7 @@ uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
 }
 
 mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
+  block_name_hit = false;   // the mark is only valid while this one packet is processed
   if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
     recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
   } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
@@ -927,6 +937,21 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   batt_log_head = batt_log_count = 0;
   memset(temp_log, 0, sizeof(temp_log));
   memset(blockhop, 0, sizeof(blockhop));
+  memset(blockname, 0, sizeof(blockname));
+  block_name_hit = false;
+  memset(filter_keys, 0, sizeof(filter_keys));
+  chanallow_on = chanallow_extra_set = false;
+  chanallow_extra_hash = 0;
+  chanallow_dropped = 0;
+  cmd_hops = -1;
+  sleep_cmd_flag = false;
+  {   // built-in Public channel key (publicly known): used read-only, to check sender names
+    static const uint8_t PUBLIC_KEY[16] = {0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+                                           0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72};
+    memset(&public_chan, 0, sizeof(public_chan));
+    memcpy(public_chan.secret, PUBLIC_KEY, sizeof(PUBLIC_KEY));
+    mesh::Utils::sha256(public_chan.hash, sizeof(public_chan.hash), public_chan.secret, sizeof(PUBLIC_KEY));
+  }
   hot_count = 0;
   hot_msg_sent = crit_msg_sent = false;
   blk_pending_n = 0;
@@ -1213,6 +1238,7 @@ void MyMesh::startSleep(uint32_t duration_ms, bool absolute) {
   sleep_start_at = futureMillis(3000);  // give CLI reply some time to be sent back, before the radio goes off
   sleep_deadline = futureMillis(3000 + SLEEP_MSG_WAIT_MS);   // ... and queued channel messages some time to go out
   sleep_pending = true;
+  sleep_cmd_flag = true;   // (handleChannelCommand checks this to pick the reply delay)
 }
 
 bool MyMesh::sleepFor(uint32_t duration_ms) {   // (CommonCLI hook; 'sleep <mins>' is handled in handleSleepCommands)
@@ -1228,6 +1254,11 @@ void MyMesh::radioSleep(uint32_t duration_ms) {
 #ifdef HELTEC_T096
   t096FrontEndOff();
 #endif
+#ifdef HELTEC_LORA_V4
+  board.loRaFEMControl.setSleepModeEnable();            // front-end chip into its low-power mode (supply stays on)
+  gpio_pullup_dis((gpio_num_t)P_LORA_DIO_1);            // hold DIO1 low while the radio sleeps, so a floating pin
+  gpio_pulldown_en((gpio_num_t)P_LORA_DIO_1);           //   can't keep the MCU from light-sleeping
+#endif
 }
 
 void MyMesh::radioWake() {
@@ -1235,6 +1266,10 @@ void MyMesh::radioWake() {
   uint32_t saved_time = getRTCClock()->getCurrentTime();
 #ifdef HELTEC_T096
   t096FrontEndOn();                   // front-end chip must be powered before the radio restarts
+#endif
+#ifdef HELTEC_LORA_V4
+  gpio_pulldown_dis((gpio_num_t)P_LORA_DIO_1);          // the radio drives DIO1 itself again
+  board.loRaFEMControl.setRxModeEnable();               // front-end chip back to receive mode before the radio restarts
 #endif
   radio_init();                       // full radio re-init (hardware reset), same as at boot
   getRTCClock()->setCurrentTime(saved_time);  // radio_init() may touch the clock; keep the time
@@ -1288,8 +1323,12 @@ void MyMesh::batteryMonitor() {
   if (mv < CRIT_WARN_MV) {
     if (!crit_msg_sent) {
       crit_msg_sent = true;
+#ifdef NRF52_POWER_MANAGEMENT   // only these boards really shut down (boot lock)
       snprintf(msg, sizeof(msg), "Battery critical %u.%02uV, shutting down until recharged",
                (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
+#else
+      snprintf(msg, sizeof(msg), "Battery critical %u.%02uV", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
+#endif
       chanEnqueue(msg, CHAN_GAP_MS);
     }
   } else if (mv >= BATT_LOW_MV) {
@@ -1443,6 +1482,147 @@ void MyMesh::formatBlockHopList(char* reply, int page) {
     shown++;
   }
   if (pages > 1) snprintf(&reply[pos], 12, " p%d/%d", page, pages);
+}
+
+// ---------------------- 'blockname', 'filterchan' and 'chanallow' ----------------------
+
+static bool eqNoCase(const char* a, const char* b) {
+  while (*a && *b) {
+    if (lowerc((unsigned char)*a) != lowerc((unsigned char)*b)) return false;
+    a++;
+    b++;
+  }
+  return *a == 0 && *b == 0;
+}
+
+// does a listed name match a sender name? exact (ignoring case), or a prefix if the listed name ends with '*'
+static bool nameMatches(const char* entry, const char* sender, int slen) {
+  int el = (int)strlen(entry);
+  if (el > 0 && entry[el - 1] == '*') {
+    int pl = el - 1;
+    if (slen < pl) return false;
+    for (int i = 0; i < pl; i++) {
+      if (lowerc((unsigned char)entry[i]) != lowerc((unsigned char)sender[i])) return false;
+    }
+    return true;
+  }
+  if (el != slen) return false;
+  for (int i = 0; i < el; i++) {
+    if (lowerc((unsigned char)entry[i]) != lowerc((unsigned char)sender[i])) return false;
+  }
+  return true;
+}
+
+// channel key text -> bytes (same rules as 'channel set'). returns 16 or 32, or -1 if invalid. tmp must hold 32 bytes
+static int parseChanKey(const char* key, uint8_t* tmp) {
+  size_t kl = strlen(key);
+  bool all_hex = kl > 0;
+  for (size_t i = 0; i < kl; i++) {
+    if (hexNibble(key[i]) < 0) all_hex = false;
+  }
+  int len;
+  if ((kl == 32 || kl == 64) && all_hex) {
+    len = (int)(kl / 2);
+    for (int i = 0; i < len; i++) {
+      tmp[i] = (uint8_t)((hexNibble(key[i * 2]) << 4) | hexNibble(key[i * 2 + 1]));
+    }
+  } else {
+    len = b64Decode(key, tmp, 32);
+  }
+  return (len == 16 || len == 32) ? len : -1;
+}
+
+uint8_t MyMesh::blockNameCount() const {
+  uint8_t n = 0;
+  for (int i = 0; i < MAX_BLOCKNAME; i++) {
+    if (blockname[i].name[0]) n++;
+  }
+  return n;
+}
+
+// text is "<sender>: <message>" from the Public channel or a filter channel
+void MyMesh::blockNameCheckText(const char* text) {
+  const char* sep = strstr(text, ": ");
+  if (sep == NULL) return;
+  int slen = (int)(sep - text);
+  if (slen <= 0 || slen >= BLOCKNAME_LEN) return;
+  for (int i = 0; i < MAX_BLOCKNAME; i++) {
+    BlockNameEntry& e = blockname[i];
+    if (e.name[0] == 0 || !nameMatches(e.name, text, slen)) continue;
+    e.hits++;
+    e.last_hit_ms = millis();
+    block_name_hit = true;   // allowPacketForward() refuses to relay this packet
+    return;
+  }
+}
+
+// one line per page: "Spam123* x12 5m | Free Crypto x3 2h | Bot42 x0 - p1/2"; a page is filled as far as the reply fits
+void MyMesh::formatBlockNameList(char* reply, int page) {
+  if (blockNameCount() == 0) {
+    strcpy(reply, "blockname: list empty");
+    return;
+  }
+  int limit = CLI_REPLY_MAX - 8;   // room for " pN/M"
+  if (from_channel) {              // over the channel the repeater's name is added in front, and the message is cut at CHAN_MSG_MAX
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    limit = CHAN_MSG_MAX - prefix - 8;
+  }
+  unsigned long now = millis();
+  int pages = 1;
+  for (int pass = 0; pass < 2; pass++) {   // pass 0 counts the pages, pass 1 writes the wanted one
+    int cur_page = 1, in_page = 0, cur_len = 0;
+    size_t pos = 0;
+    reply[0] = 0;
+    for (int i = 0; i < MAX_BLOCKNAME; i++) {
+      const BlockNameEntry& e = blockname[i];
+      if (e.name[0] == 0) continue;
+      char age[12];
+      if (e.hits) fmtAge(age, sizeof(age), now - e.last_hit_ms);
+      else strcpy(age, "-");
+      char item[72];
+      int il = snprintf(item, sizeof(item), "%s x%lu %s", e.name, (unsigned long)e.hits, age);
+      if (il >= (int)sizeof(item)) il = (int)sizeof(item) - 1;
+      int need = il + (in_page ? 3 : 0);   // " | " between entries
+      if (in_page >= BLOCKNAME_PER_PAGE || (in_page > 0 && cur_len + need > limit)) {
+        cur_page++;
+        in_page = 0;
+        cur_len = 0;
+        need = il;
+      }
+      if (pass == 1 && cur_page == page) {
+        if (in_page) {
+          memcpy(&reply[pos], " | ", 4);
+          pos += 3;
+        }
+        memcpy(&reply[pos], item, il + 1);
+        pos += il;
+      }
+      cur_len += need;
+      in_page++;
+    }
+    if (pass == 0) {
+      pages = cur_page;
+      if (page < 1) page = 1;
+      if (page > pages) page = pages;
+    } else if (pages > 1) {
+      snprintf(&reply[pos], 12, " p%d/%d", page, pages);
+    }
+  }
+}
+
+// true if the relay whitelist is on and this is a channel message from a channel that is not allowed
+bool MyMesh::chanAllowBlocks(const mesh::Packet* packet) {
+  if (!chanallow_on || !packet->isRouteFlood()) return false;
+  uint8_t t = packet->getPayloadType();
+  if (t != PAYLOAD_TYPE_GRP_TXT && t != PAYLOAD_TYPE_GRP_DATA) return false;   // adverts, direct messages, acks ...: relayed as always
+  if (packet->payload_len < 1) return false;
+  uint8_t h = packet->payload[0];   // channel hash, sent in the clear
+  if (chan_key_set && h == chan.hash[0]) return false;   // the command channel is always allowed
+  if (h == public_chan.hash[0]) return false;            // so is Public
+  if (chanallow_extra_set && h == chanallow_extra_hash) return false;
+  chanallow_dropped++;
+  return true;
 }
 
 void MyMesh::saveChannelKey() {   // /chan_key: 1 byte key length + 32 bytes key
@@ -1604,9 +1784,12 @@ void MyMesh::formatStatus(char* reply) {
     int a = t10 < 0 ? -t10 : t10;
     pos += snprintf(&reply[pos], 16, ", %s%d.%dC", t10 < 0 ? "-" : "", a / 10, a % 10);
   }
-  snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, up %lud%luh%lum",
+  char hops[8];   // hops the channel command took to reach us ('-' when the command did not come over the channel)
+  if (cmd_hops >= 0) snprintf(hops, sizeof(hops), "%d", (int)cmd_hops);
+  else strcpy(hops, "-");
+  snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, hops %s, up %lud%luh%lum",
            cycle_active ? "on" : "off", sleep_auto_enabled ? "on" : "off", blocked,
-           chan_key_set ? "set" : "not set", up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
+           chan_key_set ? "set" : "not set", hops, up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
 }
 
 void MyMesh::noteAutoBlock(const uint8_t* key, uint8_t len) {
@@ -1637,11 +1820,24 @@ void MyMesh::blockNoticeService() {   // at most one notice an hour, listing eve
 }
 
 int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
-  if (chan_key_set && max_matches > 0 && chan.hash[0] == hash[0]) {
-    channels[0] = chan;
-    return 1;
+  int n = 0;
+  if (chan_key_set && n < max_matches && chan.hash[0] == hash[0]) {   // the private command channel
+    channels[n++] = chan;
   }
-  return 0;   // no key set: channel messages are not read
+  if (blockNameCount() == 0) return n;   // empty blockname list: Public / filter channels are not decrypted at all
+  if (n < max_matches && public_chan.hash[0] == hash[0]) {
+    channels[n++] = public_chan;
+  }
+  for (int i = 0; i < MAX_FILTER_KEYS && n < max_matches; i++) {
+    const FilterKey& k = filter_keys[i];
+    if (!k.set || k.ch.hash[0] != hash[0]) continue;
+    bool dup = false;   // same key as one already offered (command, Public or another slot): don't decrypt twice
+    for (int j = 0; j < n; j++) {
+      if (memcmp(channels[j].secret, k.ch.secret, sizeof(k.ch.secret)) == 0) dup = true;
+    }
+    if (!dup) channels[n++] = k.ch;
+  }
+  return n;
 }
 
 void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
@@ -1650,11 +1846,16 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
   uint32_t ts;
   memcpy(&ts, data, 4);
   data[len] = 0;   // text is padded with zeroes (same as BaseChatMesh::onGroupDataRecv)
-  handleChannelCommand((const char*)&data[5], ts);
+  bool is_command_channel = chan_key_set && memcmp(channel.secret, chan.secret, sizeof(chan.secret)) == 0;
+  if (!is_command_channel) {   // Public or a filter channel: only check the sender name, NEVER run commands
+    blockNameCheckText((const char*)&data[5]);
+    return;
+  }
+  handleChannelCommand((const char*)&data[5], ts, (int)packet->getPathHashCount());
 }
 
 // channel commands look like  <battlog all>  <templog Tuna>  <sleep until 21:00 all>
-void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
+void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   const char* body = strstr(text, ": ");   // "<sender>: <message>"
   if (body == NULL) return;
   body += 2;
@@ -1669,7 +1870,8 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
   buf[inner] = 0;
 
   int cmd_len = -1;   // addressed to everyone, or to this repeater by name?
-  if (!endsWithTarget(buf, inner, "all", &cmd_len) && !endsWithTarget(buf, inner, _prefs.node_name, &cmd_len)) return;
+  bool to_all = endsWithTarget(buf, inner, "all", &cmd_len);
+  if (!to_all && !endsWithTarget(buf, inner, _prefs.node_name, &cmd_len)) return;
   while (cmd_len > 0 && buf[cmd_len - 1] == ' ') cmd_len--;
   buf[cmd_len] = 0;
 
@@ -1686,6 +1888,10 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
                  || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
                  || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
                  || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
+                 || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
+                 || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
+                 || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
+                 || strncmp(buf, "filterchan clear", 16) == 0
                  || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
                  || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0;
   if (!allowed) return;   // only these commands can be given over the channel
@@ -1696,6 +1902,8 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
   char reply[192];
   reply[0] = 0;
   from_channel = true;
+  sleep_cmd_flag = false;   // startSleep() sets this if the command starts a sleep
+  cmd_hops = hops;          // 'status' reports it
   if (strcmp(buf, "advert") == 0) {   // flood advert, delayed at random so repeaters don't all send at once
     sendSelfAdvertisement(getRNG()->nextInt(2000, 60001), true);
     strcpy(reply, "OK - advert sent");
@@ -1703,6 +1911,9 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
     handleCommand(0, buf, reply);   // (0 = no clock sync from channel messages)
   }
   from_channel = false;
+  cmd_hops = -1;
+  bool started_sleep = sleep_cmd_flag;
+  sleep_cmd_flag = false;
   if (reply[0] != 0) {
     if ((reply[0] == 'V' || reply[0] == 'C') && reply[1] == '/') {   // battlog / templog line: make it fit
       int prefix = (int)strlen(_prefs.node_name) + 2;
@@ -1711,9 +1922,17 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts) {
     }
     chanEnqueue(reply, CHAN_GAP_MS);
   }
-  // every repeater answers a command for 'all': spread the replies out by a random 5..60 seconds
   chan_gap_on = true;
-  chan_next_send_at = futureMillis(getRNG()->nextInt(5000, 60001));
+  if (to_all && started_sleep) {
+    // a sleep command for 'all': the furthest repeaters answer (and sleep) first, so every reply can still be
+    // relayed by nearer repeaters that are awake. 112 s at 0 hops, 10 s less per hop, plus a random 0..8 s.
+    int32_t lo = (int32_t)STAGGER_BASE_S - (int32_t)STAGGER_STEP_S * (int32_t)hops;
+    if (lo < STAGGER_FLOOR_S) lo = STAGGER_FLOOR_S;
+    chan_next_send_at = futureMillis(getRNG()->nextInt(lo * 1000, (lo + STAGGER_SPREAD_S) * 1000 + 1));
+  } else {
+    // every repeater answers a command for 'all': spread the replies out by a random 5..60 seconds
+    chan_next_send_at = futureMillis(getRNG()->nextInt(5000, 60001));
+  }
 }
 
 bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply) {
@@ -1931,6 +2150,181 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       }
     } else {
       strcpy(reply, "Err - blockhop add|remove|list|clear");
+    }
+    return true;
+  }
+
+  if (memcmp(command, "blockname", 9) == 0 && (command[9] == 0 || command[9] == ' ')) {
+    const char* sub = command + 9;
+    while (*sub == ' ') sub++;
+    if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
+      formatBlockNameList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+    } else if (strcmp(sub, "clear") == 0) {
+      memset(blockname, 0, sizeof(blockname));
+      strcpy(reply, "OK - blockname cleared");
+    } else if (memcmp(sub, "add ", 4) == 0 || memcmp(sub, "remove ", 7) == 0) {
+      bool is_add = (sub[0] == 'a');
+      const char* name = sub + (is_add ? 4 : 7);
+      while (*name == ' ') name++;
+      size_t nl = strlen(name);
+      if (nl == 0) {
+        strcpy(reply, "Err - name missing");
+      } else if (nl >= BLOCKNAME_LEN) {
+        snprintf(reply, 40, "Err - name max %d chars", BLOCKNAME_LEN - 1);
+      } else if (is_add) {
+        if (strcmp(name, "*") == 0) {
+          strcpy(reply, "Err - '*' alone would block everyone");
+        } else {
+          int free_idx = -1;
+          bool listed = false;
+          for (int i = 0; i < MAX_BLOCKNAME; i++) {
+            if (blockname[i].name[0] == 0) {
+              if (free_idx < 0) free_idx = i;
+            } else if (eqNoCase(blockname[i].name, name)) {
+              listed = true;
+            }
+          }
+          if (listed) {
+            strcpy(reply, "OK - already listed");
+          } else if (free_idx < 0) {
+            snprintf(reply, 40, "Err - blockname list full (%d)", MAX_BLOCKNAME);
+          } else {
+            memset(&blockname[free_idx], 0, sizeof(blockname[free_idx]));
+            strncpy(blockname[free_idx].name, name, BLOCKNAME_LEN - 1);
+            strcpy(reply, "OK - blocked");
+          }
+        }
+      } else {
+        int removed = 0;
+        for (int i = 0; i < MAX_BLOCKNAME; i++) {
+          if (blockname[i].name[0] && eqNoCase(blockname[i].name, name)) {
+            memset(&blockname[i], 0, sizeof(blockname[i]));
+            removed++;
+          }
+        }
+        strcpy(reply, removed ? "OK - removed" : "Err - not in list");
+      }
+    } else {
+      strcpy(reply, "Err - blockname add|remove|list|clear");
+    }
+    return true;
+  }
+
+  if (memcmp(command, "filterchan", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+    const char* sub = command + 10;
+    while (*sub == ' ') sub++;
+    if (*sub == 0 || strcmp(sub, "get") == 0) {   // slots with the channel hash, never the keys
+      int pos = 0;
+      reply[0] = 0;
+      for (int i = 0; i < MAX_FILTER_KEYS; i++) {
+        const FilterKey& k = filter_keys[i];
+        if (k.set) pos += snprintf(&reply[pos], 40, "%s%d: set (hash %02X)", i ? " | " : "", i + 1, k.ch.hash[0]);
+        else pos += snprintf(&reply[pos], 40, "%s%d: empty", i ? " | " : "", i + 1);
+      }
+      snprintf(&reply[pos], 40, " | Public: built in");
+    } else if (memcmp(sub, "get ", 4) == 0) {    // full key of one slot: CLI only
+      if (from_channel) {
+        strcpy(reply, "Err - filterchan get <slot> is CLI only");
+      } else {
+        int slot = atoi(&sub[4]);
+        if (slot < 1 || slot > MAX_FILTER_KEYS) {
+          strcpy(reply, "Err - filterchan get <1-4>");
+        } else if (!filter_keys[slot - 1].set) {
+          snprintf(reply, 40, "%d: empty", slot);
+        } else {
+          char b64[48];
+          b64Encode(filter_keys[slot - 1].ch.secret, filter_keys[slot - 1].len, b64);
+          snprintf(reply, 100, "%d: key: %s", slot, b64);
+        }
+      }
+    } else if (memcmp(sub, "set ", 4) == 0) {
+      const char* p = sub + 4;
+      while (*p == ' ') p++;
+      int slot = atoi(p);
+      while (*p >= '0' && *p <= '9') p++;
+      while (*p == ' ') p++;
+      if (slot < 1 || slot > MAX_FILTER_KEYS || *p == 0) {
+        strcpy(reply, "Err - filterchan set <1-4> <key>");
+      } else {
+        uint8_t tmp[32];
+        int len = parseChanKey(p, tmp);
+        if (len < 0) {
+          strcpy(reply, "Err - key must be base64 or hex, 16 or 32 bytes");
+        } else {
+          FilterKey& k = filter_keys[slot - 1];
+          memset(&k, 0, sizeof(k));
+          memcpy(k.ch.secret, tmp, len);
+          mesh::Utils::sha256(k.ch.hash, sizeof(k.ch.hash), k.ch.secret, len);   // same as BaseChatMesh::addChannel()
+          k.len = (uint8_t)len;
+          k.set = true;
+          snprintf(reply, 60, "OK - filterchan %d set (hash %02X)", slot, k.ch.hash[0]);   // never repeats the key
+        }
+      }
+    } else if (memcmp(sub, "clear", 5) == 0 && (sub[5] == 0 || sub[5] == ' ')) {
+      const char* a = sub + 5;
+      while (*a == ' ') a++;
+      if (strcmp(a, "all") == 0) {
+        memset(filter_keys, 0, sizeof(filter_keys));
+        strcpy(reply, "OK - filterchan keys cleared");
+      } else {
+        int slot = atoi(a);
+        if (*a == 0 || slot < 1 || slot > MAX_FILTER_KEYS) {
+          strcpy(reply, "Err - filterchan clear <1-4>|all");
+        } else {
+          memset(&filter_keys[slot - 1], 0, sizeof(filter_keys[slot - 1]));
+          snprintf(reply, 40, "OK - filterchan %d cleared", slot);
+        }
+      }
+    } else {
+      strcpy(reply, "Err - filterchan get|set <slot> <key>|clear <slot>|all");
+    }
+    return true;
+  }
+
+  if (memcmp(command, "chanallow", 9) == 0 && (command[9] == 0 || command[9] == ' ')) {
+    const char* sub = command + 9;
+    while (*sub == ' ') sub++;
+    if (*sub == 0) {
+      char cmdh[8], extra[8];
+      if (chan_key_set) snprintf(cmdh, sizeof(cmdh), "%02X", chan.hash[0]);
+      else strcpy(cmdh, "-");
+      if (chanallow_extra_set) snprintf(extra, sizeof(extra), "%02X", chanallow_extra_hash);
+      else strcpy(extra, "-");
+      snprintf(reply, 100, "chanallow %s, cmd %s, Public %02X, extra %s, dropped %lu", chanallow_on ? "on" : "off", cmdh,
+               public_chan.hash[0], extra, (unsigned long)chanallow_dropped);
+    } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
+      chanallow_on = (sub[1] == 'n');
+      strcpy(reply, chanallow_on ? "OK - chanallow on" : "OK - chanallow off");
+    } else if (strcmp(sub, "clear") == 0) {
+      chanallow_extra_set = false;
+      chanallow_extra_hash = 0;
+      strcpy(reply, "OK - extra channel cleared");
+    } else if (memcmp(sub, "set ", 4) == 0) {
+      const char* a = sub + 4;
+      while (*a == ' ') a++;
+      if (strlen(a) == 2 && hexNibble(a[0]) >= 0 && hexNibble(a[1]) >= 0) {   // a 2 character hash
+        chanallow_extra_hash = (uint8_t)((hexNibble(a[0]) << 4) | hexNibble(a[1]));
+        chanallow_extra_set = true;
+        snprintf(reply, 60, "OK - extra channel hash %02X", chanallow_extra_hash);
+      } else if (from_channel) {   // a key never goes over the channel
+        strcpy(reply, "Err - over the channel give a 2 character hash");
+      } else {
+        uint8_t tmp[32];
+        int len = parseChanKey(a, tmp);
+        if (len < 0) {
+          strcpy(reply, "Err - give a 2 character hash, or a base64/hex key (16 or 32 bytes)");
+        } else {
+          mesh::GroupChannel tmpc;
+          memset(&tmpc, 0, sizeof(tmpc));
+          memcpy(tmpc.secret, tmp, len);
+          mesh::Utils::sha256(tmpc.hash, sizeof(tmpc.hash), tmpc.secret, len);
+          chanallow_extra_hash = tmpc.hash[0];
+          chanallow_extra_set = true;
+          snprintf(reply, 60, "OK - extra channel hash %02X", chanallow_extra_hash);
+        }
+      }
+    } else {
+      strcpy(reply, "Err - chanallow on|off|set <hash or key>|clear");
     }
     return true;
   }
