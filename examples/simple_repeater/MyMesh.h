@@ -90,6 +90,10 @@ struct NeighbourInfo {
 #define BLOCKNAME_PER_PAGE 5    // most entries shown by one 'blockname list'
 #define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
 
+#define BOT_KEY_FILE "/bot_key"   // trail bot channel key (item 32), same layout as /chan_key
+#define BOT_MSG_MAX  134          // trail bot: max bytes of a message INCLUDING "<node name>: "
+#define BOT_Q_MAX    4            // trail bot: most messages one request can produce
+
 #define PACKET_LOG_FILE  "/packet_log"
 
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
@@ -166,6 +170,17 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t chanallow_extra_hash;
   uint32_t chanallow_dropped;
 
+  // trail bot (item 32): own channel + key, answers "!trail" / "!town" messages. Off after every boot.
+  bool bot_key_set, bot_on;
+  uint8_t bot_key_len;
+  mesh::GroupChannel bot_chan;
+  char bot_q[BOT_Q_MAX][BOT_MSG_MAX + 1];   // replies waiting to be posted
+  uint8_t bot_q_n;
+  unsigned long bot_next_send_at;
+  bool bot_rate_on;                         // a request was answered recently: ignore new ones until bot_next_ok_at
+  unsigned long bot_next_ok_at;
+  uint32_t bot_replies;
+
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
 
@@ -230,6 +245,12 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void blockNameCheckText(const char* text);
   void formatBlockNameList(char* reply, int page);
   bool chanAllowBlocks(const mesh::Packet* packet);
+  bool botSameAsCommandChannel(const mesh::GroupChannel& ch) const;
+  void saveBotKey();
+  void loadBotKey();
+  void handleBotMessage(const char* text, int hops, float snr, int rssi);
+  bool postBotMessage(const char* text);
+  void botService();
   bool setChannelKey(const char* key);
   void saveChannelKey();
   void loadChannelKey();
@@ -380,7 +401,7 @@ public:
   // true while timed channel work is waiting (ESP32 only): the main loop must not light-sleep for up to 30 s then
   bool needsFastLoop() const {
 #if defined(ESP32)
-    return sleep_pending || (chan_q_n > 0 && !sleeping);
+    return sleep_pending || ((chan_q_n > 0 || bot_q_n > 0) && !sleeping);
 #else
     return false;
 #endif
