@@ -1,5 +1,6 @@
 #include "MyMesh.h"
 #include "TrailBot.h"   // trail info bot (item 32): lookup + reply text
+#include "ChatBot.h"    // ELIZA-style chat for messages that start with * (item 33)
 #include <algorithm>
 #ifdef HELTEC_LORA_V4
 #include <driver/gpio.h>   // gpio_pulldown_en() for DIO1 while the radio sleeps
@@ -1888,7 +1889,8 @@ void MyMesh::loadBotKey() {
   }
 }
 
-// a message heard on the bot channel: "<sender>: !<trail, town, 'trails' or 'test'>". Only called while the bot is on and awake.
+// a message heard on the bot channel: "<sender>: !<trail, town, 'trails' or 'test'>" or "<sender>: *<chat>".
+// Only called while the bot is on and awake.
 // hops / snr / rssi describe how this repeater heard the message ('!test' reports them; rssi is the radio's last reading).
 void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi) {
   const char* body = strstr(text, ": ");   // "<sender>: <message>"
@@ -1896,11 +1898,15 @@ void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi) {
   int slen = (int)(body - text);           // length of the sender name
   body += 2;
   while (*body == ' ') body++;
-  if (*body != '!') return;
+  if (*body != '!' && *body != '*') return;                         // '!' = trails and test, '*' = chat
   if (bot_q_n > 0) return;                                          // still answering the last request
   if (bot_rate_on && !millisHasNowPassed(bot_next_ok_at)) return;   // one answer per 10 s at most
   int n;
-  if (trailbotIsTest(body + 1)) {   // '!test': say what this repeater heard
+  if (*body == '*') {   // chat: ELIZA-style, one reply (the sender's name is the text before the ": ")
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    n = chatbotReply(text, slen, body + 1, BOT_MSG_MAX - prefix, (uint32_t)getRNG()->nextInt(0, 65536), bot_q[0]) > 0 ? 1 : 0;
+  } else if (trailbotIsTest(body + 1)) {   // '!test': say what this repeater heard
     char tstr[12];
     uint32_t now = getRTCClock()->getCurrentTime();
     if (now < CLOCK_VALID_AFTER) {
