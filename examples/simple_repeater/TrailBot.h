@@ -5,14 +5,15 @@
  *
  *   !<trail or alias>   -> "<Trail name>: <distance>, <time>, <grade>, <features>"
  *   !<town or alias>    -> the trail names in that town, as numbered messages "(1/2) !Name !Name ..."
- *   !trails             -> the towns, same format
- *   !trails <town>      -> same as !<town>
+ *   !<region or alias>  -> the towns in that region, same format
+ *   !trails             -> the regions, same format
+ *   !trails <name>      -> same as !<name> but never a trail (a town, else a region)
  *   !test               -> five lines: "Hi @[sender]", "Time 14:32:07", "SNR 6.5dB", "RSSI -91dBm", "Hops 2"
  *                          (what THIS repeater heard)
  *   anything else       -> "Not found, try !trails"
  *
  * Every reply is at most BOT_MSG_MAX (134) characters INCLUDING the sender prefix "<node name>: ".
- * A trail wins over a town with the same name. Replies never begin with '!', so two bot repeaters on one
+ * Lookup order: trail, then town, then region. A trail wins over a town with the same name. Replies never begin with '!', so two bot repeaters on one
  * channel can not trigger each other.
  */
 
@@ -80,6 +81,13 @@ static int trailbotFindTrail(const char* q) {
   return -1;
 }
 
+static int trailbotFindRegion(const char* q) {
+  for (int i = 0; i < TRAIL_REGION_COUNT; i++) {
+    if (trailbotMatches(TRAIL_REGIONS[i].name, TRAIL_REGIONS[i].aliases, q)) return i;
+  }
+  return -1;
+}
+
 static int trailbotFindTown(const char* q) {
   for (int i = 0; i < TRAIL_TOWN_COUNT; i++) {
     if (trailbotMatches(TRAIL_TOWNS[i].name, TRAIL_TOWNS[i].aliases, q)) return i;
@@ -133,6 +141,14 @@ static int trailbotList(const char* const* names, int n, int budget, char out[][
   return np;
 }
 
+static int trailbotRegionTowns(int region, const char** names, int max) {
+  int n = 0;
+  for (int i = 0; i < TRAIL_TOWN_COUNT && n < max; i++) {
+    if (TRAIL_TOWNS[i].region == region) names[n++] = TRAIL_TOWNS[i].name;
+  }
+  return n;
+}
+
 static int trailbotTownTrails(int town, const char** names, int max) {
   int n = 0;
   for (int i = 0; i < TRAIL_COUNT && n < max; i++) {
@@ -154,10 +170,10 @@ static int trailbotReply(const char* query, const char* node_name, char out[][BO
   int budget = BOT_MSG_MAX - prefix;   // characters left for the text itself
   const char* names[TRAILBOT_MAX_ITEMS];
 
-  bool towns_only = false;   // "!trails <town>"
-  if (strcmp(q, "trails") == 0) {   // the towns
+  bool towns_only = false;   // "!trails <name>": never a trail
+  if (strcmp(q, "trails") == 0) {   // the regions
     int n = 0;
-    for (int i = 0; i < TRAIL_TOWN_COUNT && n < TRAILBOT_MAX_ITEMS; i++) names[n++] = TRAIL_TOWNS[i].name;
+    for (int i = 0; i < TRAIL_REGION_COUNT && n < TRAILBOT_MAX_ITEMS; i++) names[n++] = TRAIL_REGIONS[i].name;
     return trailbotList(names, n, budget, out);
   }
   if (strncmp(q, "trails ", 7) == 0) {
@@ -177,6 +193,11 @@ static int trailbotReply(const char* query, const char* node_name, char out[][BO
   int town = trailbotFindTown(q);
   if (town >= 0) {
     int n = trailbotTownTrails(town, names, TRAILBOT_MAX_ITEMS);
+    if (n > 0) return trailbotList(names, n, budget, out);
+  }
+  int region = trailbotFindRegion(q);
+  if (region >= 0) {
+    int n = trailbotRegionTowns(region, names, TRAILBOT_MAX_ITEMS);
     if (n > 0) return trailbotList(names, n, budget, out);
   }
   snprintf(out[0], BOT_MSG_MAX + 1, "Not found, try !trails");
