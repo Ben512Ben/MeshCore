@@ -975,6 +975,15 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   boot_notice_pending = true;   // announce the (re)start on the channel
   boot_notice_armed = false;
   boot_notice_at = 0;
+  bot_key_set = bot_on = false;
+  bot_key_len = 0;
+  memset(&botc, 0, sizeof(botc));
+  bot_pending = false;
+  bot_text[0] = 0;
+  bot_due_at = 0;
+  bot_quiet_on = false;
+  bot_quiet_until = 0;
+  bot_replies = 0;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1046,6 +1055,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // TODO: key_store.begin();
   region_map.load(_fs);
   loadChannelKey();   // channel key saved by 'channel set'
+  loadBotKey();       // bot channel key saved by 'botchan set' (the bot itself is off until 'botchan on')
+  gf.seed(getRNG()->nextInt(1, 2000000000));
 
   // establish default-scope
   {
@@ -1248,6 +1259,7 @@ bool MyMesh::sleepFor(uint32_t duration_ms) {   // (CommonCLI hook; 'sleep <mins
 }
 
 void MyMesh::radioSleep(uint32_t duration_ms) {
+  bot_pending = false;   // a bot reply still waiting is dropped, not held for the next wake
   sleeping = true;
   sleep_wake_at = futureMillis(duration_ms);
   radio_driver.powerOff();
@@ -1620,6 +1632,7 @@ bool MyMesh::chanAllowBlocks(const mesh::Packet* packet) {
   uint8_t h = packet->payload[0];   // channel hash, sent in the clear
   if (chan_key_set && h == chan.hash[0]) return false;   // the command channel is always allowed
   if (h == public_chan.hash[0]) return false;            // so is Public
+  if (bot_key_set && h == botc.hash[0]) return false;    // and the bot channel, when this repeater has its key
   if (chanallow_extra_set && h == chanallow_extra_hash) return false;
   chanallow_dropped++;
   return true;
@@ -1693,6 +1706,10 @@ bool MyMesh::setChannelKey(const char* key) {
 // build and flood a channel text message, the same way BaseChatMesh::sendGroupMessage() does
 bool MyMesh::postChannel(const char* text) {
   if (!chan_key_set) return false;
+  return postTo(chan, text);
+}
+
+bool MyMesh::postTo(const mesh::GroupChannel& ch, const char* text) {
   uint8_t temp[5 + CHAN_MSG_MAX + 40];
   uint32_t ts = getRTCClock()->getCurrentTime();
   memcpy(temp, &ts, 4);
@@ -1703,7 +1720,7 @@ bool MyMesh::postChannel(const char* text) {
   if (prefix_len + text_len > CHAN_MSG_MAX) text_len = CHAN_MSG_MAX - prefix_len;
   memcpy(&temp[5 + prefix_len], text, text_len);
   temp[5 + prefix_len + text_len] = 0;
-  mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, temp, 5 + prefix_len + text_len);
+  mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, 5 + prefix_len + text_len);
   if (pkt == NULL) return false;
   sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
   return true;
@@ -1790,6 +1807,10 @@ void MyMesh::formatStatus(char* reply) {
   snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, hops %s, up %lud%luh%lum",
            cycle_active ? "on" : "off", sleep_auto_enabled ? "on" : "off", blocked,
            chan_key_set ? "set" : "not set", hops, up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
+  if (bot_key_set) {
+    int l = (int)strlen(reply);
+    snprintf(&reply[l], CLI_REPLY_MAX - l, ", bot %s", bot_on ? "on" : "off");
+  }
 }
 
 void MyMesh::noteAutoBlock(const uint8_t* key, uint8_t len) {
@@ -1824,6 +1845,9 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
   if (chan_key_set && n < max_matches && chan.hash[0] == hash[0]) {   // the private command channel
     channels[n++] = chan;
   }
+  if (bot_on && bot_key_set && n < max_matches && botc.hash[0] == hash[0]) {   // the bot channel (only while the bot is on)
+    channels[n++] = botc;
+  }
   if (blockNameCount() == 0) return n;   // empty blockname list: Public / filter channels are not decrypted at all
   if (n < max_matches && public_chan.hash[0] == hash[0]) {
     channels[n++] = public_chan;
@@ -1846,12 +1870,213 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
   uint32_t ts;
   memcpy(&ts, data, 4);
   data[len] = 0;   // text is padded with zeroes (same as BaseChatMesh::onGroupDataRecv)
+  if (bot_on && bot_key_set && memcmp(channel.secret, botc.secret, sizeof(botc.secret)) == 0) {   // bot channel: chat only,
+    handleBotMessage((const char*)&data[5]);                                                        // NEVER commands, no name check
+    return;
+  }
   bool is_command_channel = chan_key_set && memcmp(channel.secret, chan.secret, sizeof(chan.secret)) == 0;
   if (!is_command_channel) {   // Public or a filter channel: only check the sender name, NEVER run commands
     blockNameCheckText((const char*)&data[5]);
     return;
   }
   handleChannelCommand((const char*)&data[5], ts, (int)packet->getPathHashCount());
+}
+
+/* ------------------- Bot channel: flirty chat bot ------------------------------ */
+// People post "*message" on the bot channel and a repeater with the bot on answers (3 to 15 s later, one at a time,
+// then 10 s quiet). The bot channel has its own key and can never run a command.
+
+static int parseKeyBytes(const char* key, uint8_t* tmp /* 32 bytes */) {   // base64 or hex, 16 or 32 bytes; -1 if bad
+  size_t kl = strlen(key);
+  bool all_hex = kl > 0;
+  for (size_t i = 0; i < kl; i++) {
+    if (hexNibble(key[i]) < 0) all_hex = false;
+  }
+  int len;
+  if ((kl == 32 || kl == 64) && all_hex) {
+    len = (int)(kl / 2);
+    for (int i = 0; i < len; i++) tmp[i] = (uint8_t)((hexNibble(key[i * 2]) << 4) | hexNibble(key[i * 2 + 1]));
+  } else {
+    len = b64Decode(key, tmp, 32);
+  }
+  return (len == 16 || len == 32) ? len : -1;
+}
+
+// true if this key is the bot channel's key (or has the same 1 byte hash): 'channel set' refuses it
+bool MyMesh::botKeyConflict(const char* key) {
+  if (!bot_key_set) return false;
+  uint8_t tmp[32];
+  memset(tmp, 0, sizeof(tmp));
+  int len = parseKeyBytes(key, tmp);
+  if (len < 0) return false;
+  uint8_t hh[sizeof(botc.hash)];
+  mesh::Utils::sha256(hh, sizeof(hh), tmp, len);
+  return hh[0] == botc.hash[0] || memcmp(tmp, botc.secret, sizeof(botc.secret)) == 0;
+}
+
+// 0 = set, 1 = bad key, 2 = same as the Public or command channel (or the same 1 byte hash)
+int MyMesh::setBotKey(const char* key) {
+  uint8_t tmp[32];
+  memset(tmp, 0, sizeof(tmp));
+  int len = parseKeyBytes(key, tmp);
+  if (len < 0) return 1;
+  uint8_t hh[sizeof(botc.hash)];
+  mesh::Utils::sha256(hh, sizeof(hh), tmp, len);
+  if (memcmp(tmp, public_chan.secret, sizeof(public_chan.secret)) == 0 || hh[0] == public_chan.hash[0]) return 2;
+  if (chan_key_set && (memcmp(tmp, chan.secret, sizeof(chan.secret)) == 0 || hh[0] == chan.hash[0])) return 2;
+  memset(&botc, 0, sizeof(botc));
+  memcpy(botc.secret, tmp, len);
+  memcpy(botc.hash, hh, sizeof(botc.hash));
+  bot_key_len = (uint8_t)len;
+  bot_key_set = true;
+  bot_on = false;
+  bot_pending = false;
+  return 0;
+}
+
+void MyMesh::saveBotKey() {   // /bot_key: 1 byte key length + 32 bytes key
+  if (_fs == NULL || !bot_key_set) return;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(BOT_KEY_FILE);
+  File f = _fs->open(BOT_KEY_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(BOT_KEY_FILE, "w");
+#else
+  File f = _fs->open(BOT_KEY_FILE, "w", true);
+#endif
+  if (f) {
+    uint8_t buf[33];
+    buf[0] = bot_key_len;
+    memcpy(&buf[1], botc.secret, 32);
+    f.write(buf, sizeof(buf));
+    f.close();
+  }
+}
+
+void MyMesh::loadBotKey() {
+  if (_fs == NULL || !_fs->exists(BOT_KEY_FILE)) return;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(BOT_KEY_FILE, "r");
+#else
+  File f = _fs->open(BOT_KEY_FILE);
+#endif
+  if (f) {
+    uint8_t buf[33];
+    int n = f.read(buf, sizeof(buf));
+    f.close();
+    if (n == 33 && (buf[0] == 16 || buf[0] == 32)) {
+      mesh::GroupChannel tmp;
+      memset(&tmp, 0, sizeof(tmp));
+      memcpy(tmp.secret, &buf[1], 32);
+      mesh::Utils::sha256(tmp.hash, sizeof(tmp.hash), tmp.secret, buf[0]);
+      bool clash = (tmp.hash[0] == public_chan.hash[0]) || (chan_key_set && tmp.hash[0] == chan.hash[0]);   // never share a hash with the command channel
+      if (!clash) {
+        botc = tmp;
+        bot_key_len = buf[0];
+        bot_key_set = true;   // bot_on stays false: off after every reboot
+      }
+    }
+  }
+}
+
+void MyMesh::handleBotCommand(const char* sub, char* reply) {
+  bool is_on = strcmp(sub, "on") == 0, is_off = strcmp(sub, "off") == 0, is_status = (*sub == 0);
+  if (from_channel && !(is_on || is_off || is_status)) {   // over the air only: botchan, botchan on, botchan off
+    reply[0] = 0;
+    return;
+  }
+  if (is_status) {
+    if (!bot_key_set) strcpy(reply, "botchan key not set");
+    else snprintf(reply, 80, "botchan %s, hash %02X, replies %lu", bot_on ? "on" : "off", botc.hash[0], (unsigned long)bot_replies);
+  } else if (memcmp(sub, "set ", 4) == 0) {
+    const char* key = sub + 4;
+    while (*key == ' ') key++;
+    int r = setBotKey(key);
+    if (r == 0) {
+      saveBotKey();
+      snprintf(reply, 80, "OK - bot key set and saved (hash %02X), bot is off", botc.hash[0]);
+    } else if (r == 1) {
+      strcpy(reply, "Err - key must be base64 or hex, 16 or 32 bytes");
+    } else {
+      strcpy(reply, "Err - bot key (or its hash) matches the command or Public channel");
+    }
+  } else if (is_on) {
+    if (!bot_key_set) {
+      strcpy(reply, "Err - botchan key not set (botchan set <key>)");
+    } else {
+      bot_on = true;
+      strcpy(reply, "OK - bot on");
+    }
+  } else if (is_off) {
+    bot_on = false;
+    bot_pending = false;
+    strcpy(reply, "OK - bot off");
+  } else if (strcmp(sub, "get") == 0) {
+    if (!bot_key_set) {
+      strcpy(reply, "botchan key not set");
+    } else {
+      char b64[48];
+      b64Encode(botc.secret, bot_key_len, b64);
+      snprintf(reply, 100, "botchan %s, hash %02X, key: %s", bot_on ? "on" : "off", botc.hash[0], b64);
+    }
+  } else if (strcmp(sub, "clear") == 0) {
+    bot_on = false;
+    bot_pending = false;
+    bot_key_set = false;
+    bot_key_len = 0;
+    memset(&botc, 0, sizeof(botc));
+    if (_fs) _fs->remove(BOT_KEY_FILE);
+    strcpy(reply, "OK - bot key cleared, bot off");
+  } else {
+    strcpy(reply, "Err - botchan set <key>|on|off|get|clear");
+  }
+}
+
+// "<sender>: *message" on the bot channel: work out a reply and queue it (one at a time)
+void MyMesh::handleBotMessage(const char* text) {
+  if (sleeping || bot_pending) return;
+  if (bot_quiet_on && !millisHasNowPassed(bot_quiet_until)) return;   // the 10 s quiet period
+  const char* colon = strstr(text, ": ");   // "<sender>: <message>"
+  if (colon == NULL) return;
+  char sender[40];
+  int sl = (int)(colon - text);
+  if (sl < 1) return;
+  if (sl > (int)sizeof(sender) - 1) sl = (int)sizeof(sender) - 1;
+  memcpy(sender, text, sl);
+  sender[sl] = 0;
+  const char* msg = colon + 2;
+  while (*msg == ' ') msg++;
+  if (*msg != '*') return;   // only messages that start with *
+  msg++;
+
+  int maxlen = BOT_REPLY_MAX - (int)strlen(_prefs.node_name) - 2;   // "<node name>: " goes in front
+  if (maxlen > CHAN_MSG_MAX - 2) maxlen = CHAN_MSG_MAX - 2;
+  if (maxlen < 20) return;
+
+  uint32_t now = getRTCClock()->getCurrentTime();
+  int hour = -1;   // Brisbane hour, or -1 while the clock is not set
+  if (now >= CLOCK_VALID_AFTER) hour = (int)(((now + BRISBANE_UTC_OFFSET_SECS) % 86400UL) / 3600UL);
+
+  char out[CHAN_MSG_MAX + 1];
+  int n = gf.reply(sender, msg, millis() / 1000UL, hour, out, maxlen);
+  if (n <= 0) return;
+  strncpy(bot_text, out, CHAN_MSG_MAX);
+  bot_text[CHAN_MSG_MAX] = 0;
+  bot_pending = true;
+  bot_due_at = futureMillis(getRNG()->nextInt(BOT_DELAY_MIN_MS, BOT_DELAY_MAX_MS + 1));
+}
+
+void MyMesh::botService() {   // send the waiting reply when its time has come (radio awake only)
+  if (!bot_pending) return;
+  if (!bot_on || !bot_key_set) {
+    bot_pending = false;
+    return;
+  }
+  if (!millisHasNowPassed(bot_due_at)) return;
+  bot_pending = false;
+  if (postTo(botc, bot_text)) bot_replies++;
+  bot_quiet_on = true;
+  bot_quiet_until = futureMillis(BOT_QUIET_MS);
 }
 
 // channel commands look like  <battlog all>  <templog Tuna>  <sleep until 21:00 all>
@@ -1888,6 +2113,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
                  || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
                  || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
                  || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
+                 || strcmp(buf, "botchan") == 0 || strcmp(buf, "botchan on") == 0 || strcmp(buf, "botchan off") == 0   // (never set / get / clear)
                  || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
                  || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
@@ -2057,13 +2283,22 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     return true;
   }
 
+  if (memcmp(command, "botchan", 7) == 0 && (command[7] == 0 || command[7] == ' ')) {
+    const char* sub = command + 7;
+    while (*sub == ' ') sub++;
+    handleBotCommand(sub, reply);
+    return true;
+  }
+
   if (memcmp(command, "channel ", 8) == 0 || strcmp(command, "channel") == 0) {
     const char* sub = command + (command[7] == ' ' ? 8 : 7);
     while (*sub == ' ') sub++;
     if (memcmp(sub, "set ", 4) == 0) {
       const char* key = sub + 4;
       while (*key == ' ') key++;
-      if (setChannelKey(key)) {
+      if (botKeyConflict(key)) {
+        strcpy(reply, "Err - that key (or its hash) is the bot channel");
+      } else if (setChannelKey(key)) {
         saveChannelKey();
         strcpy(reply, "OK - channel key set and saved");
       } else {
@@ -2627,7 +2862,10 @@ void MyMesh::loop() {
   }
   dailyReport();           // 24h report timer (counts while asleep too)
   blockNoticeService();    // announce newly auto-blocked repeaters
-  if (!sleeping) chanService();   // post queued channel messages while the radio is awake
+  if (!sleeping) {   // post queued channel messages and the bot reply while the radio is awake
+    chanService();
+    botService();
+  }
 
   // A packet leaves the send queue when its transmission STARTS, and the transmission takes seconds.
   // So after the last queued send, stay awake for a quiet period before the radio may go to sleep.
@@ -2639,7 +2877,8 @@ void MyMesh::loop() {
 
   // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
   if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork() && radio_quiet
-      && (chan_q_n == 0 || millisHasNowPassed(sleep_deadline))) {
+      && (chan_q_n == 0 || millisHasNowPassed(sleep_deadline))
+      && (!bot_pending || millisHasNowPassed(sleep_deadline))) {   // a waiting bot reply goes out first (same cap)
     sleep_pending = false;
     if (!(sleep_target_abs && millisHasNowPassed(sleep_target_at))) {   // (target already passed: nothing to sleep)
       radioSleep(sleep_duration_ms);
@@ -2681,7 +2920,7 @@ void MyMesh::loop() {
     }
   }
   // end of an awake window: back to sleep (an admin login stops the cycle before this)
-  if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet) {
+  if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet && !bot_pending) {
     radioSleep(CYCLE_SLEEP_MS);
     return;
   }

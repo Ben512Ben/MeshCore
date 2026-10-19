@@ -36,6 +36,7 @@
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
 #include "RateLimiter.h"
+#include "GfBot.h"   // flirty chat bot engine (bot channel)
 
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
@@ -89,6 +90,11 @@ struct NeighbourInfo {
 #define BLOCKNAME_LEN 32        // 31 characters + terminator
 #define BLOCKNAME_PER_PAGE 5    // most entries shown by one 'blockname list'
 #define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
+#define BOT_KEY_FILE "/bot_key"   // saved key of the bot channel (same layout as /chan_key)
+#define BOT_REPLY_MAX 134         // longest bot reply, including "<node name>: "
+#define BOT_QUIET_MS  10000       // after a bot reply, requests are ignored for this long
+#define BOT_DELAY_MIN_MS 3000     // the reply goes out this long ...
+#define BOT_DELAY_MAX_MS 15000    //   ... to this long after the request (random, so bot repeaters don't collide)
 
 #define PACKET_LOG_FILE  "/packet_log"
 
@@ -202,6 +208,18 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long busy_until;        // ... radio stays on until a quiet period has passed
   bool boot_notice_pending, boot_notice_armed;   // 'Rebooted' channel message after start-up
   unsigned long boot_notice_at;
+
+  // bot channel (own key, never the command channel; the key is saved, on/off is RAM only and off after every boot)
+  bool bot_key_set, bot_on;
+  uint8_t bot_key_len;
+  mesh::GroupChannel botc;
+  bool bot_pending;                     // one reply is waiting for its send time
+  char bot_text[CHAN_MSG_MAX + 1];
+  unsigned long bot_due_at;
+  bool bot_quiet_on;
+  unsigned long bot_quiet_until;
+  uint32_t bot_replies;
+  GfBot gf;
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -243,6 +261,14 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void noteAutoBlock(const uint8_t* key, uint8_t len);
   void blockNoticeService();
   void handleChannelCommand(const char* text, uint32_t ts, int hops);
+  bool postTo(const mesh::GroupChannel& ch, const char* text);
+  int setBotKey(const char* key);
+  bool botKeyConflict(const char* key);
+  void saveBotKey();
+  void loadBotKey();
+  void handleBotMessage(const char* text);
+  void botService();
+  void handleBotCommand(const char* sub, char* reply);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -380,7 +406,7 @@ public:
   // true while timed channel work is waiting (ESP32 only): the main loop must not light-sleep for up to 30 s then
   bool needsFastLoop() const {
 #if defined(ESP32)
-    return sleep_pending || (chan_q_n > 0 && !sleeping);
+    return sleep_pending || ((chan_q_n > 0 || bot_pending) && !sleeping);
 #else
     return false;
 #endif
