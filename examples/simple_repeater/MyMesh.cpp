@@ -1359,6 +1359,24 @@ void MyMesh::batteryMonitor() {
   }
 }
 
+// Battery percent from voltage: single-cell Li-ion resting-voltage curve, linear between points.
+// An estimate only: it reads high while charging (solar) and low under heavy load.
+static int battPercent(unsigned mv) {
+  static const uint16_t v[] = {3270, 3610, 3690, 3710, 3730, 3750, 3770, 3790, 3800, 3820,
+                               3840, 3850, 3870, 3910, 3950, 3980, 4020, 4080, 4110, 4150, 4200};
+  static const uint8_t  p[] = {   0,    5,   10,   15,   20,   25,   30,   35,   40,   45,
+                                 50,   55,   60,   65,   70,   75,   80,   85,   90,   95,  100};
+  const int n = sizeof(v) / sizeof(v[0]);
+  if (mv <= v[0]) return 0;
+  if (mv >= v[n - 1]) return 100;
+  for (int i = 1; i < n; i++) {
+    if (mv <= v[i]) {
+      return p[i - 1] + (int)(((uint32_t)(mv - v[i - 1]) * (p[i] - p[i - 1]) + (v[i] - v[i - 1]) / 2) / (v[i] - v[i - 1]));
+    }
+  }
+  return 100;
+}
+
 void MyMesh::formatBattLog(char* reply) {
   if (batt_log_count == 0) {
     strcpy(reply, "battlog: no data yet (first reading 5 min after boot)");
@@ -1369,6 +1387,19 @@ void MyMesh::formatBattLog(char* reply) {
     int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
     unsigned mv = batt_log[idx];
     pos += snprintf(&reply[pos], 8, " %u.%02u", mv / 1000, (mv % 1000) / 10);
+  }
+}
+
+void MyMesh::formatBattPct(char* reply) {
+  if (batt_log_count == 0) {
+    strcpy(reply, "battpct: no data yet (first reading 5 min after boot)");
+    return;
+  }
+  int pos = snprintf(reply, 20, "%%/h old>new:");
+  for (int i = 0; i < batt_log_count; i++) {
+    int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+    if (pos > CLI_REPLY_MAX - 6) break;   // never overrun the reply buffer
+    pos += snprintf(&reply[pos], 6, " %d", battPercent(batt_log[idx]));
   }
 }
 
@@ -1778,7 +1809,7 @@ void MyMesh::formatStatus(char* reply) {
     if (blockhop[i].len) blocked++;
   }
   unsigned long up = (unsigned long)(uptime_millis / 1000ULL);
-  int pos = snprintf(reply, 24, "Bat %u.%02uV", mv / 1000, (mv % 1000) / 10);
+  int pos = snprintf(reply, 32, "Bat %u.%02uV %d%%", mv / 1000, (mv % 1000) / 10, battPercent(mv));
   if (!isnan(t)) {
     int t10 = (int)(t * 10.0f + (t >= 0 ? 0.5f : -0.5f));
     int a = t10 < 0 ? -t10 : t10;
@@ -1882,7 +1913,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
       if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
     }
   }
-  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "templog") == 0
+  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
                  || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
                  || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
@@ -1915,7 +1946,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   bool started_sleep = sleep_cmd_flag;
   sleep_cmd_flag = false;
   if (reply[0] != 0) {
-    if ((reply[0] == 'V' || reply[0] == 'C') && reply[1] == '/') {   // battlog / templog line: make it fit
+    if ((reply[0] == 'V' || reply[0] == 'C' || reply[0] == '%') && reply[1] == '/') {   // battlog / battpct / templog line: make it fit
       int prefix = (int)strlen(_prefs.node_name) + 2;
       if (prefix > 39) prefix = 39;
       trimLogToFit(reply, 12, prefix);
@@ -2035,6 +2066,11 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
 
   if (strcmp(command, "battlog") == 0) {
     formatBattLog(reply);
+    return true;
+  }
+
+  if (strcmp(command, "battpct") == 0) {
+    formatBattPct(reply);
     return true;
   }
 

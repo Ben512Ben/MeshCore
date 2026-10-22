@@ -222,6 +222,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void stopSleepCycle();
   void batteryMonitor();
   void formatBattLog(char* reply);
+  void formatBattPct(char* reply);
   void formatTempLog(char* reply);
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
