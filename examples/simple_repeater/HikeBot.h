@@ -46,6 +46,14 @@
 #define HIKE_PEOPLE 15
 #define HIKE_MAXW 40
 
+// Stack is small on the repeater. Handlers are never inlined into each other, and every large work buffer is static
+// (the bot answers one request at a time and is never re-entered), so at most one small frame is live at a time.
+#if defined(__GNUC__)
+  #define HB_NOINLINE __attribute__((noinline))
+#else
+  #define HB_NOINLINE
+#endif
+
 // ---------------------------------------------------------------------------------------------------------------
 // request context
 
@@ -140,8 +148,8 @@ struct HbOut {
   int budget;
 };
 
-static bool hbMsg(HbOut* o, const char* fmt, ...) {
-  char tmp[BOT_MSG_MAX * 2 + 80];
+static HB_NOINLINE bool hbMsg(HbOut* o, const char* fmt, ...) {
+  static char tmp[BOT_MSG_MAX * 2 + 80];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(tmp, sizeof(tmp), fmt, ap);
@@ -174,7 +182,7 @@ static bool hbMsg(HbOut* o, const char* fmt, ...) {
 }
 
 // a text of up to 4 parts separated by '~' becomes messages
-static void hbParts(HbOut* o, const char* text) {
+static HB_NOINLINE void hbParts(HbOut* o, const char* text) {
   while (text && *text) {
     const char* e = strchr(text, '~');
     int len = e ? (int)(e - text) : (int)strlen(text);
@@ -272,7 +280,7 @@ static bool hbParseDistField(const char* f, int* d100) {
   return true;
 }
 
-static void hbParseInfo(const char* info, HikeInfo* r) {
+static HB_NOINLINE void hbParseInfo(const char* info, HikeInfo* r) {
   r->dist100 = -1; r->tlo = r->thi = -1; r->tapprox = false; r->grade = 0; r->offtrack = false;
   r->f0[0] = r->ft[0] = r->feat[0] = 0;
   char buf[160];
@@ -411,10 +419,10 @@ struct HbHit {
 };
 
 // edit distance of a and b (insert, delete, change, swap two letters) if it is at most maxd, else maxd + 1
-static int hbEdit(const char* a, int la, const char* b, int lb, int maxd) {
+static HB_NOINLINE int hbEdit(const char* a, int la, const char* b, int lb, int maxd) {
   if (la - lb > maxd || lb - la > maxd) return maxd + 1;
   if (la > 48 || lb > 48) return maxd + 1;
-  int r0[50], r1[50], r2[50];
+  static int r0[50], r1[50], r2[50];
   int *p2 = r0, *p1 = r1, *cur = r2;
   for (int j = 0; j <= lb; j++) p1[j] = j;
   for (int i = 1; i <= la; i++) {
@@ -536,7 +544,7 @@ static const char* hbEntityName(int kind, int idx) {
 static int hbTrailByWords(const char* phrase) {   // "natural bridge" -> trail index, or -1
   char norm[60];
   trailbotNorm(phrase, norm, sizeof(norm));
-  HbWords w;
+  static HbWords w;
   hbSplit(norm, &w);
   HbHit h = hbFind(&w, 1);
   return (h.ok && h.dist == 0) ? h.idx : -1;
@@ -545,9 +553,9 @@ static int hbTrailByWords(const char* phrase) {   // "natural bridge" -> trail i
 // ---------------------------------------------------------------------------------------------------------------
 // durations in a message: "2 hours", "90 minutes", "1h 20m", "an hour"
 
-static int hbParseDuration(const char* norm) {
+static HB_NOINLINE int hbParseDuration(const char* norm) {
   int total = -1;
-  HbWords w;
+  static HbWords w;
   hbSplit(norm, &w);
   for (int i = 0; i < w.n; i++) {
     // forms: "2" "hours" | "2h" | "2hours" | "an" "hour" | "half" "an" "hour"
@@ -599,6 +607,13 @@ static bool hbLastOk(HbCtx* H) {
          hbHas(H->padded, "it;that;there;this;the walk;the trail;the track;the hike;that walk;this walk;that trail;this trail");
 }
 
+// copies of the sentence's words for searches that mark words as used (static: keeps the stack small)
+static HbWords g_hb_scratch[3];
+static HbWords* hbCopyWords(const HbWords* src, int k) {
+  g_hb_scratch[k] = *src;
+  return &g_hb_scratch[k];
+}
+
 // trail named in the sentence; else (if allowed) the person's last trail. -1 if none.
 static int hbTrailIn(HbCtx* H, bool allow_last, bool mark = true) {
   HbHit h = hbFind(&H->w, 1);
@@ -625,7 +640,7 @@ static const char* hbVerdict(int snr10, int rssi, int* level) {
   return v[lv];
 }
 
-static int hbDoTest(HbCtx* H) {
+static HB_NOINLINE int hbDoTest(HbCtx* H) {
   const HikeCtx* c = H->c;
   char tstr[12];
   if (!H->clk.ok) strcpy(tstr, "n/a");
@@ -633,7 +648,7 @@ static int hbDoTest(HbCtx* H) {
     long secs = ((long)c->now_utc + HIKE_TZ_SECS) % 86400L;
     snprintf(tstr, sizeof(tstr), "%02d:%02d:%02d", (int)(secs / 3600), (int)((secs % 3600) / 60), (int)(secs % 60));
   }
-  char rep[BOT_MSG_MAX + 1];
+  static char rep[BOT_MSG_MAX + 1];
   trailbotTestReply(c->sender, c->slen, H->o.budget, tstr, c->snr10, c->rssi, c->hops, rep);
   int lv;
   const char* verdict = hbVerdict(c->snr10, c->rssi, &lv);
@@ -648,7 +663,7 @@ static int hbDoTest(HbCtx* H) {
   H->who->flags |= HP_HAS_SNR;
   const char* tip = lv <= 1 ? "Tip: try higher, open ground, or a clearer view toward the repeater." : "";
   const char* extra[3] = {verdict, cmp, tip};
-  char cur[BOT_MSG_MAX + 1];
+  static char cur[BOT_MSG_MAX + 1];
   strcpy(cur, rep);
   for (int i = 0; i < 3; i++) {
     if (!extra[i][0]) continue;
@@ -668,12 +683,12 @@ static int hbDoTest(HbCtx* H) {
 // ---------------------------------------------------------------------------------------------------------------
 // time, date and daylight
 
-static void hbNoClock(HbCtx* H) {
+static HB_NOINLINE void hbNoClock(HbCtx* H) {
   hbMsg(&H->o, "My clock isn't set, so I can't tell the time.");
   hbMsg(&H->o, "In SE Qld sunrise is about 4:40 to 6:30 am and sunset about 4:55 to 6:35 pm, depending on the season.");
 }
 
-static int hbDoTimeDate(HbCtx* H) {
+static HB_NOINLINE int hbDoTimeDate(HbCtx* H) {
   if (!H->clk.ok) { hbNoClock(H); return H->o.n; }
   char t[14], r[14], s[14];
   hbFmtClock(H->clk.mins, t, sizeof(t));
@@ -684,7 +699,7 @@ static int hbDoTimeDate(HbCtx* H) {
   return H->o.n;
 }
 
-static int hbDoSun(HbCtx* H) {
+static HB_NOINLINE int hbDoSun(HbCtx* H) {
   if (!H->clk.ok) { hbNoClock(H); return H->o.n; }
   char r[14], s[14], x[14], d[20];
   hbFmtClock(H->clk.rise, r, sizeof(r));
@@ -713,7 +728,7 @@ static int hbNeedMin(const HikePerson* p, const HikeInfo* inf) {
 }
 
 // one message about the daylight for a walk of need minutes starting at 'start' (local minutes)
-static void hbDaylightVerdict(HbCtx* H, int start, int need) {
+static HB_NOINLINE void hbDaylightVerdict(HbCtx* H, int start, int need) {
   const HikeClock* k = &H->clk;
   char s[14], l[14], r[14], f[14];
   hbFmtClock(k->set, s, sizeof(s));
@@ -748,7 +763,7 @@ static void hbDaylightVerdict(HbCtx* H, int start, int need) {
   }
 }
 
-static int hbDoStartAdvice(HbCtx* H, int t, int dur_min) {
+static HB_NOINLINE int hbDoStartAdvice(HbCtx* H, int t, int dur_min) {
   if (!H->clk.ok) {
     hbMsg(&H->o, "I can't see the time (my clock isn't set). Start early so you're back well before sunset.");
     hbMsg(&H->o, "SE Qld sunset is about 4:55 pm in winter to 6:35 pm in summer. Allow the listed time plus rests.");
@@ -780,7 +795,7 @@ static int hbDoStartAdvice(HbCtx* H, int t, int dur_min) {
 }
 
 // glow worms: they only show in full darkness, about half an hour after sunset
-static int hbDoGlow(HbCtx* H) {
+static HB_NOINLINE int hbDoGlow(HbCtx* H) {
   if (!H->clk.ok) return -1;
   int from = H->clk.set + 35;
   char s[14], g[14], x[14];
@@ -804,7 +819,7 @@ static int hbDoGlow(HbCtx* H) {
 // ---------------------------------------------------------------------------------------------------------------
 // hike timer
 
-static void hbTimerReminder(HbCtx* H) {
+static HB_NOINLINE void hbTimerReminder(HbCtx* H) {
   static const char* const v[] = {
     "Tell someone your plan and carry a PLB. I can't raise an alarm if you're overdue.",
     "Leave your plan with someone and carry a PLB. I can't alert anyone if you don't finish.",
@@ -812,7 +827,7 @@ static void hbTimerReminder(HbCtx* H) {
   hbMsg(&H->o, "%s", v[(H->c->seed >> 3) & 1]);
 }
 
-static int hbDoStart(HbCtx* H, int t_in) {
+static HB_NOINLINE int hbDoStart(HbCtx* H, int t_in) {
   if (!H->clk.ok) {
     hbMsg(&H->o, "My clock isn't set, so I can't time your hike. Note your start time yourself.");
     hbTimerReminder(H);
@@ -860,7 +875,7 @@ static int hbDoStart(HbCtx* H, int t_in) {
   return H->o.n;
 }
 
-static void hbExplainElapsed(HbCtx* H, int elapsed, int t, bool from_clock) {
+static HB_NOINLINE void hbExplainElapsed(HbCtx* H, int elapsed, int t, bool from_clock) {
   char e[20];
   hbFmtMin(elapsed, e, sizeof(e));
   HikePerson* p = H->who;
@@ -909,7 +924,7 @@ static void hbExplainElapsed(HbCtx* H, int elapsed, int t, bool from_clock) {
   }
 }
 
-static int hbDoFinish(HbCtx* H, int t_in) {
+static HB_NOINLINE int hbDoFinish(HbCtx* H, int t_in) {
   HikePerson* p = H->who;
   int dur = hbParseDuration(H->norm);
   if (p->t_start && H->clk.ok && dur < 0) {
@@ -959,7 +974,7 @@ static int hbDoFinish(HbCtx* H, int t_in) {
 #define GB_KIDS   0x100
 #define GB_NIGHT  0x200
 
-static int hbDoGear(HbCtx* H, int t) {
+static HB_NOINLINE int hbDoGear(HbCtx* H, int t) {
   uint16_t b = 0;
   if (t >= 0) {
     const char* inf = TRAILS[t].info;
@@ -1000,7 +1015,7 @@ static int hbDoGear(HbCtx* H, int t) {
   if (b & GB_SWIM) list[nl++] = "swimwear and a towel";
   if (b & GB_CREEK) list[nl++] = "check recent rain first";
   if (nl > 0) {
-    char cur[BOT_MSG_MAX + 1];
+    static char cur[BOT_MSG_MAX + 1];
     snprintf(cur, sizeof(cur), "%s", t >= 0 ? "Extras for this walk: " : "Extras: ");
     bool first = true;
     for (int i = 0; i < nl; i++) {
@@ -1039,7 +1054,7 @@ static const char* hbGradeWords(int g) {
   return "";
 }
 
-static int hbDoTrailInfo(HbCtx* H, int t) {
+static HB_NOINLINE int hbDoTrailInfo(HbCtx* H, int t) {
   hbMsg(&H->o, "%s: %s", TRAILS[t].name, TRAILS[t].info);
   if (!(H->who->flags & HP_HINT_SEEN)) {
     H->who->flags |= HP_HINT_SEEN;
@@ -1048,7 +1063,7 @@ static int hbDoTrailInfo(HbCtx* H, int t) {
   return H->o.n;
 }
 
-static int hbDoFacet(HbCtx* H, int t, bool want_time, bool want_dist, bool want_grade, bool want_kids, bool want_feat) {
+static HB_NOINLINE int hbDoFacet(HbCtx* H, int t, bool want_time, bool want_dist, bool want_grade, bool want_kids, bool want_feat) {
   HikeInfo inf;
   hbParseInfo(TRAILS[t].info, &inf);
   const char* nm = TRAILS[t].name;
@@ -1091,7 +1106,7 @@ static int hbDoFacet(HbCtx* H, int t, bool want_time, bool want_dist, bool want_
   return H->o.n;
 }
 
-static int hbDoCompare(HbCtx* H, int a, int b) {
+static HB_NOINLINE int hbDoCompare(HbCtx* H, int a, int b) {
   HikeInfo ia, ib;
   hbParseInfo(TRAILS[a].info, &ia);
   hbParseInfo(TRAILS[b].info, &ib);
@@ -1099,7 +1114,7 @@ static int hbDoCompare(HbCtx* H, int a, int b) {
   bool fl = hbHas(H->padded, "longer;shorter;longest;shortest;further;farther;distance");
   bool fq = hbHas(H->padded, "quicker;faster;slower;quickest;fastest;time;takes longer;less time;more time");
   if (!fh && !fl && !fq) fh = fl = fq = true;
-  char sen[3][110];
+  static char sen[3][110];
   int ns = 0;
   if (fh) {
     if (ia.grade && ib.grade && ia.grade != ib.grade) {
@@ -1125,7 +1140,7 @@ static int hbDoCompare(HbCtx* H, int a, int b) {
                ma > mb ? ib.ft : ia.ft);
     else if (ma >= 0 && mb >= 0) snprintf(sen[ns++], sizeof(sen[0]), "Similar times.");
   }
-  char cur[BOT_MSG_MAX + 1];
+  static char cur[BOT_MSG_MAX + 1];
   cur[0] = 0;
   for (int i = 0; i < ns; i++) {
     if (cur[0] && (int)strlen(cur) + 1 + (int)strlen(sen[i]) > H->o.budget) { hbMsg(&H->o, "%s", cur); cur[0] = 0; }
@@ -1215,10 +1230,10 @@ static void hbFmtItem(const Trail* tr, char* out, int osz) {
   else snprintf(out, osz, "%s", tr->name);
 }
 
-static int hbSuggestList(HbCtx* H, bool more) {
+static HB_NOINLINE int hbSuggestList(HbCtx* H, bool more) {
   HikePerson* p = H->who;
-  int idx[TRAIL_COUNT];
-  int sc[TRAIL_COUNT];
+  static int idx[TRAIL_COUNT];
+  static int sc[TRAIL_COUNT];
   int cnt = 0;
   bool relaxed = false;
   for (int pass = 0; pass < 2 && cnt == 0; pass++) {
@@ -1248,14 +1263,14 @@ static int hbSuggestList(HbCtx* H, bool more) {
     off = 0;
   }
   int shown = 0;
-  char cur[BOT_MSG_MAX + 1];
+  static char cur[BOT_MSG_MAX + 1];
   cur[0] = 0;
   const char* head = relaxed ? "Closest matches: " : "Try: ";
   snprintf(cur, sizeof(cur), "%s", head);
   bool first_in_msg = true;
   int msgs_started = 1;
   for (int k = off; k < cnt && shown < 5; k++) {
-    char item[100];
+    static char item[100];
     hbFmtItem(&TRAILS[idx[k]], item, sizeof(item));
     int need = (int)strlen(cur) + (first_in_msg ? 0 : 2) + (int)strlen(item);
     if (need > H->o.budget) {
@@ -1286,7 +1301,7 @@ static int hbSuggestList(HbCtx* H, bool more) {
 }
 
 // read the walk preferences out of the sentence into the person's search
-static void hbReadFilters(HbCtx* H, HbWords* w) {
+static HB_NOINLINE void hbReadFilters(HbCtx* H, HbWords* w) {
   HikePerson* p = H->who;
   p->sg_glo = p->sg_ghi = 0;
   p->sg_tmin = p->sg_tmax = 0;
@@ -1341,8 +1356,8 @@ static bool hbSafetyWins(const char* padded, bool gearish) {
 // ---------------------------------------------------------------------------------------------------------------
 // the front door
 
-static int hbChat(HbCtx* H, const char* text) {
-  char rep[BOT_MSG_MAX + 1];
+static HB_NOINLINE int hbChat(HbCtx* H, const char* text) {
+  static char rep[BOT_MSG_MAX + 1];
   rep[0] = 0;
   int n = chatbotReply(H->c->sender, H->c->slen, text, H->o.budget, H->c->seed, rep);
   if (n <= 0 || rep[0] == 0) return H->o.n;
@@ -1356,7 +1371,7 @@ static bool hbTopicExists(HbCtx* H, int min_prio) {
   return false;
 }
 
-static bool hbTopic(HbCtx* H, int min_prio, int max_prio) {
+static HB_NOINLINE bool hbTopic(HbCtx* H, int min_prio, int max_prio) {
   int best = -1;
   for (int i = 0; i < HIKE_TOPIC_COUNT; i++) {
     int pr = HIKE_TOPICS[i].prio;
@@ -1375,7 +1390,7 @@ static bool hbTopic(HbCtx* H, int min_prio, int max_prio) {
   const char* s = txt;
   for (int k = 0; k < v; k++) { s = strchr(s, '|'); s++; }
   const char* e = strchr(s, '|');
-  char seg[4 * (HIKE_PART_MAX + 2) + 8];
+  static char seg[4 * (HIKE_PART_MAX + 2) + 8];
   int len = e ? (int)(e - s) : (int)strlen(s);
   if (len > (int)sizeof(seg) - 1) len = (int)sizeof(seg) - 1;
   memcpy(seg, s, len);
@@ -1384,7 +1399,7 @@ static bool hbTopic(HbCtx* H, int min_prio, int max_prio) {
   return true;
 }
 
-static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_MAX + 1]) {
+static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_MAX + 1]) {
   if (!g_hike_ready) {
     memset(g_hike_cyc, 255, sizeof(g_hike_cyc));
     memset(g_hike_people, 0, sizeof(g_hike_people));
@@ -1467,7 +1482,7 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
   }
   // a trail named while a timer without a trail is running: attach it
   if (P->t_start && P->t_trail < 0) {
-    HbWords w2 = H.w;
+    HbWords& w2 = *hbCopyWords(&H.w, 0);
     HbHit h = hbFind(&w2, 1);
     if (h.ok && h.dist == 0) { P->t_trail = (int16_t)h.idx; }
   }
@@ -1505,7 +1520,7 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
   // 7. compare two trails
   if (hbHas(H.padded, "harder;easier;longer;shorter;quicker;faster;slower;steeper;tougher;versus;vs;compared to;compare;which is better;"
                       "which one is;which is longer;which is harder;difference between")) {
-    HbWords w2 = H.w;
+    HbWords& w2 = *hbCopyWords(&H.w, 0);
     HbHit h1 = hbFind(&w2, 1);
     if (h1.ok) {
       hbUse(&w2, &h1);
@@ -1550,12 +1565,12 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
                                   "with a pram;with a stroller;kid friendly;family friendly;for children;with children;with a baby;with babies");
     bool f_feat = hbHas(H.padded, "what is there to see;what can i see;what is on it;highlights;what does it have;features;what is along");
     if (f_time || f_dist || f_grade || f_kids || f_feat) {
-      HbWords w2 = H.w;
+      HbWords& w2 = *hbCopyWords(&H.w, 0);
       HbHit h = hbFind(&w2, 1);
       int t = -1;
       if (h.ok) t = h.idx;
       else {
-        HbWords w3 = H.w;
+        HbWords& w3 = *hbCopyWords(&H.w, 1);
         HbHit place = hbFind(&w3, 6);   // a town or region named: that is a search, not a question about the last trail
         if (!place.ok && P->last_trail >= 0 && (hbLastOk(&H) || hbWordCount(H.norm) <= 5)) t = P->last_trail;
       }
@@ -1566,7 +1581,7 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
         return hbDoFacet(&H, t, f_time || both, f_dist || both, f_grade, f_kids, f_feat);
       }
       if (hbWordCount(H.norm) <= 5 && !(f_time && hbHas(H.padded, "hike;walk"))) {
-        HbWords w3 = H.w;
+        HbWords& w3 = *hbCopyWords(&H.w, 1);
         HbHit place = hbFind(&w3, 6);
         if (!place.ok) {
           hbMsg(&H.o, "Which trail do you mean? Tell me the name, like Twin Falls, and I'll look it up.");
@@ -1586,7 +1601,7 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
                      hbHas(H.padded, "walk;walks;hike;hikes;trail;trails;track;tracks;route;routes;bushwalk;bushwalks");
     bool named_trail = false;
     {
-      HbWords w4 = H.w;
+      HbWords& w4 = *hbCopyWords(&H.w, 2);
       HbHit th = hbFind(&w4, 1);
       named_trail = th.ok && th.dist == 0;
       if (named_trail) {   // a trail is named, but a place too ("easy coastal walk near the gold coast"): still a search
@@ -1596,7 +1611,7 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
       }
     }
     if ((sug_key || sug_loose) && !named_trail) {
-      HbWords w2 = H.w;
+      HbWords& w2 = *hbCopyWords(&H.w, 0);
       HikePerson save = *P;
       hbReadFilters(&H, &w2);
       if (hbHasFilters(P)) {
@@ -1627,7 +1642,7 @@ static int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_M
 
   // 12. a trail, town or region named anywhere in the sentence
   {
-    HbWords w2 = H.w;
+    HbWords& w2 = *hbCopyWords(&H.w, 0);
     HbHit h = hbFind(&w2, 7);
     if (h.ok) {
       if (h.tie && h.alt_kind >= 0) {

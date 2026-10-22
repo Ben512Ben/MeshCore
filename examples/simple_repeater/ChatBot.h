@@ -66,7 +66,7 @@ static bool chatWordIs(const char* w, int len, const char* lit) {
 
 // lowercase words separated by single spaces, apostrophes and other punctuation removed, contractions expanded
 static void chatNorm(const char* in, char* out, int outsz) {
-  char tmp[CHAT_WORK_MAX];
+  static char tmp[CHAT_WORK_MAX];
   int n = 0;
   bool space = false;
   for (const unsigned char* p = (const unsigned char*)in; *p && n < (int)sizeof(tmp) - 2; p++) {
@@ -343,13 +343,13 @@ static int chatbotReply(const char* sender, int slen, const char* text, int budg
   if (budget > BOT_MSG_MAX) budget = BOT_MSG_MAX;
   if (budget < 20) return 0;
 
-  char name[CHAT_NAME_MAX + 8];
+  static char name[CHAT_NAME_MAX + 8];   // static: keeps the stack small (one request at a time)
   chatCleanName(sender, slen, name);
 
-  char norm[CHAT_WORK_MAX];
+  static char norm[CHAT_WORK_MAX];
   chatNorm(text, norm, sizeof(norm));
 
-  char buf[CHAT_WORK_MAX + 8];
+  static char buf[CHAT_WORK_MAX + 8];
   const char* none = "";
   ChatSender* who = chatSenderFor(chatHash(name, (int)strlen(name)));
   bool ok = false;
@@ -357,13 +357,14 @@ static int chatbotReply(const char* sender, int slen, const char* text, int budg
   if (norm[0] == 0) {   // just "!"
     ok = chatPick(CHAT_EMPTY, &g_chat_empty_cyc, seed, name, none, none, none, buf, sizeof(buf));
   } else {
-    char padded[CHAT_WORK_MAX + 4];
+    static char padded[CHAT_WORK_MAX + 4];
     snprintf(padded, sizeof(padded), " %s ", norm);
     uint16_t h = chatHash(norm, (int)strlen(norm));
 
     int best = -1;
     const char* best_after = NULL;
-    char best_key[44] = "";
+    static char best_key[44];
+    best_key[0] = 0;
     for (int i = 0; i < CHAT_RULE_COUNT; i++) {
       if (best >= 0 && CHAT_RULES[i].prio <= CHAT_RULES[best].prio) continue;
       char mk[44];
@@ -383,7 +384,7 @@ static int chatbotReply(const char* sender, int slen, const char* text, int budg
       if (ok) who->mem[0] = 0;
     }
     if (!ok && best >= 0) {
-      char cap_raw[CHAT_CAP_MAX + 8], cap[CHAT_CAP_MAX + 24], amp_raw[CHAT_CAP_MAX + 60], amp[CHAT_CAP_MAX + 80];
+      static char cap_raw[CHAT_CAP_MAX + 8], cap[CHAT_CAP_MAX + 24], amp_raw[CHAT_CAP_MAX + 60], amp[CHAT_CAP_MAX + 80];
       chatCapture(best_after, cap_raw, sizeof(cap_raw));
       chatReflect(cap_raw, cap, sizeof(cap));
       snprintf(amp_raw, sizeof(amp_raw), "%s%s%s", best_key, cap_raw[0] ? " " : "", cap_raw);
