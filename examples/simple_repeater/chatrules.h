@@ -1,6 +1,6 @@
 #pragma once
 /*
- * ELIZA-style chat rules for the bot channel (item 33). Trigger: a message that starts with '*', e.g. "*hello".
+ * ELIZA-style chat rules for the bot channel (item 33). Trigger: a message that starts with '!' and is not a trail, town, region or signal request, e.g. "!hello".
  * Compiled into the firmware (flash). To change what the bot says, edit this file and rebuild.
  *
  * A rule is: { keys, priority, flags, replies }
@@ -44,7 +44,7 @@ static const ChatRule CHAT_RULES[] = {
    "Sounds serious. Call 000 (112 on mobile) now. I'm only a bot; mesh may not reach help.|With no signal, use a PLB or EPIRB if you carry one, and stay put."},
   {"need help;help me;please help;urgent;emergency;sos;mayday;call for help;need rescue;need rescuing", 100, 0,
    "Is this an emergency? Call 000 (112 on mobile). I'm only a bot.|If you need urgent help, call 000. Mesh messages may not reach rescuers."},
-  {"lost;cannot find the track;cannot find the trail;cannot find the path;off track;off the track;wrong way;turned around", 95, 0,
+  {"lost;cannot find the track;cannot find the trail;cannot find the path;i am off track;i am off the track;we are off track;we are off the track;wrong way;turned around", 95, 0,
    "Lost? Stop, stay put, stay warm. Call 000 if you can. Mesh may not reach help.|Stay where you are. Go back only to the last sign you know. Call 000 if unsafe."},
   {"snake;snakes", 90, 0,
    "Give snakes space, stay calm, and back away slowly. If bitten, stay still and call 000.|Most snakes just want to leave. Walk around, don't poke. If bitten, call 000."},
@@ -121,13 +121,13 @@ static const ChatRule CHAT_RULES[] = {
   {"mesh;meshcore;repeater;node;radio;lora;antenna;signal;range", 40, 0,
    "Mesh is magic. What are you running, @?|I live inside a repeater, so I'm biased. How's your signal?|Range depends on height and line of sight. Higher is better."},
   {"test", 40, 0,
-   "Try !test for a signal report, @. For a chat, start with *"},
+   "Try !test for a signal report, @. Or just chat: !hello"},
   {"joke;funny;laugh;jokes", 45, 0,
    "Why did the hiker bring a ladder? It was a steep trail.|I'd tell a joke about the trail, but it's all uphill.|What do you call a hiker who never gets lost? A liar."},
   {"fact;trivia;did you know;facts", 45, 0,
    "Fact: Lamington and Springbrook are part of the Gondwana Rainforests World Heritage Area.|Fact: Captain Cook named the Glass House Mountains in 1770, after glass furnaces.|Fact: Natural Bridge has a glow worm colony. Best after dark. Try !natural bridge.|Fact: Mount Coot-tha is a short walk from the Brisbane CBD. Try !mount coot-tha."},
   {"bored", 45, 0,
-   "Bored? Try *joke, or *fact. Or !trails to plan the next one.|Tell me where you walked last, @."},
+   "Bored? Try !joke, or !fact. Or !trails to plan the next one.|Tell me where you walked last, @."},
   {"weekend;today;tomorrow;yesterday;tonight", 30, 0,
    "What are you planning, @?|Tell me more about your plans."},
 
@@ -143,7 +143,7 @@ static const ChatRule CHAT_RULES[] = {
   {"computer;computers;ai;chatgpt;robot;machine;artificial", 35, 0,
    "Do computers worry you?|I'm not an AI, just rules running on a radio.|What do you think machines have to do with this?"},
   {"help", 25, 0,
-   "I'm a chat bot. Say anything after *, like *hello. For trails use !trails. For emergencies call 000.|Try *hello, *joke or *fact. Trails: !trails. Emergency: 000."},
+   "I'm a hiking helper. Ask me about trails, gear or timing. Emergencies: call 000.|Try !hello, !joke or !fact. Trails: !trails. Emergency: 000."},
 
   // ============ greetings, thanks, goodbyes ============
   {"hello;hi;hey;howdy;good morning;good afternoon;good evening;yo;hiya", 38, 0,
@@ -248,7 +248,7 @@ static const char* const CHAT_FALLBACK =
 
 // the message was just "*"
 static const char* const CHAT_EMPTY =
-  "Yes, @? What's on your mind?|Say something after the *, like *hello.|I'm listening, @.";
+  "Yes, @? What's on your mind?|Say something after the !, like !hello.|I'm listening, @.";
 
 // the same person sent the same message twice in a row
 static const char* const CHAT_REPEAT =

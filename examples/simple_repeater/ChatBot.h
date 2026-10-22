@@ -1,14 +1,14 @@
 #pragma once
 /*
  * ELIZA-style chat engine for the bot channel (item 33). Pure functions: no mesh, radio or Arduino calls, so it can
- * be tested on a PC (tools/chatbot_test.cpp). MyMesh.cpp calls chatbotReply() for a message that starts with '*'.
+ * be tested on a PC (tools/chatbot_test.cpp). HikeBot.h calls chatbotReply() for a '!' message it can not answer from the trail or hike knowledge.
  *
  * What it does, in order:
  *   1. cleans the message (lowercase, no punctuation, contractions expanded, a few slang words fixed)
  *   2. finds the matching rule with the highest priority (chatrules.h)
  *   3. cuts out what the person said after the keyword, swaps I/you, my/your, am/are
  *   4. picks the next reply template of that rule (so it does not repeat), and fills in the blanks
- *   5. remembers one line per person (8 people) to bring up later, and notices repeated messages
+ *   5. remembers one line per person (15 people) to bring up later, and notices repeated messages
  *
  * Safety rules (emergencies, being lost, snakes, low water ...) have the top priorities, so they win over chat.
  * A reply never starts with '!' or '*', so another bot repeater on the channel can not mistake it for a request.
@@ -27,7 +27,7 @@
 #define CHAT_TEXT_MAX  168     // longest cleaned message kept (characters)
 #define CHAT_CAP_MAX   44      // longest piece of the person's words that is repeated back
 #define CHAT_NAME_MAX  18      // longest sender name used in a reply (bytes)
-#define CHAT_SENDERS   8       // how many people it remembers
+#define CHAT_SENDERS   15      // how many people it remembers
 #define CHAT_WORK_MAX  (CHAT_TEXT_MAX + 16)
 
 struct ChatSender {
@@ -354,7 +354,7 @@ static int chatbotReply(const char* sender, int slen, const char* text, int budg
   ChatSender* who = chatSenderFor(chatHash(name, (int)strlen(name)));
   bool ok = false;
 
-  if (norm[0] == 0) {   // just "*"
+  if (norm[0] == 0) {   // just "!"
     ok = chatPick(CHAT_EMPTY, &g_chat_empty_cyc, seed, name, none, none, none, buf, sizeof(buf));
   } else {
     char padded[CHAT_WORK_MAX + 4];

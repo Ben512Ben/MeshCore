@@ -1,6 +1,5 @@
 #include "MyMesh.h"
-#include "TrailBot.h"   // trail info bot (item 32): lookup + reply text
-#include "ChatBot.h"    // ELIZA-style chat for messages that start with * (item 33)
+#include "HikeBot.h"    // one bot for every "!" message: trails, hiking help, signal test and chat (uses TrailBot.h, ChatBot.h)
 #include <algorithm>
 #ifdef HELTEC_LORA_V4
 #include <driver/gpio.h>   // gpio_pulldown_en() for DIO1 while the radio sleeps
@@ -1898,33 +1897,22 @@ void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi) {
   int slen = (int)(body - text);           // length of the sender name
   body += 2;
   while (*body == ' ') body++;
-  if (*body != '!' && *body != '*') return;                         // '!' = trails and test, '*' = chat
+  if (*body != '!') return;                                         // '!' is the only trigger
   if (bot_q_n > 0) return;                                          // still answering the last request
   if (bot_rate_on && !millisHasNowPassed(bot_next_ok_at)) return;   // one answer per 10 s at most
-  int n;
-  if (*body == '*') {   // chat: ELIZA-style, one reply (the sender's name is the text before the ": ")
-    int prefix = (int)strlen(_prefs.node_name) + 2;
-    if (prefix > 39) prefix = 39;
-    n = chatbotReply(text, slen, body + 1, BOT_MSG_MAX - prefix, (uint32_t)getRNG()->nextInt(0, 65536), bot_q[0]) > 0 ? 1 : 0;
-  } else if (trailbotIsTest(body + 1)) {   // '!test': say what this repeater heard
-    char tstr[12];
-    uint32_t now = getRTCClock()->getCurrentTime();
-    if (now < CLOCK_VALID_AFTER) {
-      strcpy(tstr, "n/a");   // clock not set
-    } else {   // Brisbane time, like 'sleep until'
-      uint32_t day_secs = (uint32_t)((now + BRISBANE_UTC_OFFSET_SECS) % 86400UL);
-      snprintf(tstr, sizeof(tstr), "%02u:%02u:%02u", (unsigned)(day_secs / 3600U), (unsigned)((day_secs % 3600U) / 60U),
-               (unsigned)(day_secs % 60U));
-    }
-    int snr10 = (int)(snr * 10.0f + (snr >= 0 ? 0.5f : -0.5f));
-    int prefix = (int)strlen(_prefs.node_name) + 2;
-    if (prefix > 39) prefix = 39;
-    trailbotTestReply(text, slen, BOT_MSG_MAX - prefix, tstr, snr10, rssi, hops, bot_q[0]);
-    n = 1;
-  } else {
-    n = trailbotReply(body + 1, _prefs.node_name, bot_q);
-  }
+  HikeCtx hc;
+  hc.sender = text;                                                 // the sender's name is the text before the ": "
+  hc.slen = slen;
+  hc.node_name = _prefs.node_name;
+  uint32_t now = getRTCClock()->getCurrentTime();
+  hc.now_utc = now < CLOCK_VALID_AFTER ? 0 : now;                   // 0 = clock not set
+  hc.snr10 = (int)(snr * 10.0f + (snr >= 0 ? 0.5f : -0.5f));
+  hc.rssi = rssi;
+  hc.hops = hops;
+  hc.seed = (uint32_t)getRNG()->nextInt(0, 65536);
+  int n = hikebotReply(&hc, body + 1, bot_q);   // trails, hiking help, '!test' / '!ping' and chat
   if (n <= 0) return;
+  if (n > BOT_Q_MAX) n = BOT_Q_MAX;
   bot_q_n = (uint8_t)n;
   bot_replies++;
   bot_next_send_at = futureMillis(getRNG()->nextInt(BOT_FIRST_MIN_MS, BOT_FIRST_MAX_MS + 1));

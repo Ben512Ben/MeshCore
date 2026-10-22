@@ -160,7 +160,8 @@ static int trailbotTownTrails(int town, const char** names, int max) {
 // 'query' is the message text after the '!'. 'node_name' is this repeater's name (the sender prefix is
 // "<node name>: ", cut at 39 characters like postChannel does). Fills out[] with ready-to-send message texts
 // (WITHOUT the prefix) and returns how many (0 = send nothing).
-static int trailbotReply(const char* query, const char* node_name, char out[][BOT_MSG_MAX + 1]) {
+// like trailbotReply() but returns -1 (writes nothing) when the query is not a trail, town, region or "trails"
+static int trailbotLookup(const char* query, const char* node_name, char out[][BOT_MSG_MAX + 1]) {
   char q[TRAILBOT_QUERY_MAX + 8];
   trailbotNorm(query, q, sizeof(q));
   if (q[0] == 0) return 0;   // a lone "!" : ignore
@@ -200,6 +201,12 @@ static int trailbotReply(const char* query, const char* node_name, char out[][BO
     int n = trailbotRegionTowns(region, names, TRAILBOT_MAX_ITEMS);
     if (n > 0) return trailbotList(names, n, budget, out);
   }
+  return -1;
+}
+
+static int trailbotReply(const char* query, const char* node_name, char out[][BOT_MSG_MAX + 1]) {
+  int n = trailbotLookup(query, node_name, out);
+  if (n >= 0) return n;
   snprintf(out[0], BOT_MSG_MAX + 1, "Not found, try !trails");
   return 1;
 }
