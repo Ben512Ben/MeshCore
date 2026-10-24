@@ -15,7 +15,7 @@ Commands:
   build-firmwares: Build all firmwares for all targets.
   build-matching-firmwares <build-match-spec>: Build all firmwares for build targets containing the string given for <build-match-spec>.
   build-companion-firmwares: Build all companion firmwares for all build targets.
-  build-repeater-firmwares: Build all repeater firmwares for all build targets.
+  build-repeater-firmwares: Build the repeater firmwares for the Heltec T096, Heltec V4 and Heltec T114 without display only.
   build-room-server-firmwares: Build all chat room server firmwares for all build targets.
 
 Examples:
@@ -199,6 +199,13 @@ build_all_firmwares_by_suffix() {
   done
 }
 
+# only these repeater firmwares are built (Heltec T096, Heltec V4, Heltec T114 without display)
+REPEATER_TARGETS=(
+  "Heltec_t096_repeater"
+  "heltec_v4_repeater"
+  "Heltec_t114_without_display_repeater"
+)
+
 build_repeater_firmwares() {
 
 #  # build specific repeater firmwares
@@ -209,8 +216,10 @@ build_repeater_firmwares() {
 #  build_firmware "LilyGo_T3S3_sx1262_Repeater"
 #  build_firmware "RAK_4631_Repeater"
 
-  # build all repeater firmwares
-  build_all_firmwares_by_suffix "_repeater"
+  # build only the repeater firmwares listed in REPEATER_TARGETS
+  for env in "${REPEATER_TARGETS[@]}"; do
+    build_firmware $env
+  done
 
 }
 
@@ -298,7 +307,8 @@ elif [[ $1 == "get-companion-firmwares-to-build" ]]; then
   get_pio_envs_ending_with_string "_companion_radio_usb"
   get_pio_envs_ending_with_string "_companion_radio_ble"
 elif [[ $1 == "get-repeater-firmwares-to-build" ]]; then
-  get_pio_envs_ending_with_string "_repeater"
+  # one target per line, used by the GitHub Actions build matrix
+  printf '%s\n' "${REPEATER_TARGETS[@]}"
 elif [[ $1 == "get-room-server-firmwares-to-build" ]]; then
   get_pio_envs_ending_with_string "_room_server"
 fi
