@@ -1359,22 +1359,12 @@ void MyMesh::batteryMonitor() {
   }
 }
 
-// Battery percent from voltage: single-cell Li-ion resting-voltage curve, linear between points.
-// An estimate only: it reads high while charging (solar) and low under heavy load.
+// Battery percent from voltage: straight line from 3.00 V (0%) to 4.20 V (100%), whole percent
+// rounded down. This is the same conversion the MeshCore app uses, so the numbers match the app.
 static int battPercent(unsigned mv) {
-  static const uint16_t v[] = {3270, 3610, 3690, 3710, 3730, 3750, 3770, 3790, 3800, 3820,
-                               3840, 3850, 3870, 3910, 3950, 3980, 4020, 4080, 4110, 4150, 4200};
-  static const uint8_t  p[] = {   0,    5,   10,   15,   20,   25,   30,   35,   40,   45,
-                                 50,   55,   60,   65,   70,   75,   80,   85,   90,   95,  100};
-  const int n = sizeof(v) / sizeof(v[0]);
-  if (mv <= v[0]) return 0;
-  if (mv >= v[n - 1]) return 100;
-  for (int i = 1; i < n; i++) {
-    if (mv <= v[i]) {
-      return p[i - 1] + (int)(((uint32_t)(mv - v[i - 1]) * (p[i] - p[i - 1]) + (v[i] - v[i - 1]) / 2) / (v[i] - v[i - 1]));
-    }
-  }
-  return 100;
+  if (mv <= 3000) return 0;
+  if (mv >= 4200) return 100;
+  return (int)(((uint32_t)(mv - 3000) * 100) / 1200);
 }
 
 void MyMesh::formatBattLog(char* reply) {
