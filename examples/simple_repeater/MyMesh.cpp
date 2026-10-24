@@ -969,9 +969,10 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   bot_key_set = bot_on = false;   // trail bot: off after every boot
   bot_key_len = 0;
   memset(&bot_chan, 0, sizeof(bot_chan));
-  test_key_set = test_on = false;   // #test channel: off after every boot too
-  test_key_len = 0;
-  memset(&test_chan, 0, sizeof(test_chan));
+  test_on = false;   // test channels: off after every boot too
+  memset(test_slot_set, 0, sizeof(test_slot_set));
+  memset(test_key_len, 0, sizeof(test_key_len));
+  memset(test_chans, 0, sizeof(test_chans));
   test_replies = 0;
   bot_q_n = 0;
   bot_ans_n = 0;
@@ -1066,8 +1067,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // TODO: key_store.begin();
   region_map.load(_fs);
   loadChannelKey();   // channel key saved by 'channel set'
-  loadBotKey(BOT_CH_BOT);    // trail bot key saved by 'botchan set' (the bot itself stays off until 'botchan on')
-  loadBotKey(BOT_CH_TEST);   // #test key saved by 'testchan set' (stays off until 'testchan on')
+  loadBotKey();       // trail bot key saved by 'botchan set' (the bot itself stays off until 'botchan on')
+  loadTestKeys();     // test channel keys saved by 'testchan set' (they stay off until 'testchan on')
 
   // establish default-scope
   {
@@ -1838,8 +1839,11 @@ void MyMesh::formatStatus(char* reply) {
     strcat(reply, bot_on ? ", bot on" : ", bot off");
   }
   int sl = (int)strlen(reply);
-  if (test_key_set && sl < CLI_REPLY_MAX - 12) {   // #test channel: shown only when a test key is set
-    strcat(reply, test_on ? ", test on" : ", test off");
+  int tcount = testCount();
+  if (tcount > 0 && sl < CLI_REPLY_MAX - 16) {   // test channels: shown only when a test key is set
+    char tb[16];
+    snprintf(tb, sizeof(tb), ", test %s x%d", test_on ? "on" : "off", tcount);
+    strcat(reply, tb);
   }
 }
 
@@ -1879,8 +1883,9 @@ bool MyMesh::botSameAsCommandChannel(const mesh::GroupChannel& ch) const {
 }
 
 // why `ch` cannot be the key of bot channel `which` (BOT_CH_BOT / BOT_CH_TEST), or NULL if it is fine. The key (or its 1 byte
-// hash) must differ from Public, the command channel and the other bot channel.
-const char* MyMesh::botKeyConflict(const mesh::GroupChannel& ch, uint8_t which) const {
+// hash) must differ from Public, the command channel, the bot channel and the other test channels. skip_slot = the test slot
+// being replaced (it may match itself), or -1.
+const char* MyMesh::botKeyConflict(const mesh::GroupChannel& ch, uint8_t which, int skip_slot) const {
   const bool is_test = which == BOT_CH_TEST;
   if (memcmp(ch.secret, public_chan.secret, sizeof(ch.secret)) == 0) return "Err - not the Public key";
   if (botSameAsCommandChannel(ch)) {
@@ -1890,46 +1895,55 @@ const char* MyMesh::botKeyConflict(const mesh::GroupChannel& ch, uint8_t which) 
   if (is_test) {
     if (bot_key_set && (memcmp(ch.secret, bot_chan.secret, sizeof(ch.secret)) == 0 || ch.hash[0] == bot_chan.hash[0]))
       return "Err - test key (or its hash) matches the bot channel";
+    for (int i = 0; i < TEST_CH_MAX; i++) {
+      if (i == skip_slot || !test_slot_set[i]) continue;
+      if (memcmp(ch.secret, test_chans[i].secret, sizeof(ch.secret)) == 0 || ch.hash[0] == test_chans[i].hash[0])
+        return "Err - test key (or its hash) matches another test channel";
+    }
   } else {
-    if (test_key_set && (memcmp(ch.secret, test_chan.secret, sizeof(ch.secret)) == 0 || ch.hash[0] == test_chan.hash[0]))
-      return "Err - bot key (or its hash) matches the test channel";
+    for (int i = 0; i < TEST_CH_MAX; i++) {
+      if (!test_slot_set[i]) continue;
+      if (memcmp(ch.secret, test_chans[i].secret, sizeof(ch.secret)) == 0 || ch.hash[0] == test_chans[i].hash[0])
+        return "Err - bot key (or its hash) matches a test channel";
+    }
   }
   return NULL;
 }
 
-// /bot_key and /test_key: 1 byte key length + 32 bytes key (same layout as /chan_key)
-void MyMesh::saveBotKey(uint8_t which) {
-  const bool is_test = which == BOT_CH_TEST;
-  const bool key_set = is_test ? test_key_set : bot_key_set;
-  const mesh::GroupChannel& kc = is_test ? test_chan : bot_chan;
-  const uint8_t klen = is_test ? test_key_len : bot_key_len;
-  const char* file = is_test ? TEST_KEY_FILE : BOT_KEY_FILE;
-  if (_fs == NULL || !key_set) return;
+int MyMesh::testCount() const {
+  int n = 0;
+  for (int i = 0; i < TEST_CH_MAX; i++) {
+    if (test_slot_set[i]) n++;
+  }
+  return n;
+}
+
+// /bot_key: 1 byte key length + 32 bytes key (same layout as /chan_key)
+void MyMesh::saveBotKey() {
+  if (_fs == NULL || !bot_key_set) return;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  _fs->remove(file);
-  File f = _fs->open(file, FILE_O_WRITE);
+  _fs->remove(BOT_KEY_FILE);
+  File f = _fs->open(BOT_KEY_FILE, FILE_O_WRITE);
 #elif defined(RP2040_PLATFORM)
-  File f = _fs->open(file, "w");
+  File f = _fs->open(BOT_KEY_FILE, "w");
 #else
-  File f = _fs->open(file, "w", true);
+  File f = _fs->open(BOT_KEY_FILE, "w", true);
 #endif
   if (f) {
     uint8_t buf[33];
-    buf[0] = klen;
-    memcpy(&buf[1], kc.secret, 32);
+    buf[0] = bot_key_len;
+    memcpy(&buf[1], bot_chan.secret, 32);
     f.write(buf, sizeof(buf));
     f.close();
   }
 }
 
-void MyMesh::loadBotKey(uint8_t which) {
-  const bool is_test = which == BOT_CH_TEST;
-  const char* file = is_test ? TEST_KEY_FILE : BOT_KEY_FILE;
-  if (_fs == NULL || !_fs->exists(file)) return;
+void MyMesh::loadBotKey() {
+  if (_fs == NULL || !_fs->exists(BOT_KEY_FILE)) return;
 #if defined(RP2040_PLATFORM)
-  File f = _fs->open(file, "r");
+  File f = _fs->open(BOT_KEY_FILE, "r");
 #else
-  File f = _fs->open(file);
+  File f = _fs->open(BOT_KEY_FILE);
 #endif
   if (f) {
     uint8_t buf[33];
@@ -1940,16 +1954,65 @@ void MyMesh::loadBotKey(uint8_t which) {
       memset(&tmp, 0, sizeof(tmp));
       memcpy(tmp.secret, &buf[1], 32);
       mesh::Utils::sha256(tmp.hash, sizeof(tmp.hash), tmp.secret, buf[0]);
-      if (botKeyConflict(tmp, which) != NULL) return;   // never share the command channel / Public / the other bot channel (e.g. a key was changed later)
-      if (is_test) {
-        test_chan = tmp;
-        test_key_len = buf[0];
-        test_key_set = true;
-      } else {
-        bot_chan = tmp;
-        bot_key_len = buf[0];
-        bot_key_set = true;
-      }
+      if (botKeyConflict(tmp, BOT_CH_BOT, -1) != NULL) return;   // never share the command channel / Public (e.g. a key was changed later)
+      bot_chan = tmp;
+      bot_key_len = buf[0];
+      bot_key_set = true;
+    }
+  }
+}
+
+// /test_key: TEST_CH_MAX records of 33 bytes (1 byte key length, 0 = slot empty, then 32 bytes key). The first record is the
+// same layout the single-channel version used, so an older /test_key loads into slot 1.
+void MyMesh::saveTestKeys() {
+  if (_fs == NULL) return;
+  if (testCount() == 0) {
+    _fs->remove(TEST_KEY_FILE);
+    return;
+  }
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(TEST_KEY_FILE);
+  File f = _fs->open(TEST_KEY_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(TEST_KEY_FILE, "w");
+#else
+  File f = _fs->open(TEST_KEY_FILE, "w", true);
+#endif
+  if (f) {
+    uint8_t buf[33 * TEST_CH_MAX];
+    memset(buf, 0, sizeof(buf));
+    for (int i = 0; i < TEST_CH_MAX; i++) {
+      if (!test_slot_set[i]) continue;
+      buf[i * 33] = test_key_len[i];
+      memcpy(&buf[i * 33 + 1], test_chans[i].secret, 32);
+    }
+    f.write(buf, sizeof(buf));
+    f.close();
+  }
+}
+
+void MyMesh::loadTestKeys() {
+  if (_fs == NULL || !_fs->exists(TEST_KEY_FILE)) return;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(TEST_KEY_FILE, "r");
+#else
+  File f = _fs->open(TEST_KEY_FILE);
+#endif
+  if (f) {
+    uint8_t buf[33 * TEST_CH_MAX];
+    int n = f.read(buf, sizeof(buf));
+    f.close();
+    for (int i = 0; i < TEST_CH_MAX && (i + 1) * 33 <= n; i++) {
+      const uint8_t* rec = &buf[i * 33];
+      if (rec[0] != 16 && rec[0] != 32) continue;   // empty slot
+      mesh::GroupChannel tmp;
+      memset(&tmp, 0, sizeof(tmp));
+      memcpy(tmp.secret, &rec[1], 32);
+      mesh::Utils::sha256(tmp.hash, sizeof(tmp.hash), tmp.secret, rec[0]);
+      if (botKeyConflict(tmp, BOT_CH_TEST, i) != NULL) continue;   // never share the command channel / Public / the bot channel / another test channel
+      test_chans[i] = tmp;
+      test_key_len[i] = rec[0];
+      test_slot_set[i] = true;
     }
   }
 }
@@ -1961,12 +2024,12 @@ void MyMesh::botQueueClear() {
   bot_ans_n = 0;
 }
 
-// drop the waiting answers of one channel (that channel was switched off or its key cleared); the other channel's answers stay
-void MyMesh::botQueueDropChannel(uint8_t ch) {
+// drop the waiting answers of channels ch_lo to ch_hi (switched off or key cleared); the other channels' answers stay
+void MyMesh::botQueueDropChannel(uint8_t ch_lo, uint8_t ch_hi) {
   int src = 0, dst = 0, dst_ans = 0;
   for (int a = 0; a < bot_ans_n; a++) {
     int len = bot_ans_len[a];
-    if (bot_ans_ch[a] != ch) {
+    if (bot_ans_ch[a] < ch_lo || bot_ans_ch[a] > ch_hi) {
       for (int i = 0; i < len; i++, dst++) {
         if (dst != src + i) strcpy(bot_q[dst], bot_q[src + i]);
       }
@@ -2034,7 +2097,7 @@ void MyMesh::botUserDone(uint16_t id) {
 // a message heard on the bot channel or the #test channel: "<sender>: !<trail, town, 'trails' or 'test'>".
 // Only called while that channel is on and the radio is awake.
 // hops / snr / rssi describe how this repeater heard the message ('!test' reports them; rssi is the radio's last reading).
-// ch = BOT_CH_BOT: trails, hiking help, '!test' and chat. ch = BOT_CH_TEST: only '!test', '!ping' and the radio-check phrases.
+// ch = BOT_CH_BOT: trails, hiking help, '!test' and chat. ch >= BOT_CH_TEST (a test channel): only '!test', '!ping' and the radio-check phrases.
 void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi, uint8_t ch) {
   const char* body = strstr(text, ": ");   // "<sender>: <message>"
   if (body == NULL) return;
@@ -2057,23 +2120,25 @@ void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi, u
   hc.rssi = rssi;
   hc.hops = hops;
   hc.seed = (uint32_t)getRNG()->nextInt(0, 65536);
-  hc.test_only = (ch == BOT_CH_TEST);
+  hc.test_only = (ch != BOT_CH_BOT);
   // the reply is written straight after the messages already waiting; there is always room for BOT_Q_MAX more while
   // fewer than BOT_ANS_MAX answers wait (an answer is never longer than BOT_Q_MAX messages)
   int n = hikebotReply(&hc, body + 1, bot_q + bot_q_n);
   if (n <= 0) return;
   if (n > BOT_Q_MAX) n = BOT_Q_MAX;
   botCommit(ch, who, n, true);
-  if (ch == BOT_CH_TEST) test_replies++;
+  if (ch != BOT_CH_BOT) test_replies++;
   else bot_replies++;
 }
 
-// build and flood a text message on the bot channel (ch = BOT_CH_BOT) or the #test channel (BOT_CH_TEST), the same way
+// build and flood a text message on the bot channel (ch = BOT_CH_BOT) or a test channel (BOT_CH_TEST + slot), the same way
 // postChannel() does but with that channel's key and the bot length limit
 bool MyMesh::postBotMessage(const char* text, uint8_t ch) {
-  const bool is_test = ch == BOT_CH_TEST;
-  if (!(is_test ? test_key_set : bot_key_set)) return false;
-  const mesh::GroupChannel& kc = is_test ? test_chan : bot_chan;
+  const bool is_test = ch != BOT_CH_BOT;
+  int slot = (int)ch - BOT_CH_TEST;
+  if (is_test && (slot < 0 || slot >= TEST_CH_MAX)) return false;
+  if (!(is_test ? test_slot_set[slot] : bot_key_set)) return false;
+  const mesh::GroupChannel& kc = is_test ? test_chans[slot] : bot_chan;
   uint8_t temp[5 + BOT_MSG_MAX + 40];
   uint32_t ts = getRTCClock()->getCurrentTime();
   memcpy(temp, &ts, 4);
@@ -2093,8 +2158,10 @@ bool MyMesh::postBotMessage(const char* text, uint8_t ch) {
 void MyMesh::botService() {   // post the queued bot messages, one at a time, only while the radio is awake
   if (bot_q_n == 0) return;
   uint8_t ch = bot_ans_ch[0];
-  if (!(ch == BOT_CH_TEST ? test_key_set : bot_key_set)) {   // (a 'say' may be queued while the channel is off; 'off', 'clear' and sleep empty the queue themselves)
-    botQueueDropChannel(ch);
+  bool key_ok = ch == BOT_CH_BOT ? bot_key_set
+                : ((int)ch - BOT_CH_TEST < TEST_CH_MAX && test_slot_set[(int)ch - BOT_CH_TEST]);
+  if (!key_ok) {   // (a 'say' may be queued while the channel is off; 'off', 'clear' and sleep empty the queue themselves)
+    botQueueDropChannel(ch, ch);
     return;
   }
   if (!millisHasNowPassed(bot_next_send_at)) return;
@@ -2123,8 +2190,8 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
   if (bot_key_set && bot_on && n < max_matches && bot_chan.hash[0] == hash[0]) {   // the trail bot channel (read for "!" requests only)
     channels[n++] = bot_chan;
   }
-  if (test_key_set && test_on && n < max_matches && test_chan.hash[0] == hash[0]) {   // the #test channel (read for "!test" requests only)
-    channels[n++] = test_chan;
+  for (int i = 0; test_on && i < TEST_CH_MAX; i++) {   // the test channels (read for "!test" requests only)
+    if (test_slot_set[i] && n < max_matches && test_chans[i].hash[0] == hash[0]) channels[n++] = test_chans[i];
   }
   if (blockNameCount() == 0) return n;   // empty blockname list: Public / filter channels are not decrypted at all
   if (n < max_matches && public_chan.hash[0] == hash[0]) {
@@ -2155,11 +2222,13 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
     }
     return;
   }
-  if (!is_command_channel && test_key_set && memcmp(channel.secret, test_chan.secret, sizeof(test_chan.secret)) == 0) {
-    if (test_on) {   // the #test channel: "!test" requests only, NEVER commands
-      handleBotMessage((const char*)&data[5], (int)packet->getPathHashCount(), packet->getSNR(), (int)radio_driver.getLastRSSI(), BOT_CH_TEST);
+  for (int i = 0; !is_command_channel && i < TEST_CH_MAX; i++) {
+    if (test_slot_set[i] && memcmp(channel.secret, test_chans[i].secret, sizeof(channel.secret)) == 0) {
+      if (test_on) {   // a test channel: "!test" requests only, NEVER commands
+        handleBotMessage((const char*)&data[5], (int)packet->getPathHashCount(), packet->getSNR(), (int)radio_driver.getLastRSSI(), BOT_CH_TEST + i);
+      }
+      return;
     }
-    return;
   }
   if (!is_command_channel) {   // Public or a filter channel: only check the sender name, NEVER run commands
     blockNameCheckText((const char*)&data[5]);
@@ -2189,50 +2258,40 @@ static int parseBotKey(const char* key, uint8_t* tmp) {
   return 16;
 }
 
-// 'botchan' (which = BOT_CH_BOT) and 'testchan' (BOT_CH_TEST): [get] | set <key or #name> | clear | on | off | say <text>.
-// sub = what follows the command word. Writes the reply.
-void MyMesh::botChanCommand(uint8_t which, const char* sub, char* reply) {
-  const bool is_test = which == BOT_CH_TEST;
-  const char* nm = is_test ? "testchan" : "botchan";
-  bool& key_set = is_test ? test_key_set : bot_key_set;
-  bool& on = is_test ? test_on : bot_on;
-  uint8_t& key_len = is_test ? test_key_len : bot_key_len;
-  mesh::GroupChannel& kc = is_test ? test_chan : bot_chan;
-  uint32_t& replies = is_test ? test_replies : bot_replies;
-  const char* file = is_test ? TEST_KEY_FILE : BOT_KEY_FILE;
-
+// 'botchan': [get] | set <key or #name> | clear | on | off | say <text>. sub = what follows the command word. Writes the reply.
+void MyMesh::botChanCommand(const char* sub, char* reply) {
   bool is_get = strcmp(sub, "get") == 0;
   if (*sub == 0 || is_get) {
-    if (!key_set) {
-      snprintf(reply, 60, "%s key not set", nm);
+    if (!bot_key_set) {
+      strcpy(reply, "botchan key not set");
     } else if (is_get) {   // shows the key (over the command channel too: only command channel members can read it)
       char b64[48];
-      b64Encode(kc.secret, key_len, b64);
-      snprintf(reply, 120, "%s %s, hash %02X, replies %lu, key: %s", nm, on ? "on" : "off", kc.hash[0], (unsigned long)replies, b64);
+      b64Encode(bot_chan.secret, bot_key_len, b64);
+      snprintf(reply, 120, "botchan %s, hash %02X, replies %lu, key: %s", bot_on ? "on" : "off", bot_chan.hash[0], (unsigned long)bot_replies, b64);
     } else {
-      snprintf(reply, 80, "%s %s, hash %02X, replies %lu", nm, on ? "on" : "off", kc.hash[0], (unsigned long)replies);
+      snprintf(reply, 80, "botchan %s, hash %02X, replies %lu", bot_on ? "on" : "off", bot_chan.hash[0], (unsigned long)bot_replies);
     }
   } else if (strcmp(sub, "on") == 0) {
-    if (!key_set) {
-      snprintf(reply, 80, "Err - %s key not set (%s set <key or #name>)", nm, nm);
+    if (!bot_key_set) {
+      strcpy(reply, "Err - botchan key not set (botchan set <key or #name>)");
     } else {
-      on = true;
-      snprintf(reply, 40, "OK - %s on", nm);
+      bot_on = true;
+      strcpy(reply, "OK - botchan on");
     }
   } else if (strcmp(sub, "off") == 0) {
-    on = false;
-    botQueueDropChannel(which);   // this channel's waiting replies go; the other channel's stay
-    snprintf(reply, 40, "OK - %s off", nm);
-  } else if (strcmp(sub, "say") == 0 || memcmp(sub, "say ", 4) == 0) {   // post a text to this channel
+    bot_on = false;
+    botQueueDropChannel(BOT_CH_BOT, BOT_CH_BOT);   // the bot channel's waiting replies go; the test channels' stay
+    strcpy(reply, "OK - botchan off");
+  } else if (strcmp(sub, "say") == 0 || memcmp(sub, "say ", 4) == 0) {   // post a text to the bot channel
     const char* txt = sub + 3;
     while (*txt == ' ') txt++;
     int prefix = (int)strlen(_prefs.node_name) + 2;   // the channel shows "<node name>: <text>"
     if (prefix > 39) prefix = 39;
     int maxlen = BOT_MSG_MAX - prefix;
-    if (!key_set) {
-      snprintf(reply, 80, "Err - %s key not set (%s set <key or #name>)", nm, nm);
+    if (!bot_key_set) {
+      strcpy(reply, "Err - botchan key not set (botchan set <key or #name>)");
     } else if (*txt == 0) {
-      snprintf(reply, 60, "Err - %s say <text>", nm);
+      strcpy(reply, "Err - botchan say <text>");
     } else if (bot_ans_n >= BOT_ANS_MAX) {
       strcpy(reply, "Err - bot busy, try again in a moment");
     } else {
@@ -2244,17 +2303,17 @@ void MyMesh::botChanCommand(uint8_t which, const char* sub, char* reply) {
       memcpy(bot_q[bot_q_n], txt, tl);
       bot_q[bot_q_n][tl] = 0;
       // over the command channel (a command for 'all' reaches every repeater) the post is spread out at random; from the CLI it goes at once
-      botCommit(which, 0, 1, from_channel);
-      snprintf(reply, 60, tl < (int)strlen(txt) ? "OK - %s say queued (cut to fit)" : "OK - %s say queued", nm);
+      botCommit(BOT_CH_BOT, 0, 1, from_channel);
+      strcpy(reply, tl < (int)strlen(txt) ? "OK - botchan say queued (cut to fit)" : "OK - botchan say queued");
     }
   } else if (strcmp(sub, "clear") == 0) {
-    key_set = false;
-    on = false;
-    key_len = 0;
-    memset(&kc, 0, sizeof(kc));
-    botQueueDropChannel(which);
-    if (_fs) _fs->remove(file);
-    snprintf(reply, 60, "OK - %s key cleared", nm);
+    bot_key_set = false;
+    bot_on = false;
+    bot_key_len = 0;
+    memset(&bot_chan, 0, sizeof(bot_chan));
+    botQueueDropChannel(BOT_CH_BOT, BOT_CH_BOT);
+    if (_fs) _fs->remove(BOT_KEY_FILE);
+    strcpy(reply, "OK - botchan key cleared");
   } else if (memcmp(sub, "set ", 4) == 0) {
     const char* key = sub + 4;
     while (*key == ' ') key++;
@@ -2267,20 +2326,168 @@ void MyMesh::botChanCommand(uint8_t which, const char* sub, char* reply) {
       memset(&tc, 0, sizeof(tc));
       memcpy(tc.secret, tmpk, len);
       mesh::Utils::sha256(tc.hash, sizeof(tc.hash), tc.secret, len);
-      const char* err = botKeyConflict(tc, which);
+      const char* err = botKeyConflict(tc, BOT_CH_BOT, -1);
       if (err != NULL) {
         strcpy(reply, err);
       } else {
-        kc = tc;
-        key_len = (uint8_t)len;
-        key_set = true;
-        saveBotKey(which);
-        snprintf(reply, 100, "OK - %s key set and saved (hash %02X), %s is %s", is_test ? "test" : "bot", kc.hash[0],
-                 is_test ? "test" : "bot", on ? "on" : "off");
+        bot_chan = tc;
+        bot_key_len = (uint8_t)len;
+        bot_key_set = true;
+        saveBotKey();
+        snprintf(reply, 100, "OK - bot key set and saved (hash %02X), bot is %s", bot_chan.hash[0], bot_on ? "on" : "off");
       }
     }
   } else {
-    snprintf(reply, 100, "Err - %s [get]|set <key or #name>|clear|on|off|say <text>", nm);
+    strcpy(reply, "Err - botchan [get]|set <key or #name>|clear|on|off|say <text>");
+  }
+}
+
+// 'testchan': up to TEST_CH_MAX test channels (slots 1 to 3), one on/off switch for all of them. A test channel answers only
+// '!test', '!ping' and the radio-check phrases.
+//   testchan                 state, how many channels, their hashes
+//   testchan get [n]         the same / the key of channel n
+//   testchan set [n] <key or #name>   adds a channel in the first free slot (or puts it in slot n, replacing that one)
+//   testchan remove <n or key or #name>, clear (all), on, off, say <text> (posts on every test channel)
+void MyMesh::testChanCommand(const char* sub, char* reply) {
+  int cnt = testCount();
+  bool is_get = strcmp(sub, "get") == 0 || memcmp(sub, "get ", 4) == 0;
+  if (*sub == 0 || is_get) {
+    if (cnt == 0) {
+      strcpy(reply, "testchan key not set");
+    } else if (is_get && sub[3] == ' ' && sub[4] >= '1' && sub[4] <= '0' + TEST_CH_MAX && sub[5] == 0) {   // testchan get n: shows the key
+      int i = sub[4] - '1';
+      if (!test_slot_set[i]) {
+        snprintf(reply, 40, "testchan %d: empty", i + 1);
+      } else {
+        char b64[48];
+        b64Encode(test_chans[i].secret, test_key_len[i], b64);
+        snprintf(reply, 120, "testchan %d: hash %02X, key: %s", i + 1, test_chans[i].hash[0], b64);
+      }
+    } else {
+      int w = snprintf(reply, 60, "testchan %s, %d of %d,", test_on ? "on" : "off", cnt, TEST_CH_MAX);
+      for (int i = 0; i < TEST_CH_MAX; i++) {
+        if (test_slot_set[i] && w < 100) w += snprintf(reply + w, 20, " %d:%02X", i + 1, test_chans[i].hash[0]);
+      }
+      snprintf(reply + w, 30, ", replies %lu", (unsigned long)test_replies);
+    }
+  } else if (strcmp(sub, "on") == 0) {
+    if (cnt == 0) {
+      strcpy(reply, "Err - testchan key not set (testchan set <key or #name>)");
+    } else {
+      test_on = true;
+      strcpy(reply, "OK - testchan on");
+    }
+  } else if (strcmp(sub, "off") == 0) {
+    test_on = false;
+    botQueueDropChannel(BOT_CH_TEST, BOT_CH_TEST + TEST_CH_MAX - 1);   // the test channels' waiting replies go; the bot channel's stay
+    strcpy(reply, "OK - testchan off");
+  } else if (strcmp(sub, "say") == 0 || memcmp(sub, "say ", 4) == 0) {   // post a text on every test channel
+    const char* txt = sub + 3;
+    while (*txt == ' ') txt++;
+    int prefix = (int)strlen(_prefs.node_name) + 2;   // the channel shows "<node name>: <text>"
+    if (prefix > 39) prefix = 39;
+    int maxlen = BOT_MSG_MAX - prefix;
+    if (cnt == 0) {
+      strcpy(reply, "Err - testchan key not set (testchan set <key or #name>)");
+    } else if (*txt == 0) {
+      strcpy(reply, "Err - testchan say <text>");
+    } else if (bot_ans_n + cnt > BOT_ANS_MAX) {
+      strcpy(reply, "Err - bot busy, try again in a moment");
+    } else {
+      int tl = (int)strlen(txt);
+      if (tl > maxlen) {
+        tl = maxlen;
+        while (tl > 0 && (((unsigned char)txt[tl]) & 0xC0) == 0x80) tl--;   // never cut an accented letter / emoji in half
+      }
+      for (int i = 0; i < TEST_CH_MAX; i++) {
+        if (!test_slot_set[i]) continue;
+        memcpy(bot_q[bot_q_n], txt, tl);
+        bot_q[bot_q_n][tl] = 0;
+        botCommit((uint8_t)(BOT_CH_TEST + i), 0, 1, from_channel);
+      }
+      strcpy(reply, tl < (int)strlen(txt) ? "OK - testchan say queued (cut to fit)" : "OK - testchan say queued");
+    }
+  } else if (strcmp(sub, "clear") == 0) {
+    memset(test_slot_set, 0, sizeof(test_slot_set));
+    memset(test_key_len, 0, sizeof(test_key_len));
+    memset(test_chans, 0, sizeof(test_chans));
+    test_on = false;
+    botQueueDropChannel(BOT_CH_TEST, BOT_CH_TEST + TEST_CH_MAX - 1);
+    if (_fs) _fs->remove(TEST_KEY_FILE);
+    strcpy(reply, "OK - testchan keys cleared");
+  } else if (memcmp(sub, "remove ", 7) == 0) {
+    const char* arg = sub + 7;
+    while (*arg == ' ') arg++;
+    int slot = -1;
+    if (arg[0] >= '1' && arg[0] <= '0' + TEST_CH_MAX && arg[1] == 0) {
+      slot = arg[0] - '1';
+    } else {
+      uint8_t tmpk[32];
+      int len = parseBotKey(arg, tmpk);
+      for (int i = 0; len > 0 && i < TEST_CH_MAX; i++) {
+        if (test_slot_set[i] && test_key_len[i] == len && memcmp(test_chans[i].secret, tmpk, len) == 0) slot = i;
+      }
+    }
+    if (slot < 0 || !test_slot_set[slot]) {
+      strcpy(reply, "Err - no such test channel (testchan remove <1-3, key or #name>)");
+    } else {
+      test_slot_set[slot] = false;
+      test_key_len[slot] = 0;
+      memset(&test_chans[slot], 0, sizeof(test_chans[slot]));
+      botQueueDropChannel((uint8_t)(BOT_CH_TEST + slot), (uint8_t)(BOT_CH_TEST + slot));
+      if (testCount() == 0) test_on = false;
+      saveTestKeys();
+      snprintf(reply, 60, "OK - test channel %d removed", slot + 1);
+    }
+  } else if (memcmp(sub, "set ", 4) == 0) {
+    const char* key = sub + 4;
+    while (*key == ' ') key++;
+    int slot = -1;   // -1: first free slot
+    if (key[0] >= '1' && key[0] <= '0' + TEST_CH_MAX && key[1] == ' ') {   // testchan set <n> <key>: a chosen slot
+      slot = key[0] - '1';
+      key += 2;
+      while (*key == ' ') key++;
+    }
+    uint8_t tmpk[32];
+    int len = parseBotKey(key, tmpk);
+    if (len < 0) {
+      strcpy(reply, "Err - key must be #name, or base64 / hex, 16 or 32 bytes");
+    } else {
+      mesh::GroupChannel tc;
+      memset(&tc, 0, sizeof(tc));
+      memcpy(tc.secret, tmpk, len);
+      mesh::Utils::sha256(tc.hash, sizeof(tc.hash), tc.secret, len);
+      int same = -1;   // this key is already one of the test channels
+      for (int i = 0; i < TEST_CH_MAX; i++) {
+        if (test_slot_set[i] && memcmp(test_chans[i].secret, tc.secret, sizeof(tc.secret)) == 0) same = i;
+      }
+      if (slot < 0 && same >= 0) {
+        snprintf(reply, 60, "OK - already test channel %d (hash %02X)", same + 1, tc.hash[0]);
+        return;
+      }
+      if (slot < 0) {
+        for (int i = 0; i < TEST_CH_MAX; i++) {
+          if (!test_slot_set[i]) { slot = i; break; }
+        }
+      }
+      if (slot < 0) {
+        strcpy(reply, "Err - 3 test channels already set (testchan remove <1-3>)");
+        return;
+      }
+      const char* err = botKeyConflict(tc, BOT_CH_TEST, slot);
+      if (err != NULL) {
+        strcpy(reply, err);
+      } else {
+        botQueueDropChannel((uint8_t)(BOT_CH_TEST + slot), (uint8_t)(BOT_CH_TEST + slot));   // (a key that is replaced)
+        test_chans[slot] = tc;
+        test_key_len[slot] = (uint8_t)len;
+        test_slot_set[slot] = true;
+        saveTestKeys();
+        snprintf(reply, 100, "OK - test channel %d set and saved (hash %02X), test is %s", slot + 1, tc.hash[0], test_on ? "on" : "off");
+      }
+    }
+  } else {
+    strcpy(reply, "Err - testchan [get n]|set [n] <key or #name>|remove <n>|clear|on|off|say <text>");
   }
 }
 
@@ -2502,19 +2709,22 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       while (*key == ' ') key++;
       uint8_t ctmp[32];
       int clen = parseChanKey(key, ctmp);
-      bool is_bot_key = false, is_test_key = false;   // the command channel must differ from the trail bot and #test channels
-      if (clen > 0 && (bot_key_set || test_key_set)) {
+      bool is_bot_key = false, is_test_key = false;   // the command channel must differ from the trail bot and test channels
+      if (clen > 0 && (bot_key_set || testCount() > 0)) {
         mesh::GroupChannel cc;
         memset(&cc, 0, sizeof(cc));
         memcpy(cc.secret, ctmp, clen);
         mesh::Utils::sha256(cc.hash, sizeof(cc.hash), cc.secret, clen);
         is_bot_key = bot_key_set && (memcmp(cc.secret, bot_chan.secret, sizeof(cc.secret)) == 0 || cc.hash[0] == bot_chan.hash[0]);
-        is_test_key = test_key_set && (memcmp(cc.secret, test_chan.secret, sizeof(cc.secret)) == 0 || cc.hash[0] == test_chan.hash[0]);
+        for (int ti = 0; ti < TEST_CH_MAX; ti++) {
+          if (test_slot_set[ti] && (memcmp(cc.secret, test_chans[ti].secret, sizeof(cc.secret)) == 0 || cc.hash[0] == test_chans[ti].hash[0]))
+            is_test_key = true;
+        }
       }
       if (is_bot_key) {
         strcpy(reply, "Err - that key (or its hash) is the trail bot channel");
       } else if (is_test_key) {
-        strcpy(reply, "Err - that key (or its hash) is the #test channel");
+        strcpy(reply, "Err - that key (or its hash) is a test channel");
       } else if (setChannelKey(key)) {
         saveChannelKey();
         strcpy(reply, "OK - channel key set and saved");
@@ -2788,13 +2998,13 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
   if (memcmp(command, "botchan", 7) == 0 && (command[7] == 0 || command[7] == ' ')) {
     const char* sub = command + 7;
     while (*sub == ' ') sub++;
-    botChanCommand(BOT_CH_BOT, sub, reply);
+    botChanCommand(sub, reply);
     return true;
   }
   if (memcmp(command, "testchan", 8) == 0 && (command[8] == 0 || command[8] == ' ')) {
     const char* sub = command + 8;
     while (*sub == ' ') sub++;
-    botChanCommand(BOT_CH_TEST, sub, reply);
+    testChanCommand(sub, reply);
     return true;
   }
 
