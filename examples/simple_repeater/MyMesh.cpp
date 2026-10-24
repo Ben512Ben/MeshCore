@@ -1374,6 +1374,14 @@ void MyMesh::batteryMonitor() {
   }
 }
 
+// Battery percent from voltage: straight line from 3.00 V (0%) to 4.20 V (100%), whole percent
+// rounded down. This is the same conversion the MeshCore app uses, so the numbers match the app.
+static int battPercent(unsigned mv) {
+  if (mv <= 3000) return 0;
+  if (mv >= 4200) return 100;
+  return (int)(((uint32_t)(mv - 3000) * 100) / 1200);
+}
+
 void MyMesh::formatBattLog(char* reply) {
   if (batt_log_count == 0) {
     strcpy(reply, "battlog: no data yet (first reading 5 min after boot)");
@@ -1384,6 +1392,19 @@ void MyMesh::formatBattLog(char* reply) {
     int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
     unsigned mv = batt_log[idx];
     pos += snprintf(&reply[pos], 8, " %u.%02u", mv / 1000, (mv % 1000) / 10);
+  }
+}
+
+void MyMesh::formatBattPct(char* reply) {
+  if (batt_log_count == 0) {
+    strcpy(reply, "battpct: no data yet (first reading 5 min after boot)");
+    return;
+  }
+  int pos = snprintf(reply, 20, "%%/h old>new:");
+  for (int i = 0; i < batt_log_count; i++) {
+    int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+    if (pos > CLI_REPLY_MAX - 6) break;   // never overrun the reply buffer
+    pos += snprintf(&reply[pos], 6, " %d", battPercent(batt_log[idx]));
   }
 }
 
@@ -1793,7 +1814,7 @@ void MyMesh::formatStatus(char* reply) {
     if (blockhop[i].len) blocked++;
   }
   unsigned long up = (unsigned long)(uptime_millis / 1000ULL);
-  int pos = snprintf(reply, 24, "Bat %u.%02uV", mv / 1000, (mv % 1000) / 10);
+  int pos = snprintf(reply, 32, "Bat %u.%02uV %d%%", mv / 1000, (mv % 1000) / 10, battPercent(mv));
   if (!isnan(t)) {
     int t10 = (int)(t * 10.0f + (t >= 0 ? 0.5f : -0.5f));
     int a = t10 < 0 ? -t10 : t10;
@@ -1939,7 +1960,7 @@ bool MyMesh::postBotMessage(const char* text) {
 
 void MyMesh::botService() {   // post the queued bot messages, one at a time, only while the radio is awake
   if (bot_q_n == 0) return;
-  if (!bot_key_set || !bot_on) {
+  if (!bot_key_set) {   // (a 'botchan say' may be queued while the bot is off; 'botchan off' and sleep empty the queue themselves)
     bot_q_n = 0;
     return;
   }
@@ -2028,14 +2049,14 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
       if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
     }
   }
-  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "templog") == 0
+  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
                  || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
                  || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
                  || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
                  || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
                  || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
-                 || strcmp(buf, "botchan") == 0 || strcmp(buf, "botchan on") == 0 || strcmp(buf, "botchan off") == 0   // trail bot state / on / off (never set, get or clear)
+                 || strcmp(buf, "botchan") == 0 || strncmp(buf, "botchan ", 8) == 0   // trail bot: get / set / clear / on / off / say
                  || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
                  || strncmp(buf, "filterchan clear", 16) == 0
@@ -2062,7 +2083,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   bool started_sleep = sleep_cmd_flag;
   sleep_cmd_flag = false;
   if (reply[0] != 0) {
-    if ((reply[0] == 'V' || reply[0] == 'C') && reply[1] == '/') {   // battlog / templog line: make it fit
+    if ((reply[0] == 'V' || reply[0] == 'C' || reply[0] == '%') && reply[1] == '/') {   // battlog / battpct / templog line: make it fit
       int prefix = (int)strlen(_prefs.node_name) + 2;
       if (prefix > 39) prefix = 39;
       trimLogToFit(reply, 12, prefix);
@@ -2182,6 +2203,11 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
 
   if (strcmp(command, "battlog") == 0) {
     formatBattLog(reply);
+    return true;
+  }
+
+  if (strcmp(command, "battpct") == 0) {
+    formatBattPct(reply);
     return true;
   }
 
@@ -2489,7 +2515,8 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
   }
 
   // trail info bot (item 32): its own channel key. CLI: botchan [get] | set <key> | clear | on | off
-  // over the command channel only 'botchan', 'botchan on' and 'botchan off' are allowed (no keys)
+  //   also: botchan say <text>  (posts <text> to the bot channel, as this repeater)
+  // all of them work over the command channel too, e.g. <botchan say hello all>  <botchan set <key> Tuna>
   if (memcmp(command, "botchan", 7) == 0 && (command[7] == 0 || command[7] == ' ')) {
     const char* sub = command + 7;
     while (*sub == ' ') sub++;
@@ -2497,7 +2524,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     if (*sub == 0 || is_get) {
       if (!bot_key_set) {
         strcpy(reply, "botchan key not set");
-      } else if (is_get && !from_channel) {   // CLI only: shows the key
+      } else if (is_get) {   // shows the key (over the command channel too: only command channel members can read it)
         char b64[48];
         b64Encode(bot_chan.secret, bot_key_len, b64);
         snprintf(reply, 120, "botchan %s, hash %02X, replies %lu, key: %s", bot_on ? "on" : "off", bot_chan.hash[0],
@@ -2517,8 +2544,31 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       bot_on = false;
       bot_q_n = 0;
       strcpy(reply, "OK - botchan off");
-    } else if (from_channel) {
-      strcpy(reply, "Err - botchan on|off only over the channel");
+    } else if (strcmp(sub, "say") == 0 || memcmp(sub, "say ", 4) == 0) {   // post a text to the bot channel
+      const char* txt = sub + 3;
+      while (*txt == ' ') txt++;
+      int prefix = (int)strlen(_prefs.node_name) + 2;   // the bot channel shows "<node name>: <text>"
+      if (prefix > 39) prefix = 39;
+      int maxlen = BOT_MSG_MAX - prefix;
+      if (!bot_key_set) {
+        strcpy(reply, "Err - botchan key not set (botchan set <key>)");
+      } else if (*txt == 0) {
+        strcpy(reply, "Err - botchan say <text>");
+      } else if (bot_q_n > 0) {
+        strcpy(reply, "Err - bot busy, try again in a moment");
+      } else {
+        int tl = (int)strlen(txt);
+        if (tl > maxlen) {
+          tl = maxlen;
+          while (tl > 0 && (((unsigned char)txt[tl]) & 0xC0) == 0x80) tl--;   // never cut an accented letter / emoji in half
+        }
+        memcpy(bot_q[0], txt, tl);
+        bot_q[0][tl] = 0;
+        bot_q_n = 1;
+        // over the command channel (a command for 'all' reaches every repeater) the post is spread out at random; from the CLI it goes at once
+        bot_next_send_at = futureMillis(from_channel ? getRNG()->nextInt(BOT_FIRST_MIN_MS, BOT_FIRST_MAX_MS + 1) : 0);
+        strcpy(reply, tl < (int)strlen(txt) ? "OK - botchan say queued (cut to fit)" : "OK - botchan say queued");
+      }
     } else if (strcmp(sub, "clear") == 0) {
       bot_key_set = false;
       bot_on = false;
@@ -2552,7 +2602,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
         }
       }
     } else {
-      strcpy(reply, "Err - botchan [get]|set <key>|clear|on|off");
+      strcpy(reply, "Err - botchan [get]|set <key>|clear|on|off|say <text>");
     }
     return true;
   }
