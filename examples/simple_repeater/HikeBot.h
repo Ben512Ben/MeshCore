@@ -14,8 +14,12 @@
  *        a trail, town or region named anywhere in the sentence (typos tolerated),
  *        and finally the ELIZA chat (ChatBot.h).
  *
- * It remembers 15 people (oldest slot recycled, no expiry): their last trail, hike timer, pace, last signal test
- * and last walk search. About 40 bytes each. Nothing here changes trails.h.
+ * It remembers 50 people (oldest slot recycled, no expiry): their last trail, hike timer, pace, last signal test
+ * and last walk search. About 32 bytes each. A person with a running hike timer is never recycled (see
+ * hikePersonFor). Nothing here changes trails.h.
+ *
+ * Test-only mode (HikeCtx.test_only, used for the #test channel): only '!test', '!ping' and the radio-check
+ * phrases are answered; everything else is ignored and no memory slot is used for it.
  *
  * Every message is at most the budget (134 minus the "<node name>: " prefix) and never starts with '!'.
  */
@@ -43,7 +47,7 @@
 #endif
 #define HIKE_LAT  (-27.6f)         // middle of South East Queensland (Brisbane to Gold Coast to Scenic Rim)
 #define HIKE_LON  (153.0f)
-#define HIKE_PEOPLE 15
+#define HIKE_PEOPLE 50
 #define HIKE_MAXW 40
 
 // Stack is small on the repeater. Handlers are never inlined into each other, and every large work buffer is static
@@ -66,6 +70,7 @@ struct HikeCtx {
   int rssi;
   int hops;
   uint32_t seed;        // random number, for variety
+  bool test_only;       // #test channel: answer only the signal-test commands, ignore everything else
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -100,18 +105,38 @@ static uint16_t g_hike_tick = 0;
 static bool g_hike_ready = false;
 static uint8_t g_hike_cyc[HIKE_TOPIC_COUNT];
 
-static HikePerson* hikePersonFor(uint16_t id) {
+// a running hike timer older than this is treated as left on (the same limit hbDoFinish uses), so it no longer
+// protects its slot
+#define HIKE_TIMER_LIVE_SECS (16UL * 3600UL)
+
+// when every slot holds a live timer, a new person gets this scratch slot: it works for one request and is not remembered
+static HikePerson g_hike_temp;
+
+static bool hikeTimerLive(const HikePerson* p, uint32_t now_utc) {
+  if (p->t_start == 0) return false;
+  if (now_utc == 0 || now_utc < p->t_start) return true;   // clock not set / went backwards: keep the timer
+  return (now_utc - p->t_start) <= HIKE_TIMER_LIVE_SECS;
+}
+
+// the person's slot. Order: their own slot, a free slot, the oldest slot WITHOUT a live hike timer. If every slot has a
+// live timer (50 hikers walking at once) the scratch slot g_hike_temp is returned, so no running timer is ever lost.
+static HikePerson* hikePersonFor(uint16_t id, uint32_t now_utc) {
   if (id == 0) id = 1;
   g_hike_tick++;
   HikePerson* free_slot = NULL;
-  HikePerson* oldest = &g_hike_people[0];
+  HikePerson* oldest = NULL;
   for (int i = 0; i < HIKE_PEOPLE; i++) {
     HikePerson* p = &g_hike_people[i];
     if (p->id == id) { p->age = g_hike_tick; return p; }
-    if (p->id == 0 && !free_slot) free_slot = p;
-    if ((uint16_t)(g_hike_tick - p->age) > (uint16_t)(g_hike_tick - oldest->age)) oldest = p;
+    if (p->id == 0) {
+      if (!free_slot) free_slot = p;
+      continue;
+    }
+    if (hikeTimerLive(p, now_utc)) continue;   // protected
+    if (!oldest || (uint16_t)(g_hike_tick - p->age) > (uint16_t)(g_hike_tick - oldest->age)) oldest = p;
   }
   HikePerson* p = free_slot ? free_slot : oldest;
+  if (!p) p = &g_hike_temp;   // every slot has a live timer
   memset(p, 0, sizeof(*p));
   p->id = id;
   p->age = g_hike_tick;
@@ -834,6 +859,11 @@ static HB_NOINLINE int hbDoStart(HbCtx* H, int t_in) {
     return H->o.n;
   }
   HikePerson* p = H->who;
+  if (p == &g_hike_temp) {   // every slot holds a running timer: this one could not be kept
+    hbMsg(&H->o, "My timers are full, so I can't time your hike. Note your start time yourself.");
+    hbTimerReminder(H);
+    return H->o.n;
+  }
   int t = t_in;
   char tn[14];
   hbFmtClock(H->clk.mins, tn, sizeof(tn));
@@ -1399,6 +1429,10 @@ static HB_NOINLINE bool hbTopic(HbCtx* H, int min_prio, int max_prio) {
   return true;
 }
 
+// the radio-check phrases that give the same reply as '!test' (used by the normal flow and by the #test channel)
+#define HB_RADIO_PHRASES "radio check;signal check;can you hear me;do you copy;how is my signal;how is my reception;am i getting through;" \
+                         "test message;radio test;signal test;do you read me;are you receiving me;can you read me"
+
 static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_MAX + 1]) {
   if (!g_hike_ready) {
     memset(g_hike_cyc, 255, sizeof(g_hike_cyc));
@@ -1416,13 +1450,24 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (H.o.budget > BOT_MSG_MAX) H.o.budget = BOT_MSG_MAX;
   if (H.o.budget < 30) return 0;
 
-  char name[CHAT_NAME_MAX + 8];
-  chatCleanName(c->sender, c->slen, name);
-  H.who = hikePersonFor(chatHash(name, (int)strlen(name)));
-  hbClockInit(c->now_utc, &H.clk);
-  for (const char* q = text; *q; q++) if (*q == '?') H.question = true;
   chatNorm(text, H.norm, sizeof(H.norm));
   snprintf(H.padded, sizeof(H.padded), " %s ", H.norm);
+  if (c->test_only) {   // #test channel: only the signal-test commands, nothing else (and no memory slot for anything else)
+    char tq[TRAILBOT_QUERY_MAX + 8];
+    trailbotNorm(text, tq, sizeof(tq));
+    bool is_test = strcmp(tq, "test") == 0 || strcmp(tq, "ping") == 0 || hbHas(H.padded, HB_RADIO_PHRASES);
+    if (!is_test) return 0;
+  }
+
+  char name[CHAT_NAME_MAX + 8];
+  chatCleanName(c->sender, c->slen, name);
+  H.who = hikePersonFor(chatHash(name, (int)strlen(name)), c->now_utc);
+  if (c->test_only) {
+    hbClockInit(c->now_utc, &H.clk);
+    return hbDoTest(&H);
+  }
+  hbClockInit(c->now_utc, &H.clk);
+  for (const char* q = text; *q; q++) if (*q == '?') H.question = true;
   hbSplit(H.norm, &H.w);
   HikePerson* P = H.who;
 
@@ -1449,8 +1494,7 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (hbSafetyWins(H.padded, gearish)) return hbChat(&H, text);
 
   // 3. radio check
-  if (hbHas(H.padded, "radio check;signal check;can you hear me;do you copy;how is my signal;how is my reception;am i getting through;"
-                      "test message;radio test;signal test;do you read me;are you receiving me;can you read me")) {
+  if (hbHas(H.padded, HB_RADIO_PHRASES)) {
     return hbDoTest(&H);
   }
 

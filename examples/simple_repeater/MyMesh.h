@@ -91,8 +91,14 @@ struct NeighbourInfo {
 #define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
 
 #define BOT_KEY_FILE "/bot_key"   // trail bot channel key (item 32), same layout as /chan_key
+#define TEST_KEY_FILE "/test_key" // #test channel key ('testchan'), same layout
 #define BOT_MSG_MAX  134          // trail bot: max bytes of a message INCLUDING "<node name>: "
 #define BOT_Q_MAX    4            // trail bot: most messages one request can produce
+#define BOT_ANS_MAX  3            // trail bot: answers waiting to be sent at once (a request is ignored when the queue is full)
+#define BOT_FIFO_MAX (BOT_ANS_MAX * BOT_Q_MAX)   // trail bot: messages waiting (3 answers of up to 4 messages)
+#define BOT_CD_MAX   8            // trail bot: people whose per-user cooldown is tracked
+#define BOT_CH_BOT   0            // which channel a request came from / a reply goes to
+#define BOT_CH_TEST  1
 
 #define PACKET_LOG_FILE  "/packet_log"
 
@@ -174,11 +180,24 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool bot_key_set, bot_on;
   uint8_t bot_key_len;
   mesh::GroupChannel bot_chan;
-  char bot_q[BOT_Q_MAX][BOT_MSG_MAX + 1];   // replies waiting to be posted
-  uint8_t bot_q_n;
+  // #test channel ('testchan'): its own key, answers only the signal-test commands ('!test', '!ping' ...). Off after every boot.
+  bool test_key_set, test_on;
+  uint8_t test_key_len;
+  mesh::GroupChannel test_chan;
+  uint32_t test_replies;
+  // reply queue shared by both channels: up to BOT_ANS_MAX answers, each of up to BOT_Q_MAX messages, sent oldest first
+  char bot_q[BOT_FIFO_MAX][BOT_MSG_MAX + 1];   // messages waiting to be posted
+  uint8_t bot_q_n;                          // messages waiting (0 = nothing queued)
+  uint8_t bot_ans_n;                        // answers waiting
+  uint8_t bot_ans_len[BOT_ANS_MAX];         // messages still to send of each waiting answer
+  uint8_t bot_ans_ch[BOT_ANS_MAX];          // channel of each waiting answer (BOT_CH_BOT / BOT_CH_TEST)
+  uint16_t bot_ans_who[BOT_ANS_MAX];        // who asked (hash of the sender name, 0 = nobody: 'botchan say')
   unsigned long bot_next_send_at;
-  bool bot_rate_on;                         // a request was answered recently: ignore new ones until bot_next_ok_at
-  unsigned long bot_next_ok_at;
+  struct BotCooldown {                      // per-person cooldown: no new answer for 10 s after their last one
+    uint16_t id;                            // hash of the sender name, 0 = free
+    unsigned long ready_at;
+  };
+  BotCooldown bot_cd[BOT_CD_MAX];
   uint32_t bot_replies;
 
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
@@ -247,11 +266,18 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void formatBlockNameList(char* reply, int page);
   bool chanAllowBlocks(const mesh::Packet* packet);
   bool botSameAsCommandChannel(const mesh::GroupChannel& ch) const;
-  void saveBotKey();
-  void loadBotKey();
-  void handleBotMessage(const char* text, int hops, float snr, int rssi);
-  bool postBotMessage(const char* text);
+  const char* botKeyConflict(const mesh::GroupChannel& ch, uint8_t which) const;
+  void saveBotKey(uint8_t which);
+  void loadBotKey(uint8_t which);
+  void handleBotMessage(const char* text, int hops, float snr, int rssi, uint8_t ch);
+  bool postBotMessage(const char* text, uint8_t ch);
   void botService();
+  void botQueueClear();
+  void botQueueDropChannel(uint8_t ch);
+  void botCommit(uint8_t ch, uint16_t who, int n, bool spread);
+  bool botUserBlocked(uint16_t id) const;
+  void botUserDone(uint16_t id);
+  void botChanCommand(uint8_t which, const char* sub, char* reply);
   bool setChannelKey(const char* key);
   void saveChannelKey();
   void loadChannelKey();
