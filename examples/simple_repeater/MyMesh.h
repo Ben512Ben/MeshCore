@@ -133,6 +133,12 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint16_t batt_log[24];
   int16_t temp_log[24];   // chip temperature, tenths of a degree C (INT16_MIN = no reading)
   uint8_t batt_log_head, batt_log_count;
+  uint16_t batt_old24_mv;   // item 33: the reading that was overwritten by the newest one = exactly 24h older
+  bool batt_old24_valid;
+  // item 34: radio-on time. Snapshots (millis, cumulative radio-on ms) at boot and at every hourly log tick
+  uint32_t on_cum_ms, on_since_ms;      // radio-on ms before the current awake stretch / when it began
+  uint32_t on_snap_ms[25], on_snap_cum[25];
+  uint8_t on_snap_head, on_snap_count;
 
   // 'blockhop' list (RAM only): repeaters whose relayed packets (first hop) we refuse to forward
   struct BlockHopEntry {
@@ -164,7 +170,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   // 'chanallow' relay whitelist (RAM only, off after every boot)
   bool chanallow_on, chanallow_extra_set;
   uint8_t chanallow_extra_hash;
-  uint32_t chanallow_dropped;
+  uint32_t chanallow_dropped, chanallow_dropped_adv;   // channel messages / adverts not relayed
 
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
@@ -223,6 +229,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void batteryMonitor();
   void formatBattLog(char* reply);
   void formatBattPct(char* reply);
+  void formatBattTrend(char* reply);
+  int radioOnPercent();
+  uint32_t radioOnCumNow();
   void formatTempLog(char* reply);
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
