@@ -18,8 +18,14 @@
  * and last walk search. About 32 bytes each. A person with a running hike timer is never recycled (see
  * hikePersonFor). Nothing here changes trails.h.
  *
- * Test-only mode (HikeCtx.test_only, used for the #test channel): only '!test', '!ping' and the radio-check
- * phrases are answered; everything else is ignored and no memory slot is used for it.
+ * Test-only mode (HikeCtx.test_only, used for the test channels): only '!test', '!ping' and the radio-check
+ * phrases are answered; everything else is ignored. A signal test uses no memory slot at all.
+ *
+ * Hike timer: the hike can be one of my trails, an unlisted hike (HT_UNKNOWN) or an off-trail hike (HT_OFFTRAIL). A start
+ * with no trail named reuses the person's last hike and says so; a short reply naming the right trail (or "off trail")
+ * corrects it. Off-trail and unknown hikes are only timed: no listed time, no pace learning.
+ *
+ * Sky: moon phase, moonrise and moonset, and the next meteor shower are worked out from the clock (hbDoMoon, hbDoMeteors).
  *
  * Every message is at most the budget (134 minus the "<node name>: " prefix) and never starts with '!'.
  */
@@ -76,21 +82,26 @@ struct HikeCtx {
 // ---------------------------------------------------------------------------------------------------------------
 // memory of people
 
-#define HP_HAS_SNR   0x01
+#define HP_OFFTRAIL  0x01   // said they are going off trail; used by their next hike timer
 #define HP_AWAIT_DUR 0x02
 #define HP_HINT_SEEN 0x04
+#define HP_ASSUMED   0x08   // the running timer's trail was assumed (same as last time): a trail name or "off trail" corrects it
+
+// what last_trail / t_trail can hold besides a trail number (0 or more)
+#define HT_NONE     (-1)    // nothing known
+#define HT_UNKNOWN  (-2)    // a hike that is not in the trail library
+#define HT_OFFTRAIL (-3)    // an off-trail hike
 #define HI_NONE    0
 #define HI_SUGGEST 1
 
 struct HikePerson {
   uint16_t id;          // hash of the sender's name, 0 = free slot
   uint16_t age;
-  int16_t last_trail;   // -1 none
-  int16_t t_trail;      // trail attached to the running hike timer, -1 none
+  int16_t last_trail;   // the last hike: a trail number, or HT_NONE / HT_UNKNOWN / HT_OFFTRAIL
+  int16_t t_trail;      // the running hike timer's hike: a trail number, or HT_NONE / HT_UNKNOWN / HT_OFFTRAIL
   uint32_t t_start;     // UTC seconds when the timer started, 0 = no timer
   uint16_t pace_pct;    // this person's time as a percent of the listed time, 0 = unknown
   uint8_t pace_n;
-  int16_t last_snr10;
   uint8_t flags;
   uint8_t last_intent;
   uint8_t sg_glo, sg_ghi;     // grade range of the last walk search
@@ -140,8 +151,8 @@ static HikePerson* hikePersonFor(uint16_t id, uint32_t now_utc) {
   memset(p, 0, sizeof(*p));
   p->id = id;
   p->age = g_hike_tick;
-  p->last_trail = -1;
-  p->t_trail = -1;
+  p->last_trail = HT_NONE;
+  p->t_trail = HT_NONE;
   p->sg_town = -1;
   p->sg_region = -1;
   return p;
@@ -650,20 +661,75 @@ static int hbTrailIn(HbCtx* H, bool allow_last, bool mark = true) {
   return -1;
 }
 
+// words that say "off trail" (an off-trail hike has no listed time)
+#define HB_OFFTRAIL_PHRASES "off trail;off track;off the trail;off the track;offtrail;offtrack;bush bash;bush bashing;bushbash;bushbashing;" \
+                            "cross country;my own route;own route;no track;no trail;without a track;without a trail;unmarked;" \
+                            "not on a trail;not on a track;pathless;off path;off the path"
+
+static bool hbWordIn(const char* w, int l, const char* list) {
+  const char* s = list;
+  while (*s) {
+    const char* e = strchr(s, ';');
+    int len = e ? (int)(e - s) : (int)strlen(s);
+    if (len == l && memcmp(s, w, l) == 0) return true;
+    if (!e) break;
+    s = e + 1;
+  }
+  return false;
+}
+
+// "starting the Barney Peak walk": a name in front of a trail word, or after Mt / Mount, that is not one of my trails.
+// Only asked when no trail of mine was named in the sentence.
+static bool hbUnlistedName(HbCtx* H) {
+  static const char* const nouns = "track;trail;walk;hike;circuit;loop;climb;summit;peak;falls;lookout;ridge;hikes;walks;trails;tracks";
+  static const char* const plain = "the;my;a;an;our;this;that;new;first;next;another;same;last;your;their;whole;full;quick;short;long;little;big;"
+                                   "easy;hard;hilly;day;morning;afternoon;evening;night;sunrise;sunset;solo;group;family;dog;bush;nature;"
+                                   "coastal;rainforest;local;nice;good;great;steep;scenic;off;own;now;again;today;am;are;to;on;in;of;and;"
+                                   "for;with;it;is;i;we;us;start;starting;started;begin;beginning;hit;hitting;head;heading;set;setting;"
+                                   "done;finish;finished;completed;stop;timer;out;at;trailhead;im;going;doing;about;gonna;will;were;just;"
+                                   "back;from;mountain;half;overnight;weekend;sunny;cool;hot;cold;km;kms;k;kilometre;kilometres;hour;hours;hr;hrs;min;mins;"
+                                   "minute;minutes;mile;miles;lunch;birthday";
+  const HbWords* w = &H->w;
+  for (int i = 0; i < w->n; i++) {
+    bool is_noun = hbWordIn(w->p[i], w->l[i], nouns);
+    if (is_noun && i >= 1) {
+      const char* pw = w->p[i - 1];
+      int pl = w->l[i - 1];
+      if (pw[0] >= '0' && pw[0] <= '9') continue;   // "a 5 km walk"
+      if (!hbWordIn(pw, pl, plain) && !hbWordIn(pw, pl, nouns)) return true;
+    }
+    if ((w->l[i] == 2 && memcmp(w->p[i], "mt", 2) == 0) || (w->l[i] == 5 && memcmp(w->p[i], "mount", 5) == 0)) {
+      if (i + 1 < w->n) return true;
+    }
+  }
+  return false;
+}
+
+// which hike does this message talk about? A trail of mine (its number), HT_OFFTRAIL, HT_UNKNOWN, or (if allowed) the
+// person's last hike, whatever that was (*assumed is then true), else HT_NONE.
+static HB_NOINLINE int hbPickHike(HbCtx* H, bool allow_last, bool* assumed) {
+  HikePerson* P = H->who;
+  if (assumed) *assumed = false;
+  int t = hbTrailIn(H, false);
+  if (t >= 0) { P->flags &= ~HP_OFFTRAIL; return t; }
+  if (hbHas(H->padded, HB_OFFTRAIL_PHRASES)) { P->flags &= ~HP_OFFTRAIL; return HT_OFFTRAIL; }
+  if (hbUnlistedName(H)) { P->flags &= ~HP_OFFTRAIL; return HT_UNKNOWN; }
+  if (P->flags & HP_OFFTRAIL) { P->flags &= ~HP_OFFTRAIL; return HT_OFFTRAIL; }
+  if (allow_last && P->last_trail != HT_NONE) {
+    if (assumed) *assumed = true;
+    return P->last_trail;
+  }
+  return HT_NONE;
+}
+
 static bool hbIsGlowTrail(int t) {
   return t >= 0 && strstr(TRAILS[t].name, "Natural Bridge") != NULL;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // signal test
-
-static const char* hbVerdict(int snr10, int rssi, int* level) {
-  int lv = snr10 >= 50 ? 3 : (snr10 >= 0 ? 2 : (snr10 >= -70 ? 1 : 0));
-  if (rssi < -115 && lv > 1) lv = 1;
-  *level = lv;
-  static const char* const v[] = {"Signal: very weak, near the limit.", "Signal: weak but usable.", "Signal: good.", "Signal: strong."};
-  return v[lv];
-}
+// What this repeater heard from the LAST hop (the hiker's radio only when Hops is 0, else the previous repeater), so it
+// is reported as it is, with no verdict, no tip and no comparison with an earlier test.
 
 static HB_NOINLINE int hbDoTest(HbCtx* H) {
   const HikeCtx* c = H->c;
@@ -675,33 +741,7 @@ static HB_NOINLINE int hbDoTest(HbCtx* H) {
   }
   static char rep[BOT_MSG_MAX + 1];
   trailbotTestReply(c->sender, c->slen, H->o.budget, tstr, c->snr10, c->rssi, c->hops, rep);
-  int lv;
-  const char* verdict = hbVerdict(c->snr10, c->rssi, &lv);
-  char cmp[64] = "";
-  if (H->who->flags & HP_HAS_SNR) {
-    int d = c->snr10 - H->who->last_snr10;
-    int a = d < 0 ? -d : d;
-    if (a >= 10) snprintf(cmp, sizeof(cmp), "%d.%d dB %s than your last test.", a / 10, a % 10, d > 0 ? "better" : "worse");
-    else snprintf(cmp, sizeof(cmp), "About the same as your last test.");
-  }
-  H->who->last_snr10 = (int16_t)c->snr10;
-  H->who->flags |= HP_HAS_SNR;
-  const char* tip = lv <= 1 ? "Tip: try higher, open ground, or a clearer view toward the repeater." : "";
-  const char* extra[3] = {verdict, cmp, tip};
-  static char cur[BOT_MSG_MAX + 1];
-  strcpy(cur, rep);
-  for (int i = 0; i < 3; i++) {
-    if (!extra[i][0]) continue;
-    int need = (int)strlen(cur) + 1 + (int)strlen(extra[i]);
-    if (need <= H->o.budget) {
-      strcat(cur, "\n");
-      strcat(cur, extra[i]);
-    } else {
-      hbMsg(&H->o, "%s", cur);
-      snprintf(cur, sizeof(cur), "%s", extra[i]);
-    }
-  }
-  hbMsg(&H->o, "%s", cur);
+  hbMsg(&H->o, "%s", rep);
   return H->o.n;
 }
 
@@ -852,7 +892,12 @@ static HB_NOINLINE void hbTimerReminder(HbCtx* H) {
   hbMsg(&H->o, "%s", v[(H->c->seed >> 3) & 1]);
 }
 
-static HB_NOINLINE int hbDoStart(HbCtx* H, int t_in) {
+static HB_NOINLINE void hbOffTrailReminder(HbCtx* H) {
+  hbMsg(&H->o, "Off track is easy to get lost on: carry a map or GPS and a PLB. I can't raise an alarm if you're overdue.");
+}
+
+// t_in: a trail number, HT_OFFTRAIL, HT_UNKNOWN or HT_NONE. assumed: it is the person's last hike, not named this time.
+static HB_NOINLINE int hbDoStart(HbCtx* H, int t_in, bool assumed) {
   if (!H->clk.ok) {
     hbMsg(&H->o, "My clock isn't set, so I can't time your hike. Note your start time yourself.");
     hbTimerReminder(H);
@@ -876,32 +921,40 @@ static HB_NOINLINE int hbDoStart(HbCtx* H, int t_in) {
   }
   p->t_start = H->c->now_utc;
   p->t_trail = (int16_t)t;
-  if (t >= 0) p->last_trail = (int16_t)t;
+  if (t != HT_NONE) p->last_trail = (int16_t)t;
   p->flags &= ~HP_AWAIT_DUR;
+  bool guess = (assumed && t != HT_NONE) || t == HT_UNKNOWN;   // an assumed hike, or a name I don't know: a correction is welcome
+  if (guess) p->flags |= HP_ASSUMED;
+  else p->flags &= ~HP_ASSUMED;
+  const char* same = (assumed && t != HT_NONE) ? " (same as last time)" : "";
   int need = -1;
   if (t >= 0) {
     HikeInfo inf;
     hbParseInfo(TRAILS[t].info, &inf);
     need = hbNeedMin(p, &inf);
-    char d[20], f[14];
+    char d[20];
     if (need >= 0) {
       hbFmtMin(need, d, sizeof(d));
-      hbFmtClock(H->clk.mins + need, f, sizeof(f));
-      (void)f;
-      hbMsg(&H->o, "Timer started %s on %s%s. Allow %s%s.", tn, TRAILS[t].name, prev, inf.tapprox ? "about " : "up to ", d);
+      hbMsg(&H->o, "Timer started %s on %s%s%s. Allow %s%s.", tn, TRAILS[t].name, prev, same, inf.tapprox ? "about " : "up to ", d);
     } else {
-      hbMsg(&H->o, "Timer started %s on %s%s. I don't have a listed time for it.", tn, TRAILS[t].name, prev);
+      hbMsg(&H->o, "Timer started %s on %s%s%s. I don't have a listed time for it.", tn, TRAILS[t].name, prev, same);
     }
+  } else if (t == HT_OFFTRAIL) {
+    hbMsg(&H->o, "Timer started %s%s for your off-trail hike%s. I have no listed time, so I'll just time it.", tn, prev, same);
+  } else if (t == HT_UNKNOWN) {
+    hbMsg(&H->o, "Timer started %s%s%s. I don't have that hike listed, so I'll just time it.", tn, prev, same);
   } else {
     hbMsg(&H->o, "Timer started %s%s. Which trail are you on? Tell me and I'll compare your time later.", tn, prev);
   }
+  if (guess && H->o.n <= 1) hbMsg(&H->o, "Not right? Name the trail, or say off trail.");
   bool glow = hbHas(H->padded, "glow worm;glow worms;glowworm;glowworms");
   if (glow && (t < 0 || hbIsGlowTrail(t))) {
     hbDoGlow(H);
   } else {
     hbDaylightVerdict(H, H->clk.mins, need);
   }
-  hbTimerReminder(H);
+  if (t == HT_OFFTRAIL) hbOffTrailReminder(H);
+  else hbTimerReminder(H);
   return H->o.n;
 }
 
@@ -911,6 +964,16 @@ static HB_NOINLINE void hbExplainElapsed(HbCtx* H, int elapsed, int t, bool from
   HikePerson* p = H->who;
   static const char* const praise[] = {"Great work", "Nice one", "Well done"};
   const char* pr = praise[(H->c->seed >> 5) % 3];
+  if (t == HT_OFFTRAIL) {
+    hbMsg(&H->o, "%s, that took %s on your off-trail hike%s. I have no listed time to compare it with.", pr, e,
+          from_clock ? " (breaks included)" : "");
+    return;
+  }
+  if (t == HT_UNKNOWN) {
+    hbMsg(&H->o, "%s, that took %s%s. I don't have that hike listed, so there's no time to compare it with.", pr, e,
+          from_clock ? " (breaks included)" : "");
+    return;
+  }
   if (t < 0) {
     hbMsg(&H->o, "%s, that took %s%s. Tell me which trail it was and I'll compare it with the listed time.", pr, e,
           from_clock ? " (breaks included)" : "");
@@ -954,39 +1017,288 @@ static HB_NOINLINE void hbExplainElapsed(HbCtx* H, int elapsed, int t, bool from
   }
 }
 
+// t_in: the hike named in this message (a trail number, HT_OFFTRAIL, HT_UNKNOWN) or HT_NONE.
+// A running timer is finished as the hike it was started on, never as "the last trail they talked about".
 static HB_NOINLINE int hbDoFinish(HbCtx* H, int t_in) {
   HikePerson* p = H->who;
   int dur = hbParseDuration(H->norm);
   if (p->t_start && H->clk.ok && dur < 0) {
     long el = (long)H->c->now_utc - (long)p->t_start;
     int elapsed = el < 0 ? 0 : (int)(el / 60);
-    int t = t_in >= 0 ? t_in : p->t_trail;
-    if (t < 0) t = p->last_trail;
+    int t = t_in != HT_NONE ? t_in : p->t_trail;
+    p->flags &= ~(HP_ASSUMED | HP_OFFTRAIL);
     if (elapsed > 16 * 60) {
       char e[20];
       hbFmtMin(elapsed, e, sizeof(e));
       hbMsg(&H->o, "That timer has run %s, so it was probably left on. Say I am starting now next time.", e);
       p->t_start = 0;
-      p->t_trail = -1;
+      p->t_trail = HT_NONE;
       return H->o.n;
     }
     p->t_start = 0;
-    p->t_trail = -1;
-    if (t >= 0) p->last_trail = (int16_t)t;
+    p->t_trail = HT_NONE;
+    if (t != HT_NONE) p->last_trail = (int16_t)t;
     hbExplainElapsed(H, elapsed, t, true);
     return H->o.n;
   }
   if (dur >= 0 && dur <= 16 * 60) {   // they told us how long they were out
-    int t = t_in >= 0 ? t_in : (p->t_trail >= 0 ? p->t_trail : p->last_trail);
+    int t = t_in != HT_NONE ? t_in : (p->t_trail != HT_NONE ? p->t_trail : p->last_trail);
     p->t_start = 0;
-    p->t_trail = -1;
-    p->flags &= ~HP_AWAIT_DUR;
-    if (t >= 0) p->last_trail = (int16_t)t;
+    p->t_trail = HT_NONE;
+    p->flags &= ~(HP_AWAIT_DUR | HP_ASSUMED | HP_OFFTRAIL);
+    if (t != HT_NONE) p->last_trail = (int16_t)t;
     hbExplainElapsed(H, dur, t, false);
     return H->o.n;
   }
   p->flags |= HP_AWAIT_DUR;
   hbMsg(&H->o, "I don't have a start time for you. How long were you out? Say something like 2 hours.");
+  return H->o.n;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// moon and meteor showers (worked out from the clock, for South East Queensland; times are approximate)
+
+#define HB_RAD 0.017453292519943295
+
+static double hbRev(double x) {   // an angle in degrees, brought into 0 to 360
+  long k = (long)(x / 360.0);
+  x -= (double)k * 360.0;
+  if (x < 0) x += 360.0;
+  return x;
+}
+static float hbSin(double deg) { return sinf((float)(hbRev(deg) * HB_RAD)); }
+static float hbCos(double deg) { return cosf((float)(hbRev(deg) * HB_RAD)); }
+
+struct HbMoon {
+  float elong;      // how far the moon is ahead of the sun, 0 to 360 degrees (0 new, 180 full)
+  float ra, dec;    // the moon's position in degrees
+};
+
+// the moon's position and phase at a UTC time (low-precision lunar theory: about 0.1 degree, plenty for phase and
+// rise/set to within a few minutes)
+static HB_NOINLINE void hbMoonAt(long utc, HbMoon* m) {
+  double d = (double)(utc - 946598400L) / 86400.0;   // days since 1999-12-31 00:00 UTC
+  double N = 125.1228 - 0.0529538083 * d;
+  double w = 318.0634 + 0.1643573223 * d;
+  double Mm = 115.3654 + 13.0649929509 * d;
+  double ws = 282.9404 + 4.70935e-5 * d;
+  double Ms = 356.0470 + 0.9856002585 * d;
+  const double e = 0.0549;
+  // eccentric anomaly
+  double E = Mm + (e / HB_RAD) * hbSin(Mm) * (1.0 + e * hbCos(Mm));
+  for (int i = 0; i < 2; i++) E = E - (E - (e / HB_RAD) * hbSin(E) - Mm) / (1.0 - e * hbCos(E));
+  double xv = 60.2666 * (hbCos(E) - e);
+  double yv = 60.2666 * sqrtf(1.0f - (float)(e * e)) * hbSin(E);
+  double v = atan2f((float)yv, (float)xv) / HB_RAD;
+  double r = sqrtf((float)(xv * xv + yv * yv));
+  double vw = v + w;
+  double ci = 0.99597, si = 0.08968;   // cos and sin of the 5.1454 degree inclination
+  double xh = r * (hbCos(N) * hbCos(vw) - hbSin(N) * hbSin(vw) * ci);
+  double yh = r * (hbSin(N) * hbCos(vw) + hbCos(N) * hbSin(vw) * ci);
+  double zh = r * hbSin(vw) * si;
+  double lon = atan2f((float)yh, (float)xh) / HB_RAD;
+  double lat = atan2f((float)zh, sqrtf((float)(xh * xh + yh * yh))) / HB_RAD;
+  double Ls = ws + Ms, Lm = N + w + Mm;
+  double D = Lm - Ls, F = Lm - N;
+  lon += -1.274 * hbSin(Mm - 2 * D) + 0.658 * hbSin(2 * D) - 0.186 * hbSin(Ms) - 0.059 * hbSin(2 * Mm - 2 * D) -
+         0.057 * hbSin(Mm - 2 * D + Ms) + 0.053 * hbSin(Mm + 2 * D) + 0.046 * hbSin(2 * D - Ms) + 0.041 * hbSin(Mm - Ms) -
+         0.035 * hbSin(D) - 0.031 * hbSin(Mm + Ms) - 0.015 * hbSin(2 * F - 2 * D) + 0.011 * hbSin(Mm - 4 * D);
+  lat += -0.173 * hbSin(F - 2 * D) - 0.055 * hbSin(Mm - F - 2 * D) - 0.046 * hbSin(Mm + F - 2 * D) + 0.033 * hbSin(F + 2 * D) +
+         0.017 * hbSin(2 * Mm + F);
+  double sun = Ls + 1.915 * hbSin(Ms) + 0.020 * hbSin(2 * Ms);   // the sun's longitude
+  m->elong = (float)hbRev(lon - sun);
+  // ecliptic to equatorial
+  double ecl = 23.4393 - 3.563e-7 * d;
+  double x = hbCos(lon) * hbCos(lat), y = hbSin(lon) * hbCos(lat), z = hbSin(lat);
+  double ye = y * hbCos(ecl) - z * hbSin(ecl), ze = y * hbSin(ecl) + z * hbCos(ecl);
+  m->ra = (float)hbRev(atan2f((float)ye, (float)x) / HB_RAD);
+  m->dec = asinf((float)ze) / (float)HB_RAD;
+}
+
+static int hbMoonLitPct(float elong) {   // percent of the moon's face that is lit
+  return (int)((1.0f - hbCos(elong)) * 50.0f + 0.5f);
+}
+
+static const char* hbMoonPhaseName(float e) {
+  if (e < 12 || e >= 348) return "new moon";
+  if (e < 84) return "waxing crescent";
+  if (e <= 96) return "first quarter";
+  if (e < 168) return "waxing gibbous";
+  if (e <= 192) return "full moon";
+  if (e < 264) return "waning gibbous";
+  if (e <= 276) return "last quarter";
+  return "waning crescent";
+}
+
+// the moon's height above the horizon (degrees) from the middle of SE Qld
+#define HB_LAT (-27.6)
+#define HB_LON (153.0)
+static float hbMoonAlt(long utc) {
+  HbMoon m;
+  hbMoonAt(utc, &m);
+  double gmst = 280.46061837 + 360.98564736629 * ((double)(utc - 946728000L) / 86400.0);
+  double H = gmst + HB_LON - m.ra;
+  float sa = hbSin(HB_LAT) * hbSin(m.dec) + hbCos(HB_LAT) * hbCos(m.dec) * hbCos(H);
+  if (sa > 1) sa = 1;
+  if (sa < -1) sa = -1;
+  return asinf(sa) / (float)HB_RAD;
+}
+
+// local minutes since midnight of the moon's rise and set on the local day starting at midnight_utc (-1 = none that day)
+static HB_NOINLINE void hbMoonRiseSet(long midnight_utc, int* rise, int* set) {
+  *rise = *set = -1;
+  const float h0 = 0.125f;   // the moon's centre is on the horizon when it is a little above it (parallax and refraction)
+  float prev = hbMoonAlt(midnight_utc) - h0;
+  for (int k = 1; k <= 72; k++) {
+    long t = midnight_utc + (long)k * 1200L;
+    float f = hbMoonAlt(t) - h0;
+    if ((prev < 0) != (f < 0)) {
+      float frac = prev / (prev - f);
+      int mins = (int)(((long)(k - 1) * 1200L + (long)(frac * 1200.0f) + 30L) / 60L);
+      if (mins > 1439) mins = 1439;
+      if (prev < 0 && *rise < 0) *rise = mins;
+      if (prev >= 0 && *set < 0) *set = mins;
+    }
+    prev = f;
+  }
+}
+
+// the next time (UTC) the moon's elongation is `target` degrees (180 full, 0 new); a few hours in the past still counts
+static HB_NOINLINE long hbMoonNext(long utc, float target) {
+  long t = utc;
+  for (int i = 0; i < 6; i++) {
+    HbMoon m;
+    hbMoonAt(t, &m);
+    float diff = (float)hbRev((double)target - (double)m.elong);
+    if (diff > 350.0f) diff -= 360.0f;
+    t += (long)((double)diff / 12.19 * 86400.0);
+  }
+  return t;
+}
+
+// "Fri 30 Oct" for a UTC time, and how many local days away it is
+static void hbFmtDay(long utc, long today_ld, char* out, int osz, int* days_away) {
+  long ld = (utc + HIKE_TZ_SECS) / 86400L;
+  int y, mo, dd;
+  hbCivil(ld, &y, &mo, &dd);
+  int wd = (int)((ld + 4) % 7);
+  snprintf(out, osz, "%.3s %d %.3s", HB_DAYS[wd], dd, HB_MONTHS[mo - 1]);
+  if (days_away) *days_away = (int)(ld - today_ld);
+}
+
+static HB_NOINLINE int hbDoMoon(HbCtx* H) {
+  if (!H->clk.ok) {
+    hbMsg(&H->o, "My clock isn't set, so I can't work out the moon.");
+    return H->o.n;
+  }
+  long now = (long)H->c->now_utc;
+  long today_ld = (now + HIKE_TZ_SECS) / 86400L;
+  long midnight = today_ld * 86400L - HIKE_TZ_SECS;
+  HbMoon m;
+  hbMoonAt(now, &m);
+  hbMsg(&H->o, "Moon: %s, about %d%% lit.", hbMoonPhaseName(m.elong), hbMoonLitPct(m.elong));
+
+  int rise, set;
+  hbMoonRiseSet(midnight, &rise, &set);
+  char rs[14], ss[14];
+  char tl[100];
+  if (rise >= 0) hbFmtClock(rise, rs, sizeof(rs));
+  if (set >= 0) hbFmtClock(set, ss, sizeof(ss));
+  if (rise >= 0 && set >= 0) {
+    if (set < rise) snprintf(tl, sizeof(tl), "Moonset %s, moonrise %s today.", ss, rs);
+    else snprintf(tl, sizeof(tl), "Moonrise %s, moonset %s today.", rs, ss);
+  } else if (rise >= 0) {
+    snprintf(tl, sizeof(tl), "Moonrise %s today, no moonset until tomorrow.", rs);
+  } else if (set >= 0) {
+    snprintf(tl, sizeof(tl), "Moonset %s today, no moonrise until tomorrow.", ss);
+  } else {
+    snprintf(tl, sizeof(tl), "No moonrise or moonset today.");
+  }
+  long tf = hbMoonNext(now, 180.0f), tn = hbMoonNext(now, 0.0f);
+  if (tn < now - 3600L * 12) tn = hbMoonNext(now + 86400L * 3, 0.0f);   // never report a new moon from yesterday
+  char fs[20], ns[20];
+  hbFmtDay(tf, today_ld, fs, sizeof(fs), NULL);
+  hbFmtDay(tn, today_ld, ns, sizeof(ns), NULL);
+  hbMsg(&H->o, "%s Full moon %s, new moon %s.", tl, fs, ns);
+  return H->o.n;
+}
+
+struct HbShower {
+  uint8_t mon, day;   // usual peak date (it moves by a day or so from year to year)
+  uint8_t zhr;        // meteors an hour under perfect dark skies; far fewer are seen in practice
+  const char* name;
+  const char* note;
+};
+
+// showers worth watching from SE Qld
+static const HbShower HB_SHOWERS[] = {
+  {2, 8, 6, "Alpha Centaurids", "A few bright fireballs; best before dawn."},
+  {4, 22, 18, "Lyrids", "The radiant is low in the north-east before dawn."},
+  {5, 6, 50, "Eta Aquariids", "One of the best from here; watch in the 2 hours before dawn."},
+  {7, 30, 25, "Southern Delta Aquariids", "Best after midnight."},
+  {8, 12, 100, "Perseids", "The radiant stays very low from SE Qld, so you'll see far fewer."},
+  {10, 21, 20, "Orionids", "Best after midnight to dawn."},
+  {11, 5, 5, "Southern Taurids", "Few meteors, but some bright fireballs."},
+  {11, 17, 15, "Leonids", "Best after midnight to dawn."},
+  {12, 14, 120, "Geminids", "The best of the year: good from about 9 pm, best near midnight to 2 am."},
+};
+#define HB_NSHOWERS ((int)(sizeof(HB_SHOWERS) / sizeof(HB_SHOWERS[0])))
+
+static int hbDayOfYear(int mon, int day) {   // 1 to 365 (leap days ignored)
+  static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+  return cum[mon - 1] + day;
+}
+
+static HB_NOINLINE int hbDoMeteors(HbCtx* H) {
+  if (!H->clk.ok) {
+    hbMsg(&H->o, "My clock isn't set, so I can't tell which meteor shower is next.");
+    return H->o.n;
+  }
+  long now = (long)H->c->now_utc;
+  long today_ld = (now + HIKE_TZ_SECS) / 86400L;
+  int y = H->clk.year, mo = H->clk.mon, dd = H->clk.day;
+  (void)y;
+  int today = hbDayOfYear(mo, dd);
+  // days from today to each shower's peak (wrapping past new year); a peak up to 2 days ago still counts as "now"
+  int best = -1, best_delta = 9999;
+  int delta[HB_NSHOWERS];
+  for (int i = 0; i < HB_NSHOWERS; i++) {
+    int dlt = hbDayOfYear(HB_SHOWERS[i].mon, HB_SHOWERS[i].day) - today;
+    if (dlt < -2) dlt += 365;
+    delta[i] = dlt;
+    if (dlt < best_delta) { best_delta = dlt; best = i; }
+  }
+  const HbShower& sh = HB_SHOWERS[best];
+  char when[24];
+  snprintf(when, sizeof(when), "%d %.3s", sh.day, HB_MONTHS[sh.mon - 1]);
+  if (best_delta <= 0 && best_delta >= -2) {
+    hbMsg(&H->o, "The %s are at their peak around now (usual peak %s). Up to about %d an hour under perfect dark skies.", sh.name, when, sh.zhr);
+  } else if (best_delta == 1) {
+    hbMsg(&H->o, "Next meteor shower: the %s, peaking about tomorrow (%s). Up to about %d an hour under perfect dark skies.", sh.name, when, sh.zhr);
+  } else {
+    hbMsg(&H->o, "Next meteor shower: the %s, peaking about %s (in %d days). Up to about %d an hour under perfect dark skies.", sh.name,
+          when, best_delta, sh.zhr);
+  }
+  // the moon that night (11 pm)
+  long peak_ld = today_ld + (best_delta < 0 ? 0 : best_delta);
+  long night = peak_ld * 86400L + 23L * 3600L - HIKE_TZ_SECS;
+  HbMoon m;
+  hbMoonAt(night, &m);
+  int lit = hbMoonLitPct(m.elong);
+  const char* mv = lit < 15 ? "dark skies, ideal" : (lit < 50 ? "some moonlight, face away from it" : "a bright moon will hide the fainter ones");
+  hbMsg(&H->o, "Moon that night: about %d%% lit (%s). %s Get away from town lights.", lit, mv, sh.note);
+  // the one after
+  int nxt = -1, nxt_delta = 9999;
+  for (int i = 0; i < HB_NSHOWERS; i++) {
+    if (i == best) continue;
+    if (delta[i] >= 0 && delta[i] < nxt_delta && delta[i] > best_delta) { nxt_delta = delta[i]; nxt = i; }
+  }
+  if (nxt < 0) {   // wrapped: the first one of the new year
+    for (int i = 0; i < HB_NSHOWERS; i++) {
+      if (i != best && (nxt < 0 || delta[i] < nxt_delta)) { nxt = i; nxt_delta = delta[i]; }
+    }
+  }
+  if (nxt >= 0) hbMsg(&H->o, "After that: the %s, about %d %.3s.", HB_SHOWERS[nxt].name, HB_SHOWERS[nxt].day, HB_MONTHS[HB_SHOWERS[nxt].mon - 1]);
   return H->o.n;
 }
 
@@ -1452,20 +1764,24 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
 
   chatNorm(text, H.norm, sizeof(H.norm));
   snprintf(H.padded, sizeof(H.padded), " %s ", H.norm);
-  if (c->test_only) {   // #test channel: only the signal-test commands, nothing else (and no memory slot for anything else)
+  {   // a signal test needs nothing remembered: no memory slot is used for it (and none for anything else on a test channel)
     char tq[TRAILBOT_QUERY_MAX + 8];
     trailbotNorm(text, tq, sizeof(tq));
-    bool is_test = strcmp(tq, "test") == 0 || strcmp(tq, "ping") == 0 || hbHas(H.padded, HB_RADIO_PHRASES);
-    if (!is_test) return 0;
+    bool exact_test = strcmp(tq, "test") == 0 || strcmp(tq, "ping") == 0;
+    if (c->test_only) {   // test channel: only the signal-test commands, nothing else
+      if (!exact_test && !hbHas(H.padded, HB_RADIO_PHRASES)) return 0;
+      hbClockInit(c->now_utc, &H.clk);
+      return hbDoTest(&H);
+    }
+    if (exact_test) {
+      hbClockInit(c->now_utc, &H.clk);
+      return hbDoTest(&H);
+    }
   }
 
   char name[CHAT_NAME_MAX + 8];
   chatCleanName(c->sender, c->slen, name);
   H.who = hikePersonFor(chatHash(name, (int)strlen(name)), c->now_utc);
-  if (c->test_only) {
-    hbClockInit(c->now_utc, &H.clk);
-    return hbDoTest(&H);
-  }
   hbClockInit(c->now_utc, &H.clk);
   for (const char* q = text; *q; q++) if (*q == '?') H.question = true;
   hbSplit(H.norm, &H.w);
@@ -1473,12 +1789,29 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
 
   if (H.norm[0] == 0) return hbChat(&H, text);   // just "!"
 
+  bool q_words = H.question || hbHas(H.padded, "should i;what time;when should;if i;can i;is it;how long;will i");
+
+  // 4. hike timer
+  bool has_finish = hbHas(H.padded, "finished;finish hike;finished hike;finished the hike;finished my hike;finished the walk;finished my walk;"
+                                    "done hiking;done the hike;done the walk;back at the car;back at the carpark;made it back;got back;"
+                                    "i am back;completed the hike;completed the walk;completed;stop the timer;stop timer;end timer;"
+                                    "hike done;walk done;hike complete;walk complete;all done");
+  bool has_start = hbHas(H.padded, "starting now;starting my hike;starting the hike;starting my walk;starting the walk;starting out;"
+                                   "setting off;set off now;heading out;head out;off we go;start the timer;start timer;start hike;"
+                                   "begin hike;beginning my hike;hit the trail;hitting the trail;at the trailhead;leaving now;"
+                                   "starting a hike;starting a walk;starting off;i am starting;we are starting");
+  if (!has_start && hbHas(H.padded, "starting the;starting my;starting our;starting a;beginning the;beginning my;beginning a") &&
+      hbHas(H.padded, "track;trail;walk;hike;circuit;loop;climb;summit;peak;falls;lookout;ridge"))
+    has_start = true;   // "starting the Barney Peak walk"
+
   // 1. exact commands
   {
     char q[TRAILBOT_QUERY_MAX + 8];
     trailbotNorm(text, q, sizeof(q));
-    if (strcmp(q, "test") == 0 || strcmp(q, "ping") == 0) return hbDoTest(&H);
-    int n = trailbotLookup(text, c->node_name, out);
+    bool timer_msg = !q_words && (has_start || has_finish);   // "starting the Mt Barney track now" is a timer, not a lookup
+    bool fix_reply = P->t_start && (P->t_trail == HT_NONE || (P->flags & HP_ASSUMED)) && strncmp(q, "trails", 6) != 0 &&
+                     trailbotFindTrail(q) >= 0;   // a trail name answering "Not right? Name the trail": handled below
+    int n = (timer_msg || fix_reply) ? -1 : trailbotLookup(text, c->node_name, out);
     if (n >= 0) {
       if (strncmp(q, "trails", 6) != 0) {
         int t = trailbotFindTrail(q);
@@ -1498,38 +1831,66 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
     return hbDoTest(&H);
   }
 
-  bool q_words = H.question || hbHas(H.padded, "should i;what time;when should;if i;can i;is it;how long;will i");
-
-  // 4. hike timer
-  bool has_finish = hbHas(H.padded, "finished;finish hike;finished hike;finished the hike;finished my hike;finished the walk;finished my walk;"
-                                    "done hiking;done the hike;done the walk;back at the car;back at the carpark;made it back;got back;"
-                                    "i am back;completed the hike;completed the walk;completed;stop the timer;stop timer;end timer;"
-                                    "hike done;walk done;hike complete;walk complete;all done");
-  bool has_start = hbHas(H.padded, "starting now;starting my hike;starting the hike;starting my walk;starting the walk;starting out;"
-                                   "setting off;set off now;heading out;head out;off we go;start the timer;start timer;start hike;"
-                                   "begin hike;beginning my hike;hit the trail;hitting the trail;at the trailhead;leaving now;"
-                                   "starting a hike;starting a walk;starting off;i am starting;we are starting");
+  bool offtrail_say = hbHas(H.padded, HB_OFFTRAIL_PHRASES);
   if (P->flags & HP_AWAIT_DUR) {
     int d = hbParseDuration(H.norm);
     if (d >= 0 && !has_start) {
-      int t = hbTrailIn(&H, false);
+      int t = hbPickHike(&H, false, NULL);
       return hbDoFinish(&H, t);
     }
   }
   if (has_finish && !q_words) {
-    int t = hbTrailIn(&H, false);
+    int t = hbPickHike(&H, false, NULL);
     return hbDoFinish(&H, t);
   }
   if (has_start && !q_words) {
-    int t = hbTrailIn(&H, true);
-    return hbDoStart(&H, t);
+    bool assumed = false;
+    int t = hbPickHike(&H, true, &assumed);
+    return hbDoStart(&H, t, assumed);
+  }
+  // a running timer whose hike was assumed (or not known): a short message naming the right trail, or saying off trail, corrects it
+  if (P->t_start && !q_words && (P->t_trail == HT_NONE || (P->flags & HP_ASSUMED)) && hbWordCount(H.norm) <= 7) {
+    int nt = HT_NONE;
+    HbWords& w3 = *hbCopyWords(&H.w, 1);
+    HbHit h3 = hbFind(&w3, 1);
+    if (h3.ok && h3.dist == 0) nt = h3.idx;
+    else if (offtrail_say) nt = HT_OFFTRAIL;
+    else if ((P->flags & HP_ASSUMED) && hbUnlistedName(&H)) nt = HT_UNKNOWN;
+    if (nt != HT_NONE && nt != P->t_trail) {
+      P->t_trail = (int16_t)nt;
+      P->last_trail = (int16_t)nt;
+      P->flags &= ~(HP_ASSUMED | HP_OFFTRAIL);
+      {   // reply and stop: this message was the correction
+        if (nt >= 0) {
+          HikeInfo inf;
+          hbParseInfo(TRAILS[nt].info, &inf);
+          int need = hbNeedMin(P, &inf);
+          char d[20];
+          if (need >= 0) {
+            hbFmtMin(need, d, sizeof(d));
+            hbMsg(&H.o, "OK, timing you on %s. Allow %s%s.", TRAILS[nt].name, inf.tapprox ? "about " : "up to ", d);
+          } else {
+            hbMsg(&H.o, "OK, timing you on %s. I don't have a listed time for it.", TRAILS[nt].name);
+          }
+        } else if (nt == HT_OFFTRAIL) {
+          hbMsg(&H.o, "OK, timing your off-trail hike. I have no listed time, so I'll just time it.");
+          hbOffTrailReminder(&H);
+        } else {
+          hbMsg(&H.o, "OK, I'll just time it. I don't have that hike listed.");
+        }
+        return H.o.n;
+      }
+    }
   }
   // a trail named while a timer without a trail is running: attach it
-  if (P->t_start && P->t_trail < 0) {
+  if (P->t_start && P->t_trail == HT_NONE) {
     HbWords& w2 = *hbCopyWords(&H.w, 0);
     HbHit h = hbFind(&w2, 1);
     if (h.ok && h.dist == 0) { P->t_trail = (int16_t)h.idx; }
   }
+  // "I'm going off trail": remembered for their next hike timer
+  if (offtrail_say && !q_words && hbHas(H.padded, "i am;im;we are;were;going;heading;doing;about to;gonna;i will;we will;planning"))
+    P->flags |= HP_OFFTRAIL;
 
   // 5. more of the last walk search
   if (P->last_intent == HI_SUGGEST && hbWordCount(H.norm) <= 4 &&
@@ -1541,6 +1902,15 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (hbHas(H.padded, "glow worm;glow worms;glowworm;glowworms") && H.clk.ok && !hbHas(H.padded, "gear;pack;bring;take;wear")) {
     int g = hbDoGlow(&H);
     if (g > 0) return g;
+  }
+  if (hbHas(H.padded, "moon;moons;moonrise;moonset;moon rise;moon set;moonlight;moonlit;full moon;new moon;half moon;quarter moon;crescent;"
+                      "lunar;moon phase;phase of the moon;moon phases") && !hbHas(H.padded, "gear;pack;bring;take;wear")) {
+    return hbDoMoon(&H);
+  }
+  if (hbHas(H.padded, "meteor;meteors;meteor shower;meteor showers;meteorite;meteorites;shooting star;shooting stars;falling star;"
+                      "falling stars;perseids;geminids;leonids;orionids;lyrids;taurids;aquariids;stargazing;star gazing;stargaze") &&
+      !hbHas(H.padded, "gear;pack;bring;take;wear")) {
+    return hbDoMeteors(&H);
   }
   if (hbHas(H.padded, "what time is it;what is the time;time now;current time;what day is it;what is the date;todays date;today date;"
                       "what date;what is today;what month;what year;what is the day;what is todays date;the date")) {

@@ -30,7 +30,7 @@ static const HikeTopic HIKE_TOPICS[] = {
   // ---- what the bot can do ----
   {"what can you do;what do you do;how do you work;how does this work;how to use you;what can i ask;what can i ask you;"
    "instructions;commands;menu;help;how do i use you;what are you for", 30,
-   "I'm a hiking helper. Ask about trails, what to take, how long a walk takes, or when to start.~"
+   "I'm a hiking helper. Ask about trails, what to take, how long, when to start, sunset, the moon or meteors.~"
    "Say I am starting now, then finished hike, to time a walk. Ask for a walk idea, or say radio check.~"
    "Type !trails to browse by region. I can't see weather or closures: check parks.qld.gov.au."},
 
