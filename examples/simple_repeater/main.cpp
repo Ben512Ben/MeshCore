@@ -18,6 +18,27 @@ SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
 
+#if defined(NRF52_PLATFORM)
+// Hardware watchdog (item 43): reboots the node if loop() stops feeding it for 30 minutes.
+#include "nrf.h"
+#define WDT_TIMEOUT_S 1800
+
+static void wdtStart() {
+  if (!(NRF_WDT->RUNSTATUS & 1)) {   // not running yet (power-on, reset pin or after a watchdog reset)
+    NRF_WDT->CONFIG = 0x01;          // keep counting while the CPU sleeps (bit 0); pause only while a debugger halts it (bit 3 = 0)
+    NRF_WDT->CRV = (uint32_t)WDT_TIMEOUT_S * 32768UL - 1UL;
+    NRF_WDT->RREN = 0x01;            // reload request register 0 enabled
+    NRF_WDT->TASKS_START = 1;
+  }
+  // Already running: it survived a soft reset and its settings are locked, so it is only fed.
+  NRF_WDT->RR[0] = 0x6E524635UL;
+}
+
+static inline void wdtFeed() {
+  NRF_WDT->RR[0] = 0x6E524635UL;
+}
+#endif
+
 void halt() {
   while (1) ;
 }
@@ -40,6 +61,10 @@ void setup() {
   delay(1000);
 
   board.begin();
+
+#if defined(NRF52_PLATFORM)
+  wdtStart();   // after board.begin(): the boot lock (deep sleep below 3.3 V) has already had its say
+#endif
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
@@ -186,6 +211,9 @@ void loop() {
 #endif
 
   the_mesh.loop();
+#if defined(NRF52_PLATFORM)
+  if (the_mesh.watchdogFeedOk()) wdtFeed();   // (stops only when a radio check has decided on a reboot)
+#endif
   sensors.loop();
 #ifdef DISPLAY_CLASS
   ui_task.loop();

@@ -212,6 +212,16 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long busy_until;        // ... radio stays on until a quiet period has passed
   bool boot_notice_pending, boot_notice_armed;   // 'Rebooted' channel message after start-up
   unsigned long boot_notice_at;
+  // watchdog / radio health (item 43)
+  bool wdt_feed_ok;               // false = main loop stops feeding the hardware watchdog, so it reboots the node
+  uint32_t wd_last_tick;          // millis() at the previous watchdogService() pass
+  uint32_t wd_last_sent;          // radio sent counter at the previous pass
+  uint32_t wd_tx_stuck_ms;        // awake ms with packets queued and nothing sent
+  bool wd_tx_restarted;           // radio already restarted for this stuck spell
+  uint32_t wd_last_rx;            // radio received counter (good + bad packets) at the previous pass
+  uint32_t wd_silence_ms;         // awake ms with nothing heard
+  bool wd_silence_msg_sent;       // 'No packets heard' already posted for this silent spell
+  bool wd_grace_over;             // node has been up long enough for a radio check to cause a reboot
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -232,6 +242,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void radioWake();
   void stopSleepCycle();
   void batteryMonitor();
+  void watchdogService();
+  void radioRestart();
   void formatBattLog(char* reply);
   void formatBattPct(char* reply);
   void formatBattTrend(char* reply);
@@ -402,6 +414,9 @@ public:
     return false;
 #endif
   }
+
+  // false once a radio check has decided the node must be rebooted: main.cpp then stops feeding the hardware watchdog
+  bool watchdogFeedOk() const { return wdt_feed_ok; }
 
   bool setRxBoostedGain(bool enable) override;
 

@@ -31,6 +31,10 @@
 #define STAGGER_STEP_S    10                      //   ... 10 s less per hop ...
 #define STAGGER_SPREAD_S  8                       //   ... plus a random 0..8 s ...
 #define STAGGER_FLOOR_S   5                       //   ... and never less than 5 s (so the furthest repeaters sleep first)
+#define WD_TX_STUCK_MS    (10UL * 60UL * 1000UL)  // watchdog: packets queued but none sent for this long (radio awake) = stuck
+#define WD_SILENCE_MS     (24UL * 60UL * 60UL * 1000UL)  // watchdog: this much awake time with nothing heard = silent
+#define WD_REBOOT_GRACE_MS (6UL * 60UL * 60UL * 1000UL)  // a radio check may only cause a reboot once the node has been up this long
+#define WD_SILENCE_ACTION 0                       // 0 = silence rule only posts a message; 1 = it also restarts the radio
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -984,6 +988,15 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   boot_notice_pending = true;   // announce the (re)start on the channel
   boot_notice_armed = false;
   boot_notice_at = 0;
+  wdt_feed_ok = true;
+  wd_last_tick = 0;
+  wd_last_sent = 0;
+  wd_tx_stuck_ms = 0;
+  wd_tx_restarted = false;
+  wd_last_rx = 0;
+  wd_silence_ms = 0;
+  wd_silence_msg_sent = false;
+  wd_grace_over = false;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1291,6 +1304,66 @@ void MyMesh::radioWake() {
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   radio_driver.setCADEnabled(_prefs.cad_enabled);
+}
+
+// Radio restart: the same full restart a sleep wake does, with a short pause so the front-end chip power settles.
+void MyMesh::radioRestart() {
+  radioSleep(0);
+  delay(100);
+  radioWake();
+}
+
+// Radio health checks (item 43). Runs on every loop pass, also while the radio sleeps (then it only keeps time).
+//  - stuck transmit: packets queued, none sent for 10 awake minutes -> restart the radio; if that does not help
+//    within another 10 minutes -> stop feeding the hardware watchdog so the node reboots
+//  - silence: 24 awake hours with nothing heard -> post a message (and, if WD_SILENCE_ACTION is 1, restart the radio).
+//    The silence rule never causes a reboot: a node that is simply isolated would otherwise reboot for nothing.
+void MyMesh::watchdogService() {
+#if !defined(NRF52_PLATFORM)
+  return;   // nRF52 boards only (T096, T114); other boards are not touched
+#endif
+  uint32_t now = millis();
+  uint32_t dt = now - wd_last_tick;
+  wd_last_tick = now;
+  if (!wd_grace_over && now >= WD_REBOOT_GRACE_MS) wd_grace_over = true;   // (before millis() can wrap)
+  if (sleeping) return;   // only awake time counts
+  if (dt > 60000) dt = 0;   // never count a long gap (e.g. just woken from sleep)
+
+  // stuck transmit
+  uint32_t tx = radio_driver.getPacketsSent();
+  if (hasPendingWork() && tx == wd_last_sent) {
+    wd_tx_stuck_ms += dt;
+  } else {
+    wd_tx_stuck_ms = 0;          // queue empty or something was sent: fine
+    wd_tx_restarted = false;
+  }
+  wd_last_sent = tx;
+  if (wd_tx_stuck_ms >= WD_TX_STUCK_MS) {
+    wd_tx_stuck_ms = 0;
+    if (!wd_tx_restarted) {
+      wd_tx_restarted = true;
+      radioRestart();
+    } else if (wd_grace_over) {
+      wdt_feed_ok = false;       // still stuck after a radio restart: let the hardware watchdog reboot the node
+    }
+  }
+
+  // silence
+  uint32_t rx = radio_driver.getPacketsRecv() + radio_driver.getPacketsRecvErrors();
+  if (rx != wd_last_rx) {
+    wd_last_rx = rx;
+    wd_silence_ms = 0;
+    wd_silence_msg_sent = false;   // heard something: re-armed
+  } else {
+    wd_silence_ms += dt;
+  }
+  if (wd_silence_ms >= WD_SILENCE_MS && !wd_silence_msg_sent) {
+    wd_silence_msg_sent = true;
+    chanEnqueue("No packets heard for 24h", CHAN_GAP_MS);
+#if WD_SILENCE_ACTION
+    radioRestart();
+#endif
+  }
 }
 
 void MyMesh::stopSleepCycle() {
@@ -2785,6 +2858,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 }
 
 void MyMesh::loop() {
+  watchdogService();   // radio health checks (item 43)
   // battery monitor: every 5 min (also runs while the radio sleeps)
   if (!batt_check_armed) {
     batt_check_armed = true;
@@ -2802,7 +2876,17 @@ void MyMesh::loop() {
       boot_notice_pending = false;
       unsigned mv = board.getBattMilliVolts();
       char msg[CHAN_MSG_MAX + 1];
-      snprintf(msg, sizeof(msg), "Rebooted, battery %u.%02uV", mv / 1000, (mv % 1000) / 10);
+      const char* why = "";   // why the node restarted (nRF52 boards with power management only)
+#ifdef NRF52_POWER_MANAGEMENT
+      uint32_t rr = board.getResetReason();   // RESETREAS register captured at boot
+      if (rr & 0x00000002UL)      why = " (watchdog)";
+      else if (rr & 0x00000008UL) why = " (cpu lockup)";
+      else if (rr & 0x00000001UL) why = " (reset button)";
+      else if (rr & 0x00000004UL) why = " (restart)";
+      else if (rr & 0x001F0000UL) why = " (woke from deep sleep)";
+      else                        why = " (power loss)";
+#endif
+      snprintf(msg, sizeof(msg), "Rebooted%s, battery %u.%02uV", why, mv / 1000, (mv % 1000) / 10);
       chanEnqueue(msg, CHAN_GAP_MS);
     }
   }
