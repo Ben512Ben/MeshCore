@@ -201,6 +201,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   ChanQueued chan_q[CHAN_Q_MAX];
   uint8_t chan_q_n;
   uint16_t chan_enq_count;   // counts every message queued (item 44: shows whether a command queued a reply)
+  bool reboot_pending;           // item 46: a channel 'reboot' is waiting for its reply to go out
+  unsigned long reboot_deadline; // item 46: restart by this time even if the reply is stuck
   bool chan_gap_on;
   unsigned long chan_next_send_at;
   bool report_armed;

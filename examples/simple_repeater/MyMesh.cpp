@@ -27,6 +27,7 @@
 #define CHAN_PAIR_GAP_MS  10000                   // gap between the two daily report messages
 #define BLOCK_NOTICE_GAP_MS (60UL * 60UL * 1000UL)  // at most one auto-block notice per hour
 #define SLEEP_MSG_WAIT_MS 150000                  // sleep waits at most this long for queued channel messages
+#define REBOOT_WAIT_MS    20000UL                 // item 46: a channel 'reboot' restarts after its reply has gone out, or after this at the latest
 #define TX_QUIET_MS       6000                    // radio never goes to sleep until this long after the last queued send
 #define STAGGER_BASE_S    112                     // reply delay of a sleep command sent to 'all': 112 s at 0 hops ...
 #define STAGGER_STEP_S    10                      //   ... 10 s less per hop ...
@@ -977,6 +978,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(&chan, 0, sizeof(chan));
   chan_q_n = 0;
   chan_enq_count = 0;
+  reboot_pending = false;
+  reboot_deadline = 0;
   chan_gap_on = false;
   chan_next_send_at = 0;
   report_armed = false;
@@ -2161,6 +2164,8 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
       if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
     }
   }
+  // item 46: 'reboot' and 'set tx <n>' are accepted only when addressed to this repeater by name (never to 'all')
+  bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0;
   bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "batttrend") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
                  || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
@@ -2172,7 +2177,8 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
                  || strncmp(buf, "filterchan clear", 16) == 0
                  || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
-                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0;
+                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0
+                 || (named_only && !to_all);   // item 46
   if (!allowed) return;   // only these commands can be given over the channel
 
   if (ts <= last_cmd_ts) return;   // replayed or duplicate command
@@ -2188,6 +2194,30 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
                                       // for one repeater by name only 1..3 s (item 41)
     sendSelfAdvertisement(to_all ? getRNG()->nextInt(2000, 60001) : getRNG()->nextInt(1000, 3001), true);
     strcpy(reply, "OK - advert sent");
+  } else if (strcmp(buf, "reboot") == 0) {   // item 46 (named only): reply first, then restart once the reply has gone out (see loop())
+    strcpy(reply, "OK - rebooting");
+    reboot_pending = true;
+    reboot_deadline = futureMillis(REBOOT_WAIT_MS);
+  } else if (strncmp(buf, "set tx ", 7) == 0) {   // item 46 (named only): -9..30, the same limit the node applies when it loads its settings
+    const char* q = buf + 7;
+    while (*q == ' ') q++;
+    bool neg = (*q == '-');
+    if (neg) q++;
+    int val = 0, digits = 0;
+    while (*q >= '0' && *q <= '9' && digits < 3) {
+      val = val * 10 + (*q - '0');
+      q++;
+      digits++;
+    }
+    if (neg) val = -val;
+    if (digits == 0 || *q != 0 || val < -9 || val > 30) {
+      strcpy(reply, "Err - tx must be -9..30");
+    } else {
+      char cmd[24];
+      snprintf(cmd, sizeof(cmd), "set tx %d", val);
+      handleCommand(0, cmd, reply);   // the normal CLI path: stores it, saves it and applies it
+      snprintf(reply, 32, "OK - tx %d", val);
+    }
   } else {
     handleCommand(0, buf, reply);   // (0 = no clock sync from channel messages)
   }
@@ -2984,6 +3014,14 @@ void MyMesh::loop() {
     busy_until = futureMillis(TX_QUIET_MS);
   }
   bool radio_quiet = !busy_armed || millisHasNowPassed(busy_until);
+
+  // item 46: 'reboot' over the channel restarts as soon as its reply has gone out: nothing queued, nothing in flight and the
+  // radio back in receive mode. REBOOT_WAIT_MS is the longest it waits. (The CLI 'reboot' is still immediate.)
+  if (reboot_pending && !sleeping
+      && ((chan_q_n == 0 && !hasPendingWork() && radio_driver.isInRecvMode()) || millisHasNowPassed(reboot_deadline))) {
+    reboot_pending = false;
+    board.reboot();   // does not return
+  }
 
   // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
   if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork() && radio_quiet
