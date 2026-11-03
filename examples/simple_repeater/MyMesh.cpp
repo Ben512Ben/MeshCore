@@ -16,6 +16,7 @@
 #define CYCLE_AWAKE_MS    (3UL * 60UL * 1000UL)   // sleep cycle: radio on
 #define BRISBANE_UTC_OFFSET_SECS  (10L * 3600L)   // 'sleep until' uses Brisbane time (UTC+10, no DST)
 #define CLOCK_VALID_AFTER 1767225600UL            // 1 Jan 2026: any earlier clock is considered 'not set'
+#define CLOCK_SYNC_MARGIN_S 300UL                 // item 44: a channel message moves the clock only if it is more than 5 min ahead (or the clock is unset)
 #define CLI_REPLY_MAX     150                     // keep replies well inside the 160 byte CLI buffer
 #define HOT_START_C       60                      // chip temperature warning: 60C or more ...
 #define HOT_COUNT         3                       //   ... for 3 checks in a row
@@ -975,6 +976,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   chan_key_len = 0;
   memset(&chan, 0, sizeof(chan));
   chan_q_n = 0;
+  chan_enq_count = 0;
   chan_gap_on = false;
   chan_next_send_at = 0;
   report_armed = false;
@@ -1905,6 +1907,7 @@ void MyMesh::chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report
   q.text[CHAN_MSG_MAX] = 0;
   q.gap_after_ms = gap_after_ms;
   q.is_report = is_report;
+  chan_enq_count++;   // item 44: lets the caller see whether a command queued a reply
 }
 
 void MyMesh::chanDropReports() {   // an older daily report that never got out is replaced by the new one
@@ -1933,7 +1936,7 @@ void MyMesh::chanService() {   // post queued channel messages, one at a time, o
   chan_next_send_at = futureMillis(q.gap_after_ms);
 }
 
-void MyMesh::dailyReport() {   // every 24h from boot: battlog line, then templog line
+void MyMesh::dailyReport() {   // every 24h from boot: one short summary message (item 45)
   if (!report_armed) {
     report_armed = true;
     report_due_at = futureMillis(REPORT_INTERVAL_MS);
@@ -1945,22 +1948,45 @@ void MyMesh::dailyReport() {   // every 24h from boot: battlog line, then templo
   queueReport();
 }
 
-void MyMesh::queueReport() {   // battlog line, then templog line (skipped without a key or without data)
+// Item 45: the daily report is one short message: battery now (and the 24 h change once 24 h of readings exist),
+// chip temperature high and low from the hourly log, radio-on share. Skipped without a key or without logged data.
+// Example: "Battery 80%, down 2% over 24h. Chip temp hi 47C lo 15C. Radio on 100%."
+void MyMesh::queueReport() {
   if (!chan_key_set || batt_log_count == 0) return;
   char buf[CHAN_MSG_MAX + 1];
-  int prefix = (int)strlen(_prefs.node_name) + 2;
-  if (prefix > 39) prefix = 39;
-  bool trend = batt_trend_valid;   // the trend line follows once 24 h of readings exist
-  formatBattLog(buf);
-  trimLogToFit(buf, 12, prefix);
-  chanEnqueue(buf, CHAN_PAIR_GAP_MS, true);
-  formatTempLog(buf);
-  trimLogToFit(buf, 12, prefix);
-  chanEnqueue(buf, trend ? CHAN_PAIR_GAP_MS : CHAN_GAP_MS, true);
-  if (trend) {
-    formatBattTrend(buf);
-    chanEnqueue(buf, CHAN_GAP_MS, true);
+  unsigned mv_new = batt_log[(batt_log_head + 23) % 24];   // newest hourly reading (the one the trend uses)
+  int pos = snprintf(buf, 24, "Battery %d%%", battPercent(mv_new));
+  if (batt_trend_valid) {
+    int d = (int)(mv_new / 10) - (int)(batt_prev24 / 10);   // centivolts, as in batttrend (item 33)
+    int a = d < 0 ? -d : d;
+    if (a < 2) {
+      pos += snprintf(&buf[pos], 24, ", steady over 24h");
+    } else {
+      int pct = (a * 100 + 60) / 120;   // same straight line as battpct, nearest whole percent
+      pos += snprintf(&buf[pos], 32, ", %s %d%% over 24h", d < 0 ? "down" : "up", pct);
+    }
   }
+  buf[pos++] = '.';
+  buf[pos] = 0;
+  int tmin = 0, tmax = 0;   // chip temperature from the hourly log, tenths of a degree
+  bool have_t = false;
+  for (int i = 0; i < batt_log_count; i++) {
+    int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+    if (temp_log[idx] == INT16_MIN) continue;
+    int v = temp_log[idx];
+    if (!have_t || v < tmin) tmin = v;
+    if (!have_t || v > tmax) tmax = v;
+    have_t = true;
+  }
+  if (have_t) {
+    int hi = tmax >= 0 ? (tmax + 5) / 10 : -((-tmax + 5) / 10);   // nearest whole degree
+    int lo = tmin >= 0 ? (tmin + 5) / 10 : -((-tmin + 5) / 10);
+    pos += snprintf(&buf[pos], 40, " Chip temp hi %dC lo %dC.", hi, lo);
+  }
+  int on = batt_trend_valid ? radioOnPercentTrend() : -1;   // the same 24 h as the trend, else since boot
+  if (on < 0) on = radioOnPercentSinceOldest();
+  if (on >= 0) pos += snprintf(&buf[pos], 24, " Radio on %d%%.", on);
+  chanEnqueue(buf, CHAN_GAP_MS, true);
 }
 
 void MyMesh::formatStatus(char* reply) {
@@ -2047,7 +2073,64 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
     blockNameCheckText((const char*)&data[5]);
     return;
   }
+  // item 44: any valid <...> message on the command channel can set an unset or stale clock, before the command runs
+  uint32_t behind_s = 0;
+  bool was_unset = false;
+  bool synced = chanClockSync((const char*)&data[5], ts, &behind_s, &was_unset);
+  uint16_t enq_before = chan_enq_count;
   handleChannelCommand((const char*)&data[5], ts, (int)packet->getPathHashCount());
+  if (synced) chanClockNotice(behind_s, was_unset, chan_enq_count != enq_before);
+}
+
+// Item 44. Sets the clock from the channel message's own timestamp. Same checks as handleChannelCommand for the <...> wrapper,
+// then: not a replay (ts newer than the last accepted command, read only here), not before 1 Jan 2026, and only if the clock is
+// unset or ts is more than CLOCK_SYNC_MARGIN_S ahead of it. Never moves the clock backwards. Nothing is saved to flash.
+bool MyMesh::chanClockSync(const char* text, uint32_t ts, uint32_t* behind_s, bool* was_unset) {
+  const char* body = strstr(text, ": ");   // "<sender>: <message>"
+  if (body == NULL) return false;
+  body += 2;
+  while (*body == ' ') body++;
+  int n = (int)strlen(body);
+  while (n > 0 && body[n - 1] == ' ') n--;
+  if (n < 5 || body[0] != '<' || body[n - 1] != '>') return false;
+  if (n - 2 > CHAN_MSG_MAX) return false;
+  if (ts <= last_cmd_ts) return false;           // replayed or duplicate message: never syncs
+  if (ts < CLOCK_VALID_AFTER) return false;      // the sender's own clock is not set either
+  uint32_t now = getRTCClock()->getCurrentTime();
+  bool unset = now < CLOCK_VALID_AFTER;
+  if (!unset && ts <= now + CLOCK_SYNC_MARGIN_S) return false;   // clock is fine (or at most a few minutes behind)
+  getRTCClock()->setCurrentTime(ts + 1);         // same +1 as the CLI 'clock sync'
+  *was_unset = unset;
+  *behind_s = ts - now;
+  return true;
+}
+
+// Item 44: "Clock synced, was 7m behind" (or 3h / 2d for bigger jumps) or "Clock synced, was unset".
+// Right after a reply to the same message: it follows that reply by about 10 s (so a sleep command's reply still goes out first).
+// Otherwise: a random 5..60 s wait, like replies to 'all'. A queue that already holds messages keeps its own timing.
+void MyMesh::chanClockNotice(uint32_t behind_s, bool was_unset, bool after_reply) {
+  char msg[48];
+  if (was_unset) {
+    strcpy(msg, "Clock synced, was unset");
+  } else if (behind_s < 3600UL) {
+    snprintf(msg, sizeof(msg), "Clock synced, was %um behind", (unsigned)(behind_s / 60UL));
+  } else if (behind_s < 48UL * 3600UL) {
+    snprintf(msg, sizeof(msg), "Clock synced, was %uh behind", (unsigned)(behind_s / 3600UL));
+  } else {
+    snprintf(msg, sizeof(msg), "Clock synced, was %ud behind", (unsigned)(behind_s / 86400UL));
+  }
+  if (after_reply) {
+    if (chan_q_n > 0) chan_q[chan_q_n - 1].gap_after_ms = CHAN_PAIR_GAP_MS;   // the notice follows the reply by ~10 s
+    chanEnqueue(msg, CHAN_GAP_MS);
+    return;
+  }
+  bool idle = (chan_q_n == 0);
+  chanEnqueue(msg, CHAN_GAP_MS);
+  if (idle && chan_q_n == 1) {
+    unsigned long at = futureMillis(getRNG()->nextInt(5000, 60001));
+    if (!chan_gap_on || (long)(at - chan_next_send_at) > 0) chan_next_send_at = at;   // never earlier than a gap already running
+    chan_gap_on = true;
+  }
 }
 
 // channel commands look like  <battlog all>  <templog Tuna>  <sleep until 21:00 all>
@@ -2292,7 +2375,7 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
     } else {
       chanDropReports();
       queueReport();
-      if (from_channel) reply[0] = 0;   // the two report messages are the answer
+      if (from_channel) reply[0] = 0;   // the report message is the answer
       else strcpy(reply, "OK - report queued");
     }
     return true;

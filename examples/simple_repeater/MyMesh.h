@@ -200,6 +200,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   };
   ChanQueued chan_q[CHAN_Q_MAX];
   uint8_t chan_q_n;
+  uint16_t chan_enq_count;   // counts every message queued (item 44: shows whether a command queued a reply)
   bool chan_gap_on;
   unsigned long chan_next_send_at;
   bool report_armed;
@@ -272,6 +273,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void noteAutoBlock(const uint8_t* key, uint8_t len);
   void blockNoticeService();
   void handleChannelCommand(const char* text, uint32_t ts, int hops);
+  bool chanClockSync(const char* text, uint32_t ts, uint32_t* behind_s, bool* was_unset);   // item 44
+  void chanClockNotice(uint32_t behind_s, bool was_unset, bool after_reply);               // item 44
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
