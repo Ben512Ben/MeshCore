@@ -1225,6 +1225,11 @@ static void trimLogToFit(char* buf, int hdr_len, int prefix_len) {
   }
 }
 
+// uptime in seconds -> "2d4h5m" (shared by status and chanallow, item 48)
+static void fmtUptime(char* out, size_t n, unsigned long up) {
+  snprintf(out, n, "%lud%luh%lum", up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
+}
+
 static int lowerc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 // true if s ends with " <target>" (case-insensitive). cmd_len = length of the command in front of it
@@ -2021,9 +2026,11 @@ void MyMesh::formatStatus(char* reply) {
   char hops[8];   // hops the channel command took to reach us ('-' when the command did not come over the channel)
   if (cmd_hops >= 0) snprintf(hops, sizeof(hops), "%d", (int)cmd_hops);
   else strcpy(hops, "-");
-  snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, hops %s, up %lud%luh%lum",
+  char upstr[24];
+  fmtUptime(upstr, sizeof(upstr), up);
+  snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, hops %s, up %s",
            cycle_active ? "on" : "off", sleep_auto_enabled ? "on" : "off", blocked,
-           chan_key_set ? "set" : "not set", hops, up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
+           chan_key_set ? "set" : "not set", hops, upstr);
 }
 
 void MyMesh::noteAutoBlock(const uint8_t* key, uint8_t len) {
@@ -2665,8 +2672,10 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
       else strcpy(cmdh, "-");
       if (chanallow_extra_set) snprintf(extra, sizeof(extra), "%02X", chanallow_extra_hash);
       else strcpy(extra, "-");
-      snprintf(reply, 110, "chanallow %s, cmd %s, Public %02X, extra %s, dropped msgs %lu, adverts %lu", chanallow_on ? "on" : "off",
-               cmdh, public_chan.hash[0], extra, (unsigned long)chanallow_dropped, (unsigned long)chanallow_adv_dropped);
+      char upstr[24];   // uptime covers the same period as the counters (both reset at reboot), so counters / uptime estimate the power saving, item 48
+      fmtUptime(upstr, sizeof(upstr), (unsigned long)(uptime_millis / 1000ULL));
+      snprintf(reply, 120, "chanallow %s, cmd %s, Public %02X, extra %s, dropped msgs %lu, adverts %lu, up %s", chanallow_on ? "on" : "off",
+               cmdh, public_chan.hash[0], extra, (unsigned long)chanallow_dropped, (unsigned long)chanallow_adv_dropped, upstr);
     } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
       chanallow_on = (sub[1] == 'n');
       strcpy(reply, chanallow_on ? "OK - chanallow on" : "OK - chanallow off");
