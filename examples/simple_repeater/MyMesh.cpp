@@ -1419,12 +1419,8 @@ void MyMesh::batteryMonitor() {
   if (mv < CRIT_WARN_MV) {
     if (!crit_msg_sent) {
       crit_msg_sent = true;
-#ifdef NRF52_POWER_MANAGEMENT   // only these boards really shut down (boot lock)
-      snprintf(msg, sizeof(msg), "Battery critical %u.%02uV, shutting down until recharged",
-               (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
-#else
+      // early warning only: it makes no shutdown claim, because the shutdown (below) only happens at BATT_CRIT_MV
       snprintf(msg, sizeof(msg), "Battery critical %u.%02uV", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
-#endif
       chanEnqueue(msg, CHAN_GAP_MS);
     }
   } else if (mv >= BATT_LOW_MV) {
@@ -1434,7 +1430,20 @@ void MyMesh::batteryMonitor() {
   // last resort: reboot so the board's boot lock (below 3.3V) puts the node into deep sleep
 #ifdef NRF52_POWER_MANAGEMENT   // (only boards with the nRF52 boot lock; elsewhere a reboot would not help)
   if (mv < BATT_CRIT_MV) {
-    if (++batt_crit_count >= BATT_CRIT_COUNT) board.reboot();   // doesn't return
+    if (batt_crit_count < 255) batt_crit_count++;
+    if (batt_crit_count >= BATT_CRIT_COUNT && !reboot_pending) {
+      // Confirmed: announce the shutdown, then reboot once the message has gone out (see the reboot_pending block in loop()).
+      if (sleeping) radioWake();    // wake the radio so the message can be sent
+      sleep_pending = false;        // no sleep may start again before the reboot
+      cycle_active = false;
+      chan_q_n = 0;                 // drop anything older and waiting: this message goes out now
+      chan_gap_on = false;          // ... without waiting out the gap after an earlier message
+      snprintf(msg, sizeof(msg), "Battery critical %u.%02uV, shutting down until recharged",
+               (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
+      chanEnqueue(msg, CHAN_GAP_MS);
+      reboot_pending = true;        // reboots when the queue is empty and nothing is in flight, or after REBOOT_WAIT_MS
+      reboot_deadline = futureMillis(REBOOT_WAIT_MS);
+    }
   } else {
     batt_crit_count = 0;
   }
