@@ -89,6 +89,7 @@ struct NeighbourInfo {
 #define BLOCKNAME_LEN 32        // 31 characters + terminator
 #define BLOCKNAME_PER_PAGE 5    // most entries shown by one 'blockname list'
 #define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
+#define RON_SNAPS 25            // radio-on snapshots kept: boot + one per hourly log moment (25 = exactly 24 h span)
 
 #define BOT_KEY_FILE "/bot_key"   // trail bot channel key (item 32), same layout as /chan_key
 #define TEST_KEY_FILE "/test_key" // #test channel keys ('testchan'): TEST_CH_MAX records of 33 bytes, same layout as /chan_key
@@ -144,6 +145,13 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint16_t batt_log[24];
   int16_t temp_log[24];   // chip temperature, tenths of a degree C (INT16_MIN = no reading)
   uint8_t batt_log_head, batt_log_count;
+  uint16_t batt_prev24;        // the reading the newest one replaced = exactly 24 h older (item 33)
+  bool batt_trend_valid;       // true once 25 hourly readings exist
+  uint32_t radio_on_total_ms;  // radio-on time added up (wraps; only differences are used) (item 34)
+  uint32_t radio_on_since_ms;  // millis() when the radio last came on
+  uint32_t ron_snap_t[RON_SNAPS];    // millis() at boot and at every hourly log moment
+  uint32_t ron_snap_on[RON_SNAPS];   // radio-on total at those moments
+  uint8_t ron_snap_head, ron_snap_n;
 
   // 'blockhop' list (RAM only): repeaters whose relayed packets (first hop) we refuse to forward
   struct BlockHopEntry {
@@ -175,7 +183,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   // 'chanallow' relay whitelist (RAM only, off after every boot)
   bool chanallow_on, chanallow_extra_set;
   uint8_t chanallow_extra_hash;
-  uint32_t chanallow_dropped;
+  uint32_t chanallow_dropped;       // channel messages not relayed
+  uint32_t chanallow_adv_dropped;   // flood adverts not relayed (item 36)
 
   // trail bot (item 32): own channel + key, answers "!trail" / "!town" messages. Off after every boot.
   bool bot_key_set, bot_on;
@@ -205,6 +214,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
+  uint8_t list_pages_pending;   // 'blockname list' over the channel: total pages to send (0 = just the one reply) (item 38)
 
   // warnings / notices
   uint8_t hot_count;
@@ -227,6 +237,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   };
   ChanQueued chan_q[CHAN_Q_MAX];
   uint8_t chan_q_n;
+  uint16_t chan_enq_count;   // counts every message queued (item 44: shows whether a command queued a reply)
+  bool reboot_pending;           // item 46: a channel 'reboot' is waiting for its reply to go out
+  unsigned long reboot_deadline; // item 46: restart by this time even if the reply is stuck
   bool chan_gap_on;
   unsigned long chan_next_send_at;
   bool report_armed;
@@ -239,6 +252,16 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long busy_until;        // ... radio stays on until a quiet period has passed
   bool boot_notice_pending, boot_notice_armed;   // 'Rebooted' channel message after start-up
   unsigned long boot_notice_at;
+  // watchdog / radio health (item 43)
+  bool wdt_feed_ok;               // false = main loop stops feeding the hardware watchdog, so it reboots the node
+  uint32_t wd_last_tick;          // millis() at the previous watchdogService() pass
+  uint32_t wd_last_sent;          // radio sent counter at the previous pass
+  uint32_t wd_tx_stuck_ms;        // awake ms with packets queued and nothing sent
+  bool wd_tx_restarted;           // radio already restarted for this stuck spell
+  uint32_t wd_last_rx;            // radio received counter (good + bad packets) at the previous pass
+  uint32_t wd_silence_ms;         // awake ms with nothing heard
+  bool wd_silence_msg_sent;       // 'No packets heard' already posted for this silent spell
+  bool wd_grace_over;             // node has been up long enough for a radio check to cause a reboot
   float pending_freq;
   float pending_bw;
   uint8_t pending_sf;
@@ -253,21 +276,28 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   bool handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply);
+  bool handleSleepCommandsInner(uint32_t sender_timestamp, char* command, char* reply);
   void startSleep(uint32_t duration_ms, bool absolute = false);
   void radioSleep(uint32_t duration_ms);
   void radioWake();
   void stopSleepCycle();
   void batteryMonitor();
+  void watchdogService();
+  void radioRestart();
   void formatBattLog(char* reply);
   void formatBattPct(char* reply);
+  void formatBattTrend(char* reply);
+  uint32_t radioOnMs() const;
+  void ronSnapshot();
+  int radioOnPercentSinceOldest() const;
+  int radioOnPercentTrend() const;
   void formatTempLog(char* reply);
   bool blockHopCheck(const mesh::Packet* packet);
   bool blockHopAdd(const uint8_t* key, uint8_t len, bool is_auto);
   void formatBlockHopList(char* reply, int page);
   uint8_t blockNameCount() const;
   void blockNameCheckText(const char* text);
-  void formatBlockNameList(char* reply, int page);
-  bool chanAllowBlocks(const mesh::Packet* packet);
+  int formatBlockNameList(char* reply, int page);   // returns the number of pages
   bool botSameAsCommandChannel(const mesh::GroupChannel& ch) const;
   const char* botKeyConflict(const mesh::GroupChannel& ch, uint8_t which, int skip_slot) const;
   int testCount() const;
@@ -285,6 +315,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void botUserDone(uint16_t id);
   void botChanCommand(const char* sub, char* reply);
   void testChanCommand(const char* sub, char* reply);
+  bool chanAllowBlocks(const mesh::Packet* packet);
   bool setChannelKey(const char* key);
   void saveChannelKey();
   void loadChannelKey();
@@ -298,6 +329,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void noteAutoBlock(const uint8_t* key, uint8_t len);
   void blockNoticeService();
   void handleChannelCommand(const char* text, uint32_t ts, int hops);
+  bool chanClockSync(const char* text, uint32_t ts, uint32_t* behind_s, bool* was_unset);   // item 44
+  void chanClockNotice(uint32_t behind_s, bool was_unset, bool after_reply);               // item 44
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -440,6 +473,9 @@ public:
     return false;
 #endif
   }
+
+  // false once a radio check has decided the node must be rebooted: main.cpp then stops feeding the hardware watchdog
+  bool watchdogFeedOk() const { return wdt_feed_ok; }
 
   bool setRxBoostedGain(bool enable) override;
 

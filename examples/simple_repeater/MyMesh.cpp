@@ -12,11 +12,12 @@
 #define BATT_LOW_COUNT    3
 #define BATT_CRIT_MV      3200                    // last resort: reboot below this (2 checks in a row)
 #define BATT_CRIT_COUNT   2                       //   so the board's boot lock takes over
-#define CYCLE_STOP_MV     4100                    // sleep cycle ends at/above this
+#define CYCLE_STOP_MV     4050                    // sleep cycle ends at/above this (4.05 V = 87%)
 #define CYCLE_SLEEP_MS    (57UL * 60UL * 1000UL)  // sleep cycle: radio off
 #define CYCLE_AWAKE_MS    (3UL * 60UL * 1000UL)   // sleep cycle: radio on
 #define BRISBANE_UTC_OFFSET_SECS  (10L * 3600L)   // 'sleep until' uses Brisbane time (UTC+10, no DST)
 #define CLOCK_VALID_AFTER 1767225600UL            // 1 Jan 2026: any earlier clock is considered 'not set'
+#define CLOCK_SYNC_MARGIN_S 300UL                 // item 44: a channel message moves the clock only if it is more than 5 min ahead (or the clock is unset)
 #define CLI_REPLY_MAX     150                     // keep replies well inside the 160 byte CLI buffer
 #define HOT_START_C       60                      // chip temperature warning: 60C or more ...
 #define HOT_COUNT         3                       //   ... for 3 checks in a row
@@ -27,15 +28,20 @@
 #define CHAN_PAIR_GAP_MS  10000                   // gap between the two daily report messages
 #define BLOCK_NOTICE_GAP_MS (60UL * 60UL * 1000UL)  // at most one auto-block notice per hour
 #define SLEEP_MSG_WAIT_MS 150000                  // sleep waits at most this long for queued channel messages
-#define TX_QUIET_MS       6000                    // radio never goes to sleep until this long after the last queued send
-#define STAGGER_BASE_S    112                     // reply delay of a sleep command sent to 'all': 112 s at 0 hops ...
-#define STAGGER_STEP_S    10                      //   ... 10 s less per hop ...
-#define STAGGER_SPREAD_S  8                       //   ... plus a random 0..8 s ...
+#define REBOOT_WAIT_MS    20000UL                 // item 46: a channel 'reboot' restarts after its reply has gone out, or after this at the latest
 #define BOT_FIRST_MIN_MS  3000                    // trail bot: first reply 3 to 15 s after the request ...
 #define BOT_FIRST_MAX_MS  15000
 #define BOT_GAP_MS        10000                   //   ... then 10 s between the messages of one answer
 #define BOT_USER_COOLDOWN_MS 10000                //   ... and one person gets no new answer for 10 s after their last message
+#define TX_QUIET_MS       6000                    // radio never goes to sleep until this long after the last queued send
+#define STAGGER_BASE_S    112                     // reply delay of a sleep command sent to 'all': 112 s at 0 hops ...
+#define STAGGER_STEP_S    10                      //   ... 10 s less per hop ...
+#define STAGGER_SPREAD_S  8                       //   ... plus a random 0..8 s ...
 #define STAGGER_FLOOR_S   5                       //   ... and never less than 5 s (so the furthest repeaters sleep first)
+#define WD_TX_STUCK_MS    (10UL * 60UL * 1000UL)  // watchdog: packets queued but none sent for this long (radio awake) = stuck
+#define WD_SILENCE_MS     (24UL * 60UL * 60UL * 1000UL)  // watchdog: this much awake time with nothing heard = silent
+#define WD_REBOOT_GRACE_MS (6UL * 60UL * 60UL * 1000UL)  // a radio check may only cause a reboot once the node has been up this long
+#define WD_SILENCE_ACTION 0                       // 0 = silence rule only posts a message; 1 = it also restarts the radio
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -940,6 +946,14 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   batt_low_count = batt_crit_count = 0;
   batt_check_n = 0;
   batt_log_head = batt_log_count = 0;
+  batt_prev24 = 0;
+  batt_trend_valid = false;
+  radio_on_total_ms = 0;
+  radio_on_since_ms = 0;
+  memset(ron_snap_t, 0, sizeof(ron_snap_t));
+  memset(ron_snap_on, 0, sizeof(ron_snap_on));
+  ron_snap_head = ron_snap_n = 0;
+  list_pages_pending = 0;
   memset(temp_log, 0, sizeof(temp_log));
   memset(blockhop, 0, sizeof(blockhop));
   memset(blockname, 0, sizeof(blockname));
@@ -948,6 +962,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   chanallow_on = chanallow_extra_set = false;
   chanallow_extra_hash = 0;
   chanallow_dropped = 0;
+  chanallow_adv_dropped = 0;
   cmd_hops = -1;
   sleep_cmd_flag = false;
   {   // built-in Public channel key (publicly known): used read-only, to check sender names
@@ -983,6 +998,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   bot_next_send_at = 0;
   bot_replies = 0;
   chan_q_n = 0;
+  chan_enq_count = 0;
+  reboot_pending = false;
+  reboot_deadline = 0;
   chan_gap_on = false;
   chan_next_send_at = 0;
   report_armed = false;
@@ -996,6 +1014,15 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   boot_notice_pending = true;   // announce the (re)start on the channel
   boot_notice_armed = false;
   boot_notice_at = 0;
+  wdt_feed_ok = true;
+  wd_last_tick = 0;
+  wd_last_sent = 0;
+  wd_tx_stuck_ms = 0;
+  wd_tx_restarted = false;
+  wd_last_rx = 0;
+  wd_silence_ms = 0;
+  wd_silence_msg_sent = false;
+  wd_grace_over = false;
   _logging = false;
   region_load_active = false;
   recv_pkt_region = NULL;
@@ -1061,6 +1088,8 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+  radio_on_since_ms = millis();   // the radio is on from boot: first radio-on snapshot (item 34)
+  ronSnapshot();
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -1219,6 +1248,11 @@ static void trimLogToFit(char* buf, int hdr_len, int prefix_len) {
   }
 }
 
+// uptime in seconds -> "2d4h5m" (shared by status and chanallow, item 48)
+static void fmtUptime(char* out, size_t n, unsigned long up) {
+  snprintf(out, n, "%lud%luh%lum", up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
+}
+
 static int lowerc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 // true if s ends with " <target>" (case-insensitive). cmd_len = length of the command in front of it
@@ -1271,6 +1305,7 @@ bool MyMesh::sleepFor(uint32_t duration_ms) {   // (CommonCLI hook; 'sleep <mins
 }
 
 void MyMesh::radioSleep(uint32_t duration_ms) {
+  if (!sleeping) radio_on_total_ms += (uint32_t)(millis() - radio_on_since_ms);   // radio-on time (item 34)
   sleeping = true;
   botQueueClear();   // trail bot replies still waiting are dropped, not held for the next wake
   sleep_wake_at = futureMillis(duration_ms);
@@ -1287,6 +1322,7 @@ void MyMesh::radioSleep(uint32_t duration_ms) {
 
 void MyMesh::radioWake() {
   sleeping = false;
+  radio_on_since_ms = millis();   // radio is on again (item 34)
   uint32_t saved_time = getRTCClock()->getCurrentTime();
 #ifdef HELTEC_T096
   t096FrontEndOn();                   // front-end chip must be powered before the radio restarts
@@ -1302,6 +1338,66 @@ void MyMesh::radioWake() {
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   radio_driver.setCADEnabled(_prefs.cad_enabled);
+}
+
+// Radio restart: the same full restart a sleep wake does, with a short pause so the front-end chip power settles.
+void MyMesh::radioRestart() {
+  radioSleep(0);
+  delay(100);
+  radioWake();
+}
+
+// Radio health checks (item 43). Runs on every loop pass, also while the radio sleeps (then it only keeps time).
+//  - stuck transmit: packets queued, none sent for 10 awake minutes -> restart the radio; if that does not help
+//    within another 10 minutes -> stop feeding the hardware watchdog so the node reboots
+//  - silence: 24 awake hours with nothing heard -> post a message (and, if WD_SILENCE_ACTION is 1, restart the radio).
+//    The silence rule never causes a reboot: a node that is simply isolated would otherwise reboot for nothing.
+void MyMesh::watchdogService() {
+#if !defined(NRF52_PLATFORM)
+  return;   // nRF52 boards only (T096, T114); other boards are not touched
+#endif
+  uint32_t now = millis();
+  uint32_t dt = now - wd_last_tick;
+  wd_last_tick = now;
+  if (!wd_grace_over && now >= WD_REBOOT_GRACE_MS) wd_grace_over = true;   // (before millis() can wrap)
+  if (sleeping) return;   // only awake time counts
+  if (dt > 60000) dt = 0;   // never count a long gap (e.g. just woken from sleep)
+
+  // stuck transmit
+  uint32_t tx = radio_driver.getPacketsSent();
+  if (hasPendingWork() && tx == wd_last_sent) {
+    wd_tx_stuck_ms += dt;
+  } else {
+    wd_tx_stuck_ms = 0;          // queue empty or something was sent: fine
+    wd_tx_restarted = false;
+  }
+  wd_last_sent = tx;
+  if (wd_tx_stuck_ms >= WD_TX_STUCK_MS) {
+    wd_tx_stuck_ms = 0;
+    if (!wd_tx_restarted) {
+      wd_tx_restarted = true;
+      radioRestart();
+    } else if (wd_grace_over) {
+      wdt_feed_ok = false;       // still stuck after a radio restart: let the hardware watchdog reboot the node
+    }
+  }
+
+  // silence
+  uint32_t rx = radio_driver.getPacketsRecv() + radio_driver.getPacketsRecvErrors();
+  if (rx != wd_last_rx) {
+    wd_last_rx = rx;
+    wd_silence_ms = 0;
+    wd_silence_msg_sent = false;   // heard something: re-armed
+  } else {
+    wd_silence_ms += dt;
+  }
+  if (wd_silence_ms >= WD_SILENCE_MS && !wd_silence_msg_sent) {
+    wd_silence_msg_sent = true;
+    chanEnqueue("No packets heard for 24h", CHAN_GAP_MS);
+#if WD_SILENCE_ACTION
+    radioRestart();
+#endif
+  }
 }
 
 void MyMesh::stopSleepCycle() {
@@ -1335,11 +1431,16 @@ void MyMesh::batteryMonitor() {
   if (mv < 1000) return;   // implausible reading (e.g. no battery): ignore
 
   if ((batt_check_n % 12) == 0) {   // hourly log (every 12th check)
+    if (batt_log_count == 24) {   // the reading about to be replaced is exactly 24 h older: keep it for 'batttrend'
+      batt_prev24 = batt_log[batt_log_head];
+      batt_trend_valid = true;
+    }
     batt_log[batt_log_head] = mv;
     float t = board.getMCUTemperature();   // chip temperature (NAN on boards without a sensor)
     temp_log[batt_log_head] = isnan(t) ? INT16_MIN : (int16_t)(t * 10.0f + (t >= 0 ? 0.5f : -0.5f));
     batt_log_head = (batt_log_head + 1) % 24;
     if (batt_log_count < 24) batt_log_count++;
+    ronSnapshot();   // radio-on snapshot at the same moment (item 34)
   }
   batt_check_n++;
 
@@ -1347,12 +1448,8 @@ void MyMesh::batteryMonitor() {
   if (mv < CRIT_WARN_MV) {
     if (!crit_msg_sent) {
       crit_msg_sent = true;
-#ifdef NRF52_POWER_MANAGEMENT   // only these boards really shut down (boot lock)
-      snprintf(msg, sizeof(msg), "Battery critical %u.%02uV, shutting down until recharged",
-               (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
-#else
+      // early warning only: it makes no shutdown claim, because the shutdown (below) only happens at BATT_CRIT_MV
       snprintf(msg, sizeof(msg), "Battery critical %u.%02uV", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
-#endif
       chanEnqueue(msg, CHAN_GAP_MS);
     }
   } else if (mv >= BATT_LOW_MV) {
@@ -1362,7 +1459,20 @@ void MyMesh::batteryMonitor() {
   // last resort: reboot so the board's boot lock (below 3.3V) puts the node into deep sleep
 #ifdef NRF52_POWER_MANAGEMENT   // (only boards with the nRF52 boot lock; elsewhere a reboot would not help)
   if (mv < BATT_CRIT_MV) {
-    if (++batt_crit_count >= BATT_CRIT_COUNT) board.reboot();   // doesn't return
+    if (batt_crit_count < 255) batt_crit_count++;
+    if (batt_crit_count >= BATT_CRIT_COUNT && !reboot_pending) {
+      // Confirmed: announce the shutdown, then reboot once the message has gone out (see the reboot_pending block in loop()).
+      if (sleeping) radioWake();    // wake the radio so the message can be sent
+      sleep_pending = false;        // no sleep may start again before the reboot
+      cycle_active = false;
+      chan_q_n = 0;                 // drop anything older and waiting: this message goes out now
+      chan_gap_on = false;          // ... without waiting out the gap after an earlier message
+      snprintf(msg, sizeof(msg), "Battery critical %u.%02uV, shutting down until recharged",
+               (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
+      chanEnqueue(msg, CHAN_GAP_MS);
+      reboot_pending = true;        // reboots when the queue is empty and nothing is in flight, or after REBOOT_WAIT_MS
+      reboot_deadline = futureMillis(REBOOT_WAIT_MS);
+    }
   } else {
     batt_crit_count = 0;
   }
@@ -1415,6 +1525,60 @@ void MyMesh::formatBattPct(char* reply) {
     if (pos > CLI_REPLY_MAX - 6) break;   // never overrun the reply buffer
     pos += snprintf(&reply[pos], 6, " %d", battPercent(batt_log[idx]));
   }
+}
+
+// ---- radio-on time (item 34) ----
+uint32_t MyMesh::radioOnMs() const {
+  uint32_t t = radio_on_total_ms;
+  if (!sleeping) t += (uint32_t)(millis() - radio_on_since_ms);
+  return t;
+}
+
+void MyMesh::ronSnapshot() {   // at boot and at every hourly log moment
+  ron_snap_t[ron_snap_head] = millis();
+  ron_snap_on[ron_snap_head] = radioOnMs();
+  ron_snap_head = (uint8_t)((ron_snap_head + 1) % RON_SNAPS);
+  if (ron_snap_n < RON_SNAPS) ron_snap_n++;
+}
+
+static int onPercent(uint32_t on_ms, uint32_t span_ms) {   // share of the span the radio was on, nearest whole percent
+  if (span_ms == 0) return -1;
+  uint64_t p = ((uint64_t)on_ms * 100ULL + span_ms / 2) / span_ms;
+  return p > 100 ? 100 : (int)p;
+}
+
+int MyMesh::radioOnPercentSinceOldest() const {   // since boot at first, then about the last 24..25 hours
+  if (ron_snap_n == 0) return -1;
+  uint8_t oldest = (uint8_t)((ron_snap_head + RON_SNAPS - ron_snap_n) % RON_SNAPS);
+  return onPercent(radioOnMs() - ron_snap_on[oldest], (uint32_t)(millis() - ron_snap_t[oldest]));
+}
+
+int MyMesh::radioOnPercentTrend() const {   // exactly the 24 hours between the newest snapshot and the one 24 h earlier
+  if (ron_snap_n < RON_SNAPS) return -1;
+  uint8_t oldest = ron_snap_head;   // ring is full: head points at the oldest
+  uint8_t newest = (uint8_t)((ron_snap_head + RON_SNAPS - 1) % RON_SNAPS);
+  return onPercent(ron_snap_on[newest] - ron_snap_on[oldest], ron_snap_t[newest] - ron_snap_t[oldest]);
+}
+
+// ---- battery trend (item 33): newest hourly reading against the one logged exactly 24 h earlier ----
+void MyMesh::formatBattTrend(char* reply) {
+  if (!batt_trend_valid) {
+    strcpy(reply, "batttrend: needs 24h of data (first reading 5 min after boot)");
+    return;
+  }
+  unsigned mv_new = batt_log[(batt_log_head + 23) % 24];   // newest reading
+  int d = (int)(mv_new / 10) - (int)(batt_prev24 / 10);    // centivolts: voltages are cut to two decimals, as in battlog
+  int a = d < 0 ? -d : d;
+  int pos;
+  if (a < 2) {
+    pos = snprintf(reply, 48, "Battery steady (%d.%02dV) over 24h", a / 100, a % 100);
+  } else {
+    int pct = (a * 100 + 60) / 120;   // same straight line as battpct (1.20 V = 100%), nearest whole percent
+    pos = snprintf(reply, 56, "Battery %s %d.%02dV (%c%d%%) over 24h", d < 0 ? "down" : "up", a / 100, a % 100,
+                   d < 0 ? '-' : '+', pct);
+  }
+  int on = radioOnPercentTrend();
+  if (on >= 0) snprintf(&reply[pos], 24, ", radio on %d%%", on);
 }
 
 void MyMesh::formatTempLog(char* reply) {
@@ -1558,8 +1722,25 @@ static bool nameMatches(const char* entry, const char* sender, int slen) {
   return true;
 }
 
-// channel key text -> bytes (same rules as 'channel set'). returns 16 or 32, or -1 if invalid. tmp must hold 32 bytes
+// '#name' hashtag channel (item 35): the key is the first 16 bytes of the SHA-256 of the lowercase name, '#' included.
+// returns 16, or -1 if the name cannot be used (printable characters only, no spaces, 31 at most)
+static int hashtagKey(const char* name, uint8_t* tmp) {
+  size_t nl = strlen(name);
+  if (nl < 2 || nl > 31) return -1;
+  char low[32];
+  for (size_t i = 0; i < nl; i++) {
+    unsigned char c = (unsigned char)name[i];
+    if (c <= 0x20 || c >= 0x7F) return -1;
+    low[i] = (char)lowerc(c);
+  }
+  low[nl] = 0;
+  mesh::Utils::sha256(tmp, 16, (const uint8_t*)low, (int)nl);
+  return 16;
+}
+
+// channel key text -> bytes (same rules as 'channel set', or a #name). returns 16 or 32, or -1 if invalid. tmp must hold 32 bytes
 static int parseChanKey(const char* key, uint8_t* tmp) {
+  if (key[0] == '#') return hashtagKey(key, tmp);
   size_t kl = strlen(key);
   bool all_hex = kl > 0;
   for (size_t i = 0; i < kl; i++) {
@@ -1602,10 +1783,10 @@ void MyMesh::blockNameCheckText(const char* text) {
 }
 
 // one line per page: "Spam123* x12 5m | Free Crypto x3 2h | Bot42 x0 - p1/2"; a page is filled as far as the reply fits
-void MyMesh::formatBlockNameList(char* reply, int page) {
+int MyMesh::formatBlockNameList(char* reply, int page) {   // returns the number of pages
   if (blockNameCount() == 0) {
     strcpy(reply, "blockname: list empty");
-    return;
+    return 1;
   }
   int limit = CLI_REPLY_MAX - 8;   // room for " pN/M"
   if (from_channel) {              // over the channel the repeater's name is added in front, and the message is cut at CHAN_MSG_MAX
@@ -1654,13 +1835,18 @@ void MyMesh::formatBlockNameList(char* reply, int page) {
       snprintf(&reply[pos], 12, " p%d/%d", page, pages);
     }
   }
+  return pages;
 }
 
-// true if the relay whitelist is on and this is a channel message from a channel that is not allowed
+// true if the relay whitelist is on and this is a flood advert, or a channel message from a channel that is not allowed
 bool MyMesh::chanAllowBlocks(const mesh::Packet* packet) {
   if (!chanallow_on || !packet->isRouteFlood()) return false;
   uint8_t t = packet->getPayloadType();
-  if (t != PAYLOAD_TYPE_GRP_TXT && t != PAYLOAD_TYPE_GRP_DATA) return false;   // adverts, direct messages, acks ...: relayed as always
+  if (t == PAYLOAD_TYPE_ADVERT) {   // flood adverts are not relayed while the whitelist is on, counted separately (item 36)
+    chanallow_adv_dropped++;        // (our own adverts and the blockhop auto-add from heard adverts are not affected)
+    return true;
+  }
+  if (t != PAYLOAD_TYPE_GRP_TXT && t != PAYLOAD_TYPE_GRP_DATA) return false;   // direct messages, acks ...: relayed as always
   if (packet->payload_len < 1) return false;
   uint8_t h = packet->payload[0];   // channel hash, sent in the clear
   if (chan_key_set && h == chan.hash[0]) return false;   // the command channel is always allowed
@@ -1762,6 +1948,7 @@ void MyMesh::chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report
   q.text[CHAN_MSG_MAX] = 0;
   q.gap_after_ms = gap_after_ms;
   q.is_report = is_report;
+  chan_enq_count++;   // item 44: lets the caller see whether a command queued a reply
 }
 
 void MyMesh::chanDropReports() {   // an older daily report that never got out is replaced by the new one
@@ -1790,7 +1977,7 @@ void MyMesh::chanService() {   // post queued channel messages, one at a time, o
   chan_next_send_at = futureMillis(q.gap_after_ms);
 }
 
-void MyMesh::dailyReport() {   // every 24h from boot: battlog line, then templog line
+void MyMesh::dailyReport() {   // every 24h from boot: one short summary message (item 45)
   if (!report_armed) {
     report_armed = true;
     report_due_at = futureMillis(REPORT_INTERVAL_MS);
@@ -1802,16 +1989,44 @@ void MyMesh::dailyReport() {   // every 24h from boot: battlog line, then templo
   queueReport();
 }
 
-void MyMesh::queueReport() {   // battlog line, then templog line (skipped without a key or without data)
+// Item 45: the daily report is one short message: battery now (and the 24 h change once 24 h of readings exist),
+// chip temperature high and low from the hourly log, radio-on share. Skipped without a key or without logged data.
+// Example: "Battery 80%, down 2% over 24h. Chip temp hi 47C lo 15C. Radio on 100%."
+void MyMesh::queueReport() {
   if (!chan_key_set || batt_log_count == 0) return;
   char buf[CHAN_MSG_MAX + 1];
-  int prefix = (int)strlen(_prefs.node_name) + 2;
-  if (prefix > 39) prefix = 39;
-  formatBattLog(buf);
-  trimLogToFit(buf, 12, prefix);
-  chanEnqueue(buf, CHAN_PAIR_GAP_MS, true);
-  formatTempLog(buf);
-  trimLogToFit(buf, 12, prefix);
+  unsigned mv_new = batt_log[(batt_log_head + 23) % 24];   // newest hourly reading (the one the trend uses)
+  int pos = snprintf(buf, 24, "Battery %d%%", battPercent(mv_new));
+  if (batt_trend_valid) {
+    int d = (int)(mv_new / 10) - (int)(batt_prev24 / 10);   // centivolts, as in batttrend (item 33)
+    int a = d < 0 ? -d : d;
+    if (a < 2) {
+      pos += snprintf(&buf[pos], 24, ", steady over 24h");
+    } else {
+      int pct = (a * 100 + 60) / 120;   // same straight line as battpct, nearest whole percent
+      pos += snprintf(&buf[pos], 32, ", %s %d%% over 24h", d < 0 ? "down" : "up", pct);
+    }
+  }
+  buf[pos++] = '.';
+  buf[pos] = 0;
+  int tmin = 0, tmax = 0;   // chip temperature from the hourly log, tenths of a degree
+  bool have_t = false;
+  for (int i = 0; i < batt_log_count; i++) {
+    int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+    if (temp_log[idx] == INT16_MIN) continue;
+    int v = temp_log[idx];
+    if (!have_t || v < tmin) tmin = v;
+    if (!have_t || v > tmax) tmax = v;
+    have_t = true;
+  }
+  if (have_t) {
+    int hi = tmax >= 0 ? (tmax + 5) / 10 : -((-tmax + 5) / 10);   // nearest whole degree
+    int lo = tmin >= 0 ? (tmin + 5) / 10 : -((-tmin + 5) / 10);
+    pos += snprintf(&buf[pos], 40, " Chip temp hi %dC lo %dC.", hi, lo);
+  }
+  int on = batt_trend_valid ? radioOnPercentTrend() : -1;   // the same 24 h as the trend, else since boot
+  if (on < 0) on = radioOnPercentSinceOldest();
+  if (on >= 0) pos += snprintf(&buf[pos], 24, " Radio on %d%%.", on);
   chanEnqueue(buf, CHAN_GAP_MS, true);
 }
 
@@ -1829,12 +2044,17 @@ void MyMesh::formatStatus(char* reply) {
     int a = t10 < 0 ? -t10 : t10;
     pos += snprintf(&reply[pos], 16, ", %s%d.%dC", t10 < 0 ? "-" : "", a / 10, a % 10);
   }
+  int on = radioOnPercentSinceOldest();   // share of time the radio was on (item 34)
+  if (on >= 0) pos += snprintf(&reply[pos], 16, ", on %d%%", on);
+  else pos += snprintf(&reply[pos], 16, ", on -");
   char hops[8];   // hops the channel command took to reach us ('-' when the command did not come over the channel)
   if (cmd_hops >= 0) snprintf(hops, sizeof(hops), "%d", (int)cmd_hops);
   else strcpy(hops, "-");
-  int w = snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, hops %s, up %lud%luh%lum",
+  char upstr[24];
+  fmtUptime(upstr, sizeof(upstr), up);
+  int w = snprintf(&reply[pos], CLI_REPLY_MAX - pos, ", cycle %s, auto %s, blocked %d, key %s, hops %s, up %s",
                    cycle_active ? "on" : "off", sleep_auto_enabled ? "on" : "off", blocked,
-                   chan_key_set ? "set" : "not set", hops, up / 86400UL, (up % 86400UL) / 3600UL, (up % 3600UL) / 60UL);
+                   chan_key_set ? "set" : "not set", hops, upstr);
   if (bot_key_set && w > 0 && pos + w < CLI_REPLY_MAX - 10) {   // trail bot (item 32): shown only when a bot key is set
     strcat(reply, bot_on ? ", bot on" : ", bot off");
   }
@@ -2234,7 +2454,64 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
     blockNameCheckText((const char*)&data[5]);
     return;
   }
+  // item 44: any valid <...> message on the command channel can set an unset or stale clock, before the command runs
+  uint32_t behind_s = 0;
+  bool was_unset = false;
+  bool synced = chanClockSync((const char*)&data[5], ts, &behind_s, &was_unset);
+  uint16_t enq_before = chan_enq_count;
   handleChannelCommand((const char*)&data[5], ts, (int)packet->getPathHashCount());
+  if (synced) chanClockNotice(behind_s, was_unset, chan_enq_count != enq_before);
+}
+
+// Item 44. Sets the clock from the channel message's own timestamp. Same checks as handleChannelCommand for the <...> wrapper,
+// then: not a replay (ts newer than the last accepted command, read only here), not before 1 Jan 2026, and only if the clock is
+// unset or ts is more than CLOCK_SYNC_MARGIN_S ahead of it. Never moves the clock backwards. Nothing is saved to flash.
+bool MyMesh::chanClockSync(const char* text, uint32_t ts, uint32_t* behind_s, bool* was_unset) {
+  const char* body = strstr(text, ": ");   // "<sender>: <message>"
+  if (body == NULL) return false;
+  body += 2;
+  while (*body == ' ') body++;
+  int n = (int)strlen(body);
+  while (n > 0 && body[n - 1] == ' ') n--;
+  if (n < 5 || body[0] != '<' || body[n - 1] != '>') return false;
+  if (n - 2 > CHAN_MSG_MAX) return false;
+  if (ts <= last_cmd_ts) return false;           // replayed or duplicate message: never syncs
+  if (ts < CLOCK_VALID_AFTER) return false;      // the sender's own clock is not set either
+  uint32_t now = getRTCClock()->getCurrentTime();
+  bool unset = now < CLOCK_VALID_AFTER;
+  if (!unset && ts <= now + CLOCK_SYNC_MARGIN_S) return false;   // clock is fine (or at most a few minutes behind)
+  getRTCClock()->setCurrentTime(ts + 1);         // same +1 as the CLI 'clock sync'
+  *was_unset = unset;
+  *behind_s = ts - now;
+  return true;
+}
+
+// Item 44: "Clock synced, was 7m behind" (or 3h / 2d for bigger jumps) or "Clock synced, was unset".
+// Right after a reply to the same message: it follows that reply by about 10 s (so a sleep command's reply still goes out first).
+// Otherwise: a random 5..60 s wait, like replies to 'all'. A queue that already holds messages keeps its own timing.
+void MyMesh::chanClockNotice(uint32_t behind_s, bool was_unset, bool after_reply) {
+  char msg[48];
+  if (was_unset) {
+    strcpy(msg, "Clock synced, was unset");
+  } else if (behind_s < 3600UL) {
+    snprintf(msg, sizeof(msg), "Clock synced, was %um behind", (unsigned)(behind_s / 60UL));
+  } else if (behind_s < 48UL * 3600UL) {
+    snprintf(msg, sizeof(msg), "Clock synced, was %uh behind", (unsigned)(behind_s / 3600UL));
+  } else {
+    snprintf(msg, sizeof(msg), "Clock synced, was %ud behind", (unsigned)(behind_s / 86400UL));
+  }
+  if (after_reply) {
+    if (chan_q_n > 0) chan_q[chan_q_n - 1].gap_after_ms = CHAN_PAIR_GAP_MS;   // the notice follows the reply by ~10 s
+    chanEnqueue(msg, CHAN_GAP_MS);
+    return;
+  }
+  bool idle = (chan_q_n == 0);
+  chanEnqueue(msg, CHAN_GAP_MS);
+  if (idle && chan_q_n == 1) {
+    unsigned long at = futureMillis(getRNG()->nextInt(5000, 60001));
+    if (!chan_gap_on || (long)(at - chan_next_send_at) > 0) chan_next_send_at = at;   // never earlier than a gap already running
+    chan_gap_on = true;
+  }
 }
 
 // channel key text -> bytes for 'botchan set' / 'testchan set': a hashtag channel name ("#test") gives the key the apps
@@ -2519,7 +2796,9 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
       if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
     }
   }
-  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "templog") == 0
+  // item 46: 'reboot' and 'set tx <n>' are accepted only when addressed to this repeater by name (never to 'all')
+  bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0;
+  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "batttrend") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
                  || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
                  || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
@@ -2532,7 +2811,8 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
                  || strncmp(buf, "filterchan clear", 16) == 0
                  || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
-                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0;
+                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0
+                 || (named_only && !to_all);   // item 46
   if (!allowed) return;   // only these commands can be given over the channel
 
   if (ts <= last_cmd_ts) return;   // replayed or duplicate command
@@ -2543,9 +2823,35 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   from_channel = true;
   sleep_cmd_flag = false;   // startSleep() sets this if the command starts a sleep
   cmd_hops = hops;          // 'status' reports it
-  if (strcmp(buf, "advert") == 0) {   // flood advert, delayed at random so repeaters don't all send at once
-    sendSelfAdvertisement(getRNG()->nextInt(2000, 60001), true);
+  list_pages_pending = 0;   // 'blockname list' sets this when it wants every page sent
+  if (strcmp(buf, "advert") == 0) {   // flood advert: for 'all' delayed at random 2..60 s so repeaters don't all send at once,
+                                      // for one repeater by name only 1..3 s (item 41)
+    sendSelfAdvertisement(to_all ? getRNG()->nextInt(2000, 60001) : getRNG()->nextInt(1000, 3001), true);
     strcpy(reply, "OK - advert sent");
+  } else if (strcmp(buf, "reboot") == 0) {   // item 46 (named only): reply first, then restart once the reply has gone out (see loop())
+    strcpy(reply, "OK - rebooting");
+    reboot_pending = true;
+    reboot_deadline = futureMillis(REBOOT_WAIT_MS);
+  } else if (strncmp(buf, "set tx ", 7) == 0) {   // item 46 (named only): -9..30, the same limit the node applies when it loads its settings
+    const char* q = buf + 7;
+    while (*q == ' ') q++;
+    bool neg = (*q == '-');
+    if (neg) q++;
+    int val = 0, digits = 0;
+    while (*q >= '0' && *q <= '9' && digits < 3) {
+      val = val * 10 + (*q - '0');
+      q++;
+      digits++;
+    }
+    if (neg) val = -val;
+    if (digits == 0 || *q != 0 || val < -9 || val > 30) {
+      strcpy(reply, "Err - tx must be -9..30");
+    } else {
+      char cmd[24];
+      snprintf(cmd, sizeof(cmd), "set tx %d", val);
+      handleCommand(0, cmd, reply);   // the normal CLI path: stores it, saves it and applies it
+      snprintf(reply, 32, "OK - tx %d", val);
+    }
   } else {
     handleCommand(0, buf, reply);   // (0 = no clock sync from channel messages)
   }
@@ -2553,14 +2859,31 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   cmd_hops = -1;
   bool started_sleep = sleep_cmd_flag;
   sleep_cmd_flag = false;
+  int more_pages = 0;   // 'blockname list' over the channel: pages after the first, as many as the queue can hold (item 38)
+  if (list_pages_pending > 1) {
+    int room = CHAN_Q_MAX - (int)chan_q_n - 1;   // queue slots left after the first page
+    if (room < 0) room = 0;
+    int want = (int)list_pages_pending - 1;
+    more_pages = want < room ? want : room;
+  }
   if (reply[0] != 0) {
     if ((reply[0] == 'V' || reply[0] == 'C' || reply[0] == '%') && reply[1] == '/') {   // battlog / battpct / templog line: make it fit
       int prefix = (int)strlen(_prefs.node_name) + 2;
       if (prefix > 39) prefix = 39;
       trimLogToFit(reply, 12, prefix);
     }
-    chanEnqueue(reply, CHAN_GAP_MS);
+    chanEnqueue(reply, more_pages ? CHAN_PAIR_GAP_MS : CHAN_GAP_MS);
+    if (more_pages) {
+      from_channel = true;   // the page layout depends on it (room for the repeater name in front)
+      for (int p = 2; p <= 1 + more_pages; p++) {
+        char pg[192];
+        formatBlockNameList(pg, p);
+        chanEnqueue(pg, p < 1 + more_pages ? CHAN_PAIR_GAP_MS : CHAN_GAP_MS);   // pages about 10 s apart
+      }
+      from_channel = false;
+    }
   }
+  list_pages_pending = 0;
   chan_gap_on = true;
   if (to_all && started_sleep) {
     // a sleep command for 'all': the furthest repeaters answer (and sleep) first, so every reply can still be
@@ -2568,13 +2891,29 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
     int32_t lo = (int32_t)STAGGER_BASE_S - (int32_t)STAGGER_STEP_S * (int32_t)hops;
     if (lo < STAGGER_FLOOR_S) lo = STAGGER_FLOOR_S;
     chan_next_send_at = futureMillis(getRNG()->nextInt(lo * 1000, (lo + STAGGER_SPREAD_S) * 1000 + 1));
-  } else {
+  } else if (to_all) {
     // every repeater answers a command for 'all': spread the replies out by a random 5..60 seconds
     chan_next_send_at = futureMillis(getRNG()->nextInt(5000, 60001));
+  } else {
+    // a command for this repeater by name: nobody else answers, so only a short random 1..3 seconds (item 41)
+    chan_next_send_at = futureMillis(getRNG()->nextInt(1000, 3001));
   }
 }
 
+// The inner handler trims trailing spaces off the command IN PLACE so that its exact matches work. A command it does not
+// own must reach the stock handlers exactly as typed: the app's "clear neighbours" sends "neighbor.remove " (trailing
+// space, empty key) and the stock handler matches that space. So the command is saved first and put back if not handled.
 bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply) {
+  char saved[168];
+  size_t len = strlen(command);
+  if (len >= sizeof(saved)) return handleSleepCommandsInner(sender_timestamp, command, reply);   // (longer than any CLI line)
+  memcpy(saved, command, len + 1);
+  bool handled = handleSleepCommandsInner(sender_timestamp, command, reply);
+  if (!handled) memcpy(command, saved, len + 1);   // not ours: hand it on untouched
+  return handled;
+}
+
+bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, char* reply) {
   size_t cl = strlen(command);
   while (cl > 0 && command[cl - 1] == ' ') command[--cl] = 0;   // trim trailing spaces
 
@@ -2682,6 +3021,11 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     return true;
   }
 
+  if (strcmp(command, "batttrend") == 0) {
+    formatBattTrend(reply);
+    return true;
+  }
+
   if (strcmp(command, "status") == 0) {
     formatStatus(reply);
     return true;
@@ -2695,7 +3039,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     } else {
       chanDropReports();
       queueReport();
-      if (from_channel) reply[0] = 0;   // the two report messages are the answer
+      if (from_channel) reply[0] = 0;   // the report message is the answer
       else strcpy(reply, "OK - report queued");
     }
     return true;
@@ -2820,7 +3164,8 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
     const char* sub = command + 9;
     while (*sub == ' ') sub++;
     if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
-      formatBlockNameList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+      int pages = formatBlockNameList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+      if (from_channel && sub[4] != ' ' && pages > 1) list_pages_pending = (uint8_t)pages;   // no page number over the channel: send every page
     } else if (strcmp(sub, "clear") == 0) {
       memset(blockname, 0, sizeof(blockname));
       strcpy(reply, "OK - blockname cleared");
@@ -2899,27 +3244,38 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
           snprintf(reply, 100, "%d: key: %s", slot, b64);
         }
       }
-    } else if (memcmp(sub, "set ", 4) == 0) {
+    } else if (memcmp(sub, "set ", 4) == 0) {   // 'filterchan set <key or #name>': goes in the first empty slot (item 37)
       const char* p = sub + 4;
       while (*p == ' ') p++;
-      int slot = atoi(p);
-      while (*p >= '0' && *p <= '9') p++;
-      while (*p == ' ') p++;
-      if (slot < 1 || slot > MAX_FILTER_KEYS || *p == 0) {
-        strcpy(reply, "Err - filterchan set <1-4> <key>");
+      uint8_t tmp[32];
+      int len = (*p == 0) ? -1 : parseChanKey(p, tmp);
+      if (len < 0) {
+        strcpy(reply, "Err - give a base64/hex key (16 or 32 bytes) or a #name");
       } else {
-        uint8_t tmp[32];
-        int len = parseChanKey(p, tmp);
-        if (len < 0) {
-          strcpy(reply, "Err - key must be base64 or hex, 16 or 32 bytes");
+        mesh::GroupChannel cand;
+        memset(&cand, 0, sizeof(cand));
+        memcpy(cand.secret, tmp, len);
+        mesh::Utils::sha256(cand.hash, sizeof(cand.hash), cand.secret, len);   // same as BaseChatMesh::addChannel()
+        int existing = -1, free_idx = -1;
+        for (int i = 0; i < MAX_FILTER_KEYS; i++) {
+          const FilterKey& k = filter_keys[i];
+          if (k.set) {
+            if (k.len == len && memcmp(k.ch.secret, cand.secret, sizeof(cand.secret)) == 0) existing = i;
+          } else if (free_idx < 0) {
+            free_idx = i;
+          }
+        }
+        if (existing >= 0) {
+          snprintf(reply, 60, "OK - filterchan %d already set (hash %02X)", existing + 1, cand.hash[0]);
+        } else if (free_idx < 0) {
+          snprintf(reply, 80, "Err - filterchan full (%d), use filterchan clear <slot> first", MAX_FILTER_KEYS);
         } else {
-          FilterKey& k = filter_keys[slot - 1];
+          FilterKey& k = filter_keys[free_idx];
           memset(&k, 0, sizeof(k));
-          memcpy(k.ch.secret, tmp, len);
-          mesh::Utils::sha256(k.ch.hash, sizeof(k.ch.hash), k.ch.secret, len);   // same as BaseChatMesh::addChannel()
+          k.ch = cand;
           k.len = (uint8_t)len;
           k.set = true;
-          snprintf(reply, 60, "OK - filterchan %d set (hash %02X)", slot, k.ch.hash[0]);   // never repeats the key
+          snprintf(reply, 60, "OK - filterchan %d set (hash %02X)", free_idx + 1, k.ch.hash[0]);   // never repeats the key
         }
       }
     } else if (memcmp(sub, "clear", 5) == 0 && (sub[5] == 0 || sub[5] == ' ')) {
@@ -2938,7 +3294,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
         }
       }
     } else {
-      strcpy(reply, "Err - filterchan get|set <slot> <key>|clear <slot>|all");
+      strcpy(reply, "Err - filterchan get|set <key or #name>|clear <slot>|all");
     }
     return true;
   }
@@ -2952,8 +3308,10 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
       else strcpy(cmdh, "-");
       if (chanallow_extra_set) snprintf(extra, sizeof(extra), "%02X", chanallow_extra_hash);
       else strcpy(extra, "-");
-      snprintf(reply, 100, "chanallow %s, cmd %s, Public %02X, extra %s, dropped %lu", chanallow_on ? "on" : "off", cmdh,
-               public_chan.hash[0], extra, (unsigned long)chanallow_dropped);
+      char upstr[24];   // uptime covers the same period as the counters (both reset at reboot), so counters / uptime estimate the power saving, item 48
+      fmtUptime(upstr, sizeof(upstr), (unsigned long)(uptime_millis / 1000ULL));
+      snprintf(reply, 120, "chanallow %s, cmd %s, Public %02X, extra %s, dropped msgs %lu, adverts %lu, up %s", chanallow_on ? "on" : "off",
+               cmdh, public_chan.hash[0], extra, (unsigned long)chanallow_dropped, (unsigned long)chanallow_adv_dropped, upstr);
     } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
       chanallow_on = (sub[1] == 'n');
       strcpy(reply, chanallow_on ? "OK - chanallow on" : "OK - chanallow off");
@@ -2968,13 +3326,14 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
         chanallow_extra_hash = (uint8_t)((hexNibble(a[0]) << 4) | hexNibble(a[1]));
         chanallow_extra_set = true;
         snprintf(reply, 60, "OK - extra channel hash %02X", chanallow_extra_hash);
-      } else if (from_channel) {   // a key never goes over the channel
-        strcpy(reply, "Err - over the channel give a 2 character hash");
+      } else if (from_channel && a[0] != '#') {   // a key never goes over the channel (a #name is public, so it may)
+        strcpy(reply, "Err - over the channel give a 2 character hash or a #name");
       } else {
         uint8_t tmp[32];
-        int len = parseChanKey(a, tmp);
+        int len = parseChanKey(a, tmp);   // a base64/hex key (CLI only) or a #name
         if (len < 0) {
-          strcpy(reply, "Err - give a 2 character hash, or a base64/hex key (16 or 32 bytes)");
+          strcpy(reply, a[0] == '#' ? "Err - bad #name (printable, no spaces, max 31)"
+                                    : "Err - give a 2 character hash, a #name, or a base64/hex key (16 or 32 bytes)");
         } else {
           mesh::GroupChannel tmpc;
           memset(&tmpc, 0, sizeof(tmpc));
@@ -2986,7 +3345,7 @@ bool MyMesh::handleSleepCommands(uint32_t sender_timestamp, char* command, char*
         }
       }
     } else {
-      strcpy(reply, "Err - chanallow on|off|set <hash or key>|clear");
+      strcpy(reply, "Err - chanallow on|off|set <hash, key or #name>|clear");
     }
     return true;
   }
@@ -3283,6 +3642,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 }
 
 void MyMesh::loop() {
+  watchdogService();   // radio health checks (item 43)
   // battery monitor: every 5 min (also runs while the radio sleeps)
   if (!batt_check_armed) {
     batt_check_armed = true;
@@ -3300,7 +3660,17 @@ void MyMesh::loop() {
       boot_notice_pending = false;
       unsigned mv = board.getBattMilliVolts();
       char msg[CHAN_MSG_MAX + 1];
-      snprintf(msg, sizeof(msg), "Rebooted, battery %u.%02uV", mv / 1000, (mv % 1000) / 10);
+      const char* why = "";   // why the node restarted (nRF52 boards with power management only)
+#ifdef NRF52_POWER_MANAGEMENT
+      uint32_t rr = board.getResetReason();   // RESETREAS register captured at boot
+      if (rr & 0x00000002UL)      why = " (watchdog)";
+      else if (rr & 0x00000008UL) why = " (cpu lockup)";
+      else if (rr & 0x00000001UL) why = " (reset button)";
+      else if (rr & 0x00000004UL) why = " (restart)";
+      else if (rr & 0x001F0000UL) why = " (woke from deep sleep)";
+      else                        why = " (power loss)";
+#endif
+      snprintf(msg, sizeof(msg), "Rebooted%s, battery %u.%02uV", why, mv / 1000, (mv % 1000) / 10);
       chanEnqueue(msg, CHAN_GAP_MS);
     }
   }
@@ -3316,6 +3686,14 @@ void MyMesh::loop() {
     busy_until = futureMillis(TX_QUIET_MS);
   }
   bool radio_quiet = !busy_armed || millisHasNowPassed(busy_until);
+
+  // item 46: 'reboot' over the channel restarts as soon as its reply has gone out: nothing queued, nothing in flight and the
+  // radio back in receive mode. REBOOT_WAIT_MS is the longest it waits. (The CLI 'reboot' is still immediate.)
+  if (reboot_pending && !sleeping
+      && ((chan_q_n == 0 && !hasPendingWork() && radio_driver.isInRecvMode()) || millisHasNowPassed(reboot_deadline))) {
+    reboot_pending = false;
+    board.reboot();   // does not return
+  }
 
   // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
   if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork() && radio_quiet
@@ -3346,7 +3724,8 @@ void MyMesh::loop() {
         chan_next_send_at = futureMillis(CHAN_PAIR_GAP_MS);   // message follows the advert by ~10s
       } else {   // still cycling: tell the channel that the repeater is awake now
         char msg[CHAN_MSG_MAX + 1];
-        snprintf(msg, sizeof(msg), "Awake for %lu mins", (unsigned long)(CYCLE_AWAKE_MS / 60000UL));
+        snprintf(msg, sizeof(msg), "Awake for %lu mins, battery %u.%02uV %d%%", (unsigned long)(CYCLE_AWAKE_MS / 60000UL),
+                 mv / 1000, (mv % 1000) / 10, battPercent(mv));   // the reading taken at wake (same one as the end-of-cycle test)
         chanEnqueue(msg, CHAN_GAP_MS);
         chan_gap_on = true;
         chan_next_send_at = futureMillis(getRNG()->nextInt(2000, 20001));   // spread out nodes that wake together
