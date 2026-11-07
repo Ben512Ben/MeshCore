@@ -57,7 +57,7 @@ static const ChatRule CHAT_RULES[] = {
   {"leech;leeches", 90, 0,
    "Flick leeches off sideways with a fingernail. They drop off on their own, too."},
   {"tick;ticks", 90, 0,
-   "Remove ticks with fine tweezers close to the skin. See a doctor if you feel unwell."},
+   "Kill the tick with an ether-based spray (freeze it, don't squeeze it). If it won't drop off, see a doctor."},
   {"spider;spiders", 90, 0,
    "Most spiders are harmless. For a funnel-web bite, bandage firmly and call 000."},
   {"dark;night;sunset;nightfall;torch", 70, 0,

@@ -9,7 +9,7 @@
  *   2. exact trail, town, region or "!trails" lookups (TrailBot.h), exactly as before.
  *   3. everything else is natural conversation:
  *        safety rules in chatrules.h always win (emergencies, lost, snakes, storms, low water ...)
- *        then: hike timer, time/date/sunrise/sunset, glow worms, "when should I start", compare trails,
+ *        then: hike timer, time/date/sunrise/sunset/moon/glow worms (today, or another day: "sunrise tomorrow", "moon on Friday"), "when should I start", compare trails,
  *        what to take, how long/far/hard, walk suggestions, hiking knowledge (hikeknowledge.h),
  *        a trail, town or region named anywhere in the sentence (typos tolerated),
  *        and finally the ELIZA chat (ChatBot.h).
@@ -39,6 +39,7 @@
 #include "TrailBot.h"
 #include "ChatBot.h"
 #include "hikeknowledge.h"
+#include "WildBot.h"
 
 #ifndef BOT_MSG_MAX
   #define BOT_MSG_MAX 134
@@ -420,6 +421,153 @@ static void hbClockInit(uint32_t now_utc, HikeClock* c) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// a day named in a sentence: tomorrow, Friday, in 3 days, 25 December (for sunrise, sunset, moon and glow worm times)
+
+static long hbDaysFromCivil(int y, int m, int d) {   // calendar date to days since 1970-01-01 (the inverse of hbCivil)
+  y -= (m <= 2);
+  long era = (y >= 0 ? y : y - 399) / 400;
+  long yoe = y - era * 400;
+  long doy = (153L * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + doe - 719468L;
+}
+
+static int hbDaysInMonth(int y, int m) {
+  static const int dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+  return dm[m - 1] + (m == 2 && leap ? 1 : 0);
+}
+
+static bool hbWordIs(const char* w, int n, const char* lit) {
+  return (int)strlen(lit) == n && strncmp(w, lit, n) == 0;
+}
+
+static int hbMonthWord(const char* w, int n) {   // 1 to 12, 0 if not a month
+  static const char* const nm[] = {"january", "february", "march", "april", "may", "june", "july", "august", "september",
+                                   "october", "november", "december"};
+  for (int i = 0; i < 12; i++) {
+    if (hbWordIs(w, n, nm[i])) return i + 1;
+    if (n == 3 && strncmp(w, nm[i], 3) == 0) return i + 1;   // jan, feb, mar ...
+  }
+  if (hbWordIs(w, n, "sept")) return 9;
+  return 0;
+}
+
+static int hbWeekdayWord(const char* w, int n) {   // 0 Sunday to 6 Saturday, -1 if not a weekday
+  static const char* const wd[] = {"sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"};
+  for (int i = 0; i < 7; i++) if (hbWordIs(w, n, wd[i])) return i;
+  if (hbWordIs(w, n, "tues")) return 2;
+  if (hbWordIs(w, n, "weds")) return 3;
+  if (hbWordIs(w, n, "thur") || hbWordIs(w, n, "thurs")) return 4;
+  return -1;
+}
+
+// "25", "25th", "3rd" or a number word one to ten
+static bool hbNumberWord(const char* w, int n, int* v) {
+  int i = 0, x = 0;
+  while (i < n && w[i] >= '0' && w[i] <= '9') { x = x * 10 + (w[i] - '0'); i++; if (x > 9999) return false; }
+  if (i > 0) {
+    bool suffix = (n - i == 2) && ((w[i] == 's' && w[i + 1] == 't') || (w[i] == 'n' && w[i + 1] == 'd') ||
+                                   (w[i] == 'r' && w[i + 1] == 'd') || (w[i] == 't' && w[i + 1] == 'h'));
+    if (i == n || suffix) { *v = x; return true; }
+    return false;
+  }
+  static const char* const nw[] = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"};
+  for (int k = 0; k < 10; k++) if (hbWordIs(w, n, nw[k])) { *v = k + 1; return true; }
+  return false;
+}
+
+// The first day the sentence names, as days since 1970-01-01 (local). false if none.
+// tomorrow, yesterday, today, tonight, the day after tomorrow, in 3 days, in a week, Friday (the next one),
+// 25 December, 25th of December, December 25, with an optional year.
+static bool hbFindDay(const char* norm, long today_ld, long* out_ld) {
+  const char* tp[32];
+  int tl[32];
+  int nt = 0;
+  const char* s = norm;
+  while (*s && nt < 32) {
+    while (*s == ' ') s++;
+    if (!*s) break;
+    const char* e = strchr(s, ' ');
+    int len = e ? (int)(e - s) : (int)strlen(s);
+    tp[nt] = s;
+    tl[nt] = len;
+    nt++;
+    s += len;
+  }
+  int ty, tm, td;
+  hbCivil(today_ld, &ty, &tm, &td);
+  int today_wd = (int)((today_ld + 4) % 7);
+  for (int i = 0; i < nt; i++) {
+    const char* w = tp[i];
+    int n = tl[i];
+    long ld = 0;
+    bool found = false;
+    if (hbWordIs(w, n, "day") && i + 2 < nt && hbWordIs(tp[i + 1], tl[i + 1], "after") &&
+        (hbWordIs(tp[i + 2], tl[i + 2], "tomorrow") || hbWordIs(tp[i + 2], tl[i + 2], "tmrw"))) {
+      ld = today_ld + 2; found = true;
+    } else if (hbWordIs(w, n, "tomorrow") || hbWordIs(w, n, "tomorow") || hbWordIs(w, n, "tommorow") || hbWordIs(w, n, "tmrw") ||
+               hbWordIs(w, n, "tmr")) {
+      ld = today_ld + 1; found = true;
+    } else if (hbWordIs(w, n, "yesterday")) {
+      ld = today_ld - 1; found = true;
+    } else if (hbWordIs(w, n, "today") || hbWordIs(w, n, "tonight")) {
+      ld = today_ld; found = true;
+    } else if (hbWordIs(w, n, "in") && i + 2 < nt) {
+      int v = 0;
+      if (hbWordIs(tp[i + 1], tl[i + 1], "a") && hbWordIs(tp[i + 2], tl[i + 2], "week")) { ld = today_ld + 7; found = true; }
+      else if (hbNumberWord(tp[i + 1], tl[i + 1], &v) && v >= 1 && v <= 366) {
+        if (hbWordIs(tp[i + 2], tl[i + 2], "day") || hbWordIs(tp[i + 2], tl[i + 2], "days")) { ld = today_ld + v; found = true; }
+        else if (hbWordIs(tp[i + 2], tl[i + 2], "week") || hbWordIs(tp[i + 2], tl[i + 2], "weeks")) { ld = today_ld + 7L * v; found = true; }
+      }
+    }
+    if (!found) {
+      int wd = hbWeekdayWord(w, n);
+      if (wd >= 0) {
+        int off = (wd - today_wd + 7) % 7;
+        if (off == 0) off = 7;   // today's weekday name means a week away
+        ld = today_ld + off;
+        found = true;
+      }
+    }
+    if (!found) {
+      int mo = hbMonthWord(w, n);
+      if (mo > 0) {
+        int d = 0, yr = 0, yi = i + 1;
+        bool have = false;
+        if (i >= 1 && hbNumberWord(tp[i - 1], tl[i - 1], &d)) have = true;
+        else if (i >= 2 && hbWordIs(tp[i - 1], tl[i - 1], "of") && hbNumberWord(tp[i - 2], tl[i - 2], &d)) have = true;
+        if (!have) {
+          int j = i + 1;
+          if (j < nt && hbWordIs(tp[j], tl[j], "the")) j++;
+          if (j < nt && hbNumberWord(tp[j], tl[j], &d)) { have = true; yi = j + 1; }
+        }
+        if (have && d >= 1 && d <= 31) {
+          int v = 0;
+          if (yi < nt && hbNumberWord(tp[yi], tl[yi], &v) && v >= 2000 && v <= 2100 && tl[yi] == 4) yr = v;
+          int y = yr ? yr : ty;
+          if (d <= hbDaysInMonth(y, mo)) {
+            ld = hbDaysFromCivil(y, mo, d);
+            if (!yr && ld < today_ld) {
+              y++;
+              if (d <= hbDaysInMonth(y, mo)) ld = hbDaysFromCivil(y, mo, d);
+              else have = false;
+            }
+            found = have;
+          }
+        }
+      }
+    }
+    if (found) {
+      if (ld - today_ld > 3660L || today_ld - ld > 3660L) return false;
+      *out_ld = ld;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // finding trails, towns and regions named in a sentence (exact, or a close misspelling)
 
 struct HbWords {
@@ -746,6 +894,41 @@ static HB_NOINLINE int hbDoTest(HbCtx* H) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// another day than today, named in the sentence ("!sunrise tomorrow", "sunset on Friday", "moon on 25 December")
+
+struct HbDay {
+  long ld;            // local days since 1970-01-01
+  int off;            // days from today (negative = past)
+  int year, mon, day, wday;
+  int rise, set;      // sun, local minutes since midnight
+};
+
+// true (and the day filled in) only if the sentence names a day other than today
+static bool hbDayInfo(const HbCtx* H, HbDay* d) {
+  if (!H->clk.ok) return false;
+  long today_ld = ((long)H->c->now_utc + HIKE_TZ_SECS) / 86400L;
+  long ld = 0;
+  if (!hbFindDay(H->norm, today_ld, &ld) || ld == today_ld) return false;
+  d->ld = ld;
+  d->off = (int)(ld - today_ld);
+  hbCivil(ld, &d->year, &d->mon, &d->day);
+  d->wday = (int)((ld + 4) % 7);
+  hbSun(d->year, d->mon, d->day, &d->rise, &d->set);
+  return true;
+}
+
+// "Tomorrow (Sun 8 Nov)", "Fri 13 Nov (in 6 days)", "Sun 1 Nov (3 days ago)"
+static void hbDayLabel(const HbDay* d, char* out, int osz) {
+  char dt[24];
+  if (d->off > 300 || d->off < -300) snprintf(dt, sizeof(dt), "%.3s %d %.3s %d", HB_DAYS[d->wday], d->day, HB_MONTHS[d->mon - 1], d->year);
+  else snprintf(dt, sizeof(dt), "%.3s %d %.3s", HB_DAYS[d->wday], d->day, HB_MONTHS[d->mon - 1]);
+  if (d->off == 1) snprintf(out, osz, "Tomorrow (%s)", dt);
+  else if (d->off == -1) snprintf(out, osz, "Yesterday (%s)", dt);
+  else if (d->off > 0) snprintf(out, osz, "%s (in %d days)", dt, d->off);
+  else snprintf(out, osz, "%s (%d days ago)", dt, -d->off);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // time, date and daylight
 
 static HB_NOINLINE void hbNoClock(HbCtx* H) {
@@ -755,6 +938,18 @@ static HB_NOINLINE void hbNoClock(HbCtx* H) {
 
 static HB_NOINLINE int hbDoTimeDate(HbCtx* H) {
   if (!H->clk.ok) { hbNoClock(H); return H->o.n; }
+  HbDay td;
+  if (hbDayInfo(H, &td)) {   // "what is the date tomorrow", "what day is it on 25 December"
+    char r[14], s[14];
+    hbFmtClock(td.rise, r, sizeof(r));
+    hbFmtClock(td.set, s, sizeof(s));
+    if (td.off == 1) hbMsg(&H->o, "Tomorrow is %s %d %s %d.", HB_DAYS[td.wday], td.day, HB_MONTHS[td.mon - 1], td.year);
+    else if (td.off == -1) hbMsg(&H->o, "Yesterday was %s %d %s %d.", HB_DAYS[td.wday], td.day, HB_MONTHS[td.mon - 1], td.year);
+    else if (td.off > 0) hbMsg(&H->o, "In %d days it's %s %d %s %d.", td.off, HB_DAYS[td.wday], td.day, HB_MONTHS[td.mon - 1], td.year);
+    else hbMsg(&H->o, "%d days ago it was %s %d %s %d.", -td.off, HB_DAYS[td.wday], td.day, HB_MONTHS[td.mon - 1], td.year);
+    hbMsg(&H->o, "Sunrise is about %s and sunset about %s that day (SE Qld).", r, s);
+    return H->o.n;
+  }
   char t[14], r[14], s[14];
   hbFmtClock(H->clk.mins, t, sizeof(t));
   hbFmtClock(H->clk.rise, r, sizeof(r));
@@ -766,6 +961,19 @@ static HB_NOINLINE int hbDoTimeDate(HbCtx* H) {
 
 static HB_NOINLINE int hbDoSun(HbCtx* H) {
   if (!H->clk.ok) { hbNoClock(H); return H->o.n; }
+  HbDay td;
+  if (hbDayInfo(H, &td)) {   // "!sunrise tomorrow", "sunset on Friday", "sunrise 25 December"
+    char r[14], s[14], fl[14], ll[14], dl[20], lab[44];
+    hbFmtClock(td.rise, r, sizeof(r));
+    hbFmtClock(td.set, s, sizeof(s));
+    hbFmtClock(td.rise - 25, fl, sizeof(fl));
+    hbFmtClock(td.set + 25, ll, sizeof(ll));
+    hbFmtMin(td.set - td.rise, dl, sizeof(dl));
+    hbDayLabel(&td, lab, sizeof(lab));
+    hbMsg(&H->o, "%s: sunrise about %s, sunset about %s.", lab, r, s);
+    hbMsg(&H->o, "First light about %s, last light about %s. About %s of daylight.", fl, ll, dl);
+    return H->o.n;
+  }
   char r[14], s[14], x[14], d[20];
   hbFmtClock(H->clk.rise, r, sizeof(r));
   hbFmtClock(H->clk.set, s, sizeof(s));
@@ -834,6 +1042,44 @@ static HB_NOINLINE int hbDoStartAdvice(HbCtx* H, int t, int dur_min) {
     hbMsg(&H->o, "SE Qld sunset is about 4:55 pm in winter to 6:35 pm in summer. Allow the listed time plus rests.");
     return H->o.n;
   }
+  HbDay td;
+  if (hbDayInfo(H, &td)) {   // "when should I start tomorrow", "what time should I leave on Saturday"
+    int need = dur_min;
+    char lab[44], r[14], s[14], d[20], x[14];
+    if (t >= 0) {
+      HikeInfo inf;
+      hbParseInfo(TRAILS[t].info, &inf);
+      need = hbNeedMin(H->who, &inf);
+      if (need >= 0) {
+        hbFmtMin(need, d, sizeof(d));
+        hbMsg(&H->o, "%s takes %s%s.", TRAILS[t].name, inf.tapprox ? "about " : "up to ", d);
+      } else {
+        hbMsg(&H->o, "I don't have a time for %s.", TRAILS[t].name);
+      }
+    } else if (need >= 0) {
+      hbFmtMin(need, d, sizeof(d));
+      hbMsg(&H->o, "For a %s walk:", d);
+    }
+    hbDayLabel(&td, lab, sizeof(lab));
+    hbFmtClock(td.rise, r, sizeof(r));
+    hbFmtClock(td.set, s, sizeof(s));
+    hbMsg(&H->o, "%s: sunrise about %s, sunset about %s.", lab, r, s);
+    if (need < 0) {
+      hbFmtClock(td.set - 30, x, sizeof(x));
+      hbMsg(&H->o, "Aim to be off the track by %s. Tell me the trail or how long you'll walk and I'll work out a start time.", x);
+    } else {
+      int latest = td.set - need - 30;
+      if (latest <= td.rise - 25) {
+        hbFmtClock(td.rise - 25, x, sizeof(x));
+        hbMsg(&H->o, "That's a long day: even starting at first light (%s) you'd finish near or after dark. Carry a head torch.", x);
+      } else {
+        hbFmtClock(latest, x, sizeof(x));
+        hbFmtClock(td.set - 30, r, sizeof(r));
+        hbMsg(&H->o, "Latest start is %s, to be back by about %s (half an hour before sunset).", x, r);
+      }
+    }
+    return H->o.n;
+  }
   char tn[14];
   hbFmtClock(H->clk.mins, tn, sizeof(tn));
   int need = dur_min;
@@ -862,6 +1108,17 @@ static HB_NOINLINE int hbDoStartAdvice(HbCtx* H, int t, int dur_min) {
 // glow worms: they only show in full darkness, about half an hour after sunset
 static HB_NOINLINE int hbDoGlow(HbCtx* H) {
   if (!H->clk.ok) return -1;
+  HbDay td;
+  if (hbDayInfo(H, &td)) {   // glow worms on another day
+    char s[14], g[14], x[14], lab[44];
+    hbFmtClock(td.set, s, sizeof(s));
+    hbFmtClock(td.set + 35, g, sizeof(g));
+    hbFmtClock(td.set + 25, x, sizeof(x));
+    hbDayLabel(&td, lab, sizeof(lab));
+    hbMsg(&H->o, "%s: sunset about %s, so glow worms show in full dark from about %s.", lab, s, g);
+    hbMsg(&H->o, "Natural Bridge Circuit takes about 1 hr. Arrive about %s with a head torch, and check parks.qld.gov.au.", x);
+    return H->o.n;
+  }
   int from = H->clk.set + 35;
   char s[14], g[14], x[14];
   hbFmtClock(H->clk.set, s, sizeof(s));
@@ -1193,10 +1450,20 @@ static HB_NOINLINE int hbDoMoon(HbCtx* H) {
   }
   long now = (long)H->c->now_utc;
   long today_ld = (now + HIKE_TZ_SECS) / 86400L;
+  HbDay td;
+  bool fut = hbDayInfo(H, &td);   // "moon tomorrow", "moonrise on Friday"
+  if (fut) { today_ld = td.ld; now = td.ld * 86400L - HIKE_TZ_SECS + 20L * 3600L; }   // the evening of that day
   long midnight = today_ld * 86400L - HIKE_TZ_SECS;
+  const char* when = fut ? "that day" : "today";
   HbMoon m;
   hbMoonAt(now, &m);
-  hbMsg(&H->o, "Moon: %s, about %d%% lit.", hbMoonPhaseName(m.elong), hbMoonLitPct(m.elong));
+  if (fut) {
+    char lab[44];
+    hbDayLabel(&td, lab, sizeof(lab));
+    hbMsg(&H->o, "%s: moon is %s, about %d%% lit.", lab, hbMoonPhaseName(m.elong), hbMoonLitPct(m.elong));
+  } else {
+    hbMsg(&H->o, "Moon: %s, about %d%% lit.", hbMoonPhaseName(m.elong), hbMoonLitPct(m.elong));
+  }
 
   int rise, set;
   hbMoonRiseSet(midnight, &rise, &set);
@@ -1205,14 +1472,14 @@ static HB_NOINLINE int hbDoMoon(HbCtx* H) {
   if (rise >= 0) hbFmtClock(rise, rs, sizeof(rs));
   if (set >= 0) hbFmtClock(set, ss, sizeof(ss));
   if (rise >= 0 && set >= 0) {
-    if (set < rise) snprintf(tl, sizeof(tl), "Moonset %s, moonrise %s today.", ss, rs);
-    else snprintf(tl, sizeof(tl), "Moonrise %s, moonset %s today.", rs, ss);
+    if (set < rise) snprintf(tl, sizeof(tl), "Moonset %s, moonrise %s %s.", ss, rs, when);
+    else snprintf(tl, sizeof(tl), "Moonrise %s, moonset %s %s.", rs, ss, when);
   } else if (rise >= 0) {
-    snprintf(tl, sizeof(tl), "Moonrise %s today, no moonset until tomorrow.", rs);
+    snprintf(tl, sizeof(tl), "Moonrise %s %s, no moonset until the next day.", rs, when);
   } else if (set >= 0) {
-    snprintf(tl, sizeof(tl), "Moonset %s today, no moonrise until tomorrow.", ss);
+    snprintf(tl, sizeof(tl), "Moonset %s %s, no moonrise until the next day.", ss, when);
   } else {
-    snprintf(tl, sizeof(tl), "No moonrise or moonset today.");
+    snprintf(tl, sizeof(tl), "No moonrise or moonset %s.", when);
   }
   long tf = hbMoonNext(now, 180.0f), tn = hbMoonNext(now, 0.0f);
   if (tn < now - 3600L * 12) tn = hbMoonNext(now + 86400L * 3, 0.0f);   // never report a new moon from yesterday
@@ -1741,6 +2008,74 @@ static HB_NOINLINE bool hbTopic(HbCtx* H, int min_prio, int max_prio) {
   return true;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// local wildlife (wildlife.h, WildBot.h)
+
+// one species: "<name>: <first part>", then any further parts (separated by '~')
+static HB_NOINLINE void hbWildSay(HbOut* o, int s) {
+  const char* info = WILDLIFE[s].info;
+  const char* e = strchr(info, '~');
+  char seg[BOT_MSG_MAX + 1];
+  int len = e ? (int)(e - info) : (int)strlen(info);
+  if (len > BOT_MSG_MAX) len = BOT_MSG_MAX;
+  memcpy(seg, info, len);
+  seg[len] = 0;
+  hbMsg(o, "%s: %s", WILDLIFE[s].name, seg);
+  if (e) hbParts(o, e + 1);
+}
+
+// kind 1 = the species of category idx, 2 = the items of group idx, 3 = the top level groups
+static HB_NOINLINE int hbWildList(HbOut* o, int kind, int idx) {
+  const char* names[TRAILBOT_MAX_ITEMS];
+  int n = 0;
+  if (kind == 1) n = wildCatSpecies(idx, names, TRAILBOT_MAX_ITEMS);
+  else if (kind == 2) n = wildGroupItems(idx, names, TRAILBOT_MAX_ITEMS);
+  else n = wildTopGroups(names, TRAILBOT_MAX_ITEMS);
+  if (n <= 0) return 0;
+  o->n = trailbotList(names, n, o->budget, o->out);
+  return o->n;
+}
+
+// an exact "!koala", "!frogs", "!birds", "!animals", "!wildlife". q is the normalised text. 0 = not wildlife.
+static HB_NOINLINE int hbWildExact(HbOut* o, const char* q) {
+  int s = wildFindSpecies(q);
+  if (s >= 0) { hbWildSay(o, s); return o->n; }
+  int c = wildFindCat(q);
+  if (c >= 0) return hbWildList(o, 1, c);
+  int g = wildFindGroup(q);
+  if (g >= 0) return hbWildList(o, 2, g);
+  if (wildIsTop(q)) return hbWildList(o, 3, 0);
+  return 0;
+}
+
+// a found injured, sick or orphaned animal: the wildlife care entry (the general first aid topics are for people)
+static HB_NOINLINE bool hbWildInjured(HbCtx* H) {
+  if (!hbHas(H->padded, "injured animal;injured wildlife;injured bird;injured koala;injured joey;injured possum;injured kangaroo;"
+                         "injured wallaby;injured echidna;injured turtle;injured bat;injured lizard;injured platypus;injured owl;"
+                         "sick animal;sick bird;sick koala;hurt animal;hurt bird;orphaned joey;orphaned animal;orphaned wildlife;"
+                         "abandoned joey;baby bird on the ground;found a joey;found a baby bird;dead animal;hit a kangaroo;"
+                         "hit a wallaby;hit a koala;hit a possum;hit an animal"))
+    return false;
+  int s = wildFindSpecies("injured wildlife");
+  if (s < 0) return false;
+  hbWildSay(&H->o, s);
+  return true;
+}
+
+// "what birds can I see?" : a category or group named in a question gives its list (a named species is answered later)
+static HB_NOINLINE bool hbWildAsk(HbCtx* H) {
+  bool ask = H->question || hbHas(H->padded, "what;which;list;show me;types of;kinds of;names of;any;tell me about;where can i see;can i see;do you know");
+  if (!ask) return false;
+  if (hbHas(H->padded, "allowed;permitted;banned;dog;dogs;pet;pets;leash;gear;pack;bring;take;wear;carry;bite;bitten;walk;walks;trail;trails;track;hike;hikes")) return false;
+  if (wildMentionSpecies(H->padded) >= 0) return false;
+  int kind = 0, idx = -1;
+  if (!wildMentionList(H->padded, &kind, &idx)) {
+    if (!hbHas(H->padded, "wildlife;nature")) return false;
+    kind = 3;   // "what wildlife can I see?": the top level groups
+  }
+  return hbWildList(&H->o, kind, idx) > 0;
+}
+
 // the radio-check phrases that give the same reply as '!test' (used by the normal flow and by the #test channel)
 #define HB_RADIO_PHRASES "radio check;signal check;can you hear me;do you copy;how is my signal;how is my reception;am i getting through;" \
                          "test message;radio test;signal test;do you read me;are you receiving me;can you read me"
@@ -1803,6 +2138,12 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (!has_start && hbHas(H.padded, "starting the;starting my;starting our;starting a;beginning the;beginning my;beginning a") &&
       hbHas(H.padded, "track;trail;walk;hike;circuit;loop;climb;summit;peak;falls;lookout;ridge"))
     has_start = true;   // "starting the Barney Peak walk"
+  // "I'm starting the Twin Falls walk tomorrow" is a plan for another day: work out the daylight, don't start a timer now
+  bool plan_day = false;
+  if (has_start && !q_words) {
+    HbDay pd;
+    if (hbDayInfo(&H, &pd)) { plan_day = true; has_start = false; }
+  }
 
   // 1. exact commands
   {
@@ -1818,6 +2159,10 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
         if (t >= 0) P->last_trail = (int16_t)t;
       }
       return n;
+    }
+    if (!timer_msg && !fix_reply) {
+      int w = hbWildExact(&H.o, q);   // !koala, !frogs, !birds, !plants, !wildlife
+      if (w > 0) return w;
     }
   }
 
@@ -1898,6 +2243,14 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
     return hbSuggestList(&H, true);
   }
 
+  // 5b. a walk planned for another day
+  if (plan_day) {
+    int t = hbTrailIn(&H, hbLastOk(&H));
+    int dur = hbParseDuration(H.norm);
+    if (t >= 0) P->last_trail = (int16_t)t;
+    return hbDoStartAdvice(&H, t, dur);
+  }
+
   // 6. glow worms, time, date, daylight
   if (hbHas(H.padded, "glow worm;glow worms;glowworm;glowworms") && H.clk.ok && !hbHas(H.padded, "gear;pack;bring;take;wear")) {
     int g = hbDoGlow(&H);
@@ -1913,7 +2266,8 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
     return hbDoMeteors(&H);
   }
   if (hbHas(H.padded, "what time is it;what is the time;time now;current time;what day is it;what is the date;todays date;today date;"
-                      "what date;what is today;what month;what year;what is the day;what is todays date;the date")) {
+                      "what date;what is today;what month;what year;what is the day;what is todays date;the date;what day is tomorrow;tomorrows date;"
+                      "date tomorrow;what day is it tomorrow;what day is it on")) {
     return hbDoTimeDate(&H);
   }
   if (hbHas(H.padded, "when should i start;when should i leave;what time should i start;what time should i leave;when should i set off;"
@@ -1966,6 +2320,10 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
     if (t >= 0) P->last_trail = (int16_t)t;
     return hbDoGear(&H, t);
   }
+
+  // 8b. an injured animal, or a wildlife group or category asked about ("what birds can I see?")
+  if (hbWildInjured(&H)) return H.o.n;
+  if (hbWildAsk(&H)) return H.o.n;
 
   // 9. how long / how far / how hard / what is there to see (a trail named, or the last one)
   {
@@ -2053,6 +2411,15 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
 
   // 11. specific hiking knowledge
   if (hbTopic(&H, 60, 255)) return H.o.n;
+
+  // 11b. a local animal, plant or field guide topic named anywhere in the sentence
+  {
+    int ws = wildMentionSpecies(H.padded);
+    if (ws >= 0) {
+      hbWildSay(&H.o, ws);
+      return H.o.n;
+    }
+  }
 
   // 12. a trail, town or region named anywhere in the sentence
   {
