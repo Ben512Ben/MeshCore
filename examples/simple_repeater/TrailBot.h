@@ -95,66 +95,114 @@ static int trailbotFindTown(const char* q) {
   return -1;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Lists. A list reads its names straight from the tables (or from an array the caller gives), so a town can hold
+// any number of trails: there is no item limit and no array on the stack. A list that does not fit in one
+// answer (BOT_Q_MAX messages) is split into pages: "!springbrook 2" shows the next page.
+struct TbSrc {
+  int kind;                    // 0 = the regions, 1 = the towns of region 'id', 2 = the trails of town 'id', 3 = the array 'arr'
+  int id;
+  const char* const* arr;
+  int n;
+};
+
+static int tbCount(const TbSrc* s) {
+  if (s->kind == 3) return s->n;
+  if (s->kind == 0) return TRAIL_REGION_COUNT;
+  int n = 0;
+  if (s->kind == 1) { for (int i = 0; i < TRAIL_TOWN_COUNT; i++) if (TRAIL_TOWNS[i].region == s->id) n++; }
+  else { for (int i = 0; i < TRAIL_COUNT; i++) if (TRAILS[i].town == s->id) n++; }
+  return n;
+}
+
+// the k-th name of the list (k counts from 0)
+static const char* tbName(const TbSrc* s, int k) {
+  if (s->kind == 3) return s->arr[k];
+  if (s->kind == 0) return TRAIL_REGIONS[k].name;
+  if (s->kind == 1) {
+    for (int i = 0; i < TRAIL_TOWN_COUNT; i++) if (TRAIL_TOWNS[i].region == s->id && k-- == 0) return TRAIL_TOWNS[i].name;
+  } else {
+    for (int i = 0; i < TRAIL_COUNT; i++) if (TRAILS[i].town == s->id && k-- == 0) return TRAILS[i].name;
+  }
+  return "";
+}
+
 // add as many "!name" items as fit in cap characters, starting at item 'from'. returns the next item.
-static int trailbotPack(const char* const* names, int n, int from, int cap) {
+static int tbPack(const TbSrc* s, int n, int from, int cap) {
   int used = 0, i = from;
   while (i < n) {
-    int need = (i > from ? 1 : 0) + 1 + (int)strlen(names[i]);
+    int need = (i > from ? 1 : 0) + 1 + (int)strlen(tbName(s, i));
     if (used + need > cap) break;
     used += need;
     i++;
   }
-  if (i == from && i < n) i++;   // a single name longer than a page: still make progress (it is cut on output)
+  if (i == from && i < n) i++;   // a single name longer than a message: still make progress (it is cut on output)
   return i;
 }
 
-// numbered list of "!name" items, at most BOT_Q_MAX messages. returns the number of messages.
-static int trailbotList(const char* const* names, int n, int budget, char out[][BOT_MSG_MAX + 1]) {
+// The messages of one page of a list, at most BOT_Q_MAX. 'hint' is what to send for the next page ("springbrook"):
+// when items are left, the last message ends with " +N more: !springbrook 2". With hint NULL there is only one page
+// and the last message ends with " +N more". returns the number of messages (0 = the list is empty).
+static int trailbotListPage(const TbSrc* s, int budget, int page, const char* hint, char out[][BOT_MSG_MAX + 1]) {
+  int n = tbCount(s);
   if (n <= 0) return 0;
   int cap = budget - TRAILBOT_HDR_LEN;
+  int reserve = hint ? 16 + (int)strlen(hint) : TRAILBOT_MORE_LEN;   // room kept at the end of a page that has a next page
   int start[BOT_Q_MAX + 1];
-  int np = 0, i = 0;
-  while (i < n && np < BOT_Q_MAX) {
+  int i = 0;
+  for (int pg = 1; pg <= page && i < n; pg++) {   // pages before this one are skipped, laid out the same way
+    int np = 0;
+    while (i < n && np < BOT_Q_MAX) {
+      start[np] = i;
+      int next = tbPack(s, n, i, cap);
+      if (np == BOT_Q_MAX - 1 && next < n) next = tbPack(s, n, i, cap - reserve);
+      i = next;
+      np++;
+    }
     start[np] = i;
-    int next = trailbotPack(names, n, i, cap);
-    if (np == BOT_Q_MAX - 1 && next < n) {   // last allowed message and items are left over: make room for "+N more"
-      next = trailbotPack(names, n, i, cap - TRAILBOT_MORE_LEN);
+    if (pg == page) {
+      int left = n - i;
+      for (int p = 0; p < np; p++) {
+        char* o = out[p];
+        int pos = snprintf(o, BOT_MSG_MAX + 1, "(%d/%d)", p + 1, np);
+        for (int k = start[p]; k < start[p + 1]; k++) {
+          pos += snprintf(o + pos, BOT_MSG_MAX + 1 - pos, " !%s", tbName(s, k));
+          if (pos > budget) break;
+        }
+        if (p == np - 1 && left > 0 && pos < BOT_MSG_MAX) {
+          if (hint) pos += snprintf(o + pos, BOT_MSG_MAX + 1 - pos, " +%d more: !%s %d", left, hint, page + 1);
+          else pos += snprintf(o + pos, BOT_MSG_MAX + 1 - pos, " +%d more", left);
+        }
+        if (pos > budget) pos = budget;   // never over the budget (cut, not wrapped)
+        o[pos] = 0;
+      }
+      return np;
     }
-    i = next;
-    np++;
   }
-  start[np] = i;
-  int left = n - i;
-  for (int p = 0; p < np; p++) {
-    char* o = out[p];
-    int pos = snprintf(o, BOT_MSG_MAX + 1, "(%d/%d)", p + 1, np);
-    for (int k = start[p]; k < start[p + 1]; k++) {
-      pos += snprintf(o + pos, BOT_MSG_MAX + 1 - pos, " !%s", names[k]);
-      if (pos > budget) break;
-    }
-    if (p == np - 1 && left > 0 && pos < BOT_MSG_MAX) {
-      pos += snprintf(o + pos, BOT_MSG_MAX + 1 - pos, " +%d more", left);
-    }
-    if (pos > budget) pos = budget;   // never over the budget (cut, not wrapped)
-    o[pos] = 0;
-  }
-  return np;
+  snprintf(out[0], BOT_MSG_MAX + 1, "That was the last page");
+  return 1;
 }
 
-static int trailbotRegionTowns(int region, const char** names, int max) {
-  int n = 0;
-  for (int i = 0; i < TRAIL_TOWN_COUNT && n < max; i++) {
-    if (TRAIL_TOWNS[i].region == region) names[n++] = TRAIL_TOWNS[i].name;
-  }
-  return n;
+// a list of names the caller already has (the wildlife lists): one page, "+N more" if it does not all fit
+static int trailbotList(const char* const* names, int n, int budget, char out[][BOT_MSG_MAX + 1]) {
+  TbSrc s = {3, 0, names, n};
+  return trailbotListPage(&s, budget, 1, NULL, out);
 }
 
-static int trailbotTownTrails(int town, const char** names, int max) {
-  int n = 0;
-  for (int i = 0; i < TRAIL_COUNT && n < max; i++) {
-    if (TRAILS[i].town == town) names[n++] = TRAILS[i].name;
+// "springbrook 2": a page number (1 or 2 digits) at the end of the query. Cuts it off q and returns it, else returns 0.
+static int trailbotPageNo(char* q) {
+  char* sp = strrchr(q, ' ');
+  if (!sp || sp == q || !sp[1]) return 0;
+  int len = (int)strlen(sp + 1);
+  if (len > 2) return 0;
+  int v = 0;
+  for (int i = 0; i < len; i++) {
+    if (sp[1 + i] < '0' || sp[1 + i] > '9') return 0;
+    v = v * 10 + (sp[1 + i] - '0');
   }
-  return n;
+  if (v < 1) return 0;
+  *sp = 0;
+  return v;
 }
 
 // 'query' is the message text after the '!'. 'node_name' is this repeater's name (the sender prefix is
@@ -169,17 +217,22 @@ static int trailbotLookup(const char* query, const char* node_name, char out[][B
   int prefix = (int)strlen(node_name) + 2;
   if (prefix > 39) prefix = 39;
   int budget = BOT_MSG_MAX - prefix;   // characters left for the text itself
-  const char* names[TRAILBOT_MAX_ITEMS];
 
   bool towns_only = false;   // "!trails <name>": never a trail
   if (strcmp(q, "trails") == 0) {   // the regions
-    int n = 0;
-    for (int i = 0; i < TRAIL_REGION_COUNT && n < TRAILBOT_MAX_ITEMS; i++) names[n++] = TRAIL_REGIONS[i].name;
-    return trailbotList(names, n, budget, out);
+    TbSrc s = {0, 0, NULL, 0};
+    return trailbotListPage(&s, budget, 1, "trails", out);
   }
   if (strncmp(q, "trails ", 7) == 0) {
     memmove(q, q + 7, strlen(q + 7) + 1);
     towns_only = true;
+    char rest[TRAILBOT_QUERY_MAX + 16];
+    snprintf(rest, sizeof(rest), "x %s", q);   // "!trails 2": the next page of the regions
+    int pg = trailbotPageNo(rest);
+    if (pg > 0 && strcmp(rest, "x") == 0) {
+      TbSrc s = {0, 0, NULL, 0};
+      return trailbotListPage(&s, budget, pg, "trails", out);
+    }
   }
 
   if (!towns_only) {
@@ -191,15 +244,25 @@ static int trailbotLookup(const char* query, const char* node_name, char out[][B
       return 1;
     }
   }
+  int page = 1;
+  {   // "!springbrook 2": a page number after a town or region name
+    char qb[TRAILBOT_QUERY_MAX + 8];
+    snprintf(qb, sizeof(qb), "%s", q);
+    int pg = trailbotPageNo(qb);
+    if (pg > 0 && (trailbotFindTown(qb) >= 0 || trailbotFindRegion(qb) >= 0)) {
+      page = pg;
+      snprintf(q, sizeof(q), "%s", qb);
+    }
+  }
   int town = trailbotFindTown(q);
   if (town >= 0) {
-    int n = trailbotTownTrails(town, names, TRAILBOT_MAX_ITEMS);
-    if (n > 0) return trailbotList(names, n, budget, out);
+    TbSrc s = {2, town, NULL, 0};
+    if (tbCount(&s) > 0) return trailbotListPage(&s, budget, page, TRAIL_TOWNS[town].name, out);
   }
   int region = trailbotFindRegion(q);
   if (region >= 0) {
-    int n = trailbotRegionTowns(region, names, TRAILBOT_MAX_ITEMS);
-    if (n > 0) return trailbotList(names, n, budget, out);
+    TbSrc s = {1, region, NULL, 0};
+    if (tbCount(&s) > 0) return trailbotListPage(&s, budget, page, TRAIL_REGIONS[region].name, out);
   }
   return -1;
 }

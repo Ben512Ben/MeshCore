@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Trail library for the trail info bot (item 32): South East Queensland (Gold Coast, Scenic Rim, Brisbane,
- * Sunshine Coast and the bay islands).
+ * Sunshine Coast, the bay islands, Redlands, Ipswich, Lockyer and Toowoomba, and the NSW Border Ranges).
  *
  * Compiled into the firmware (flash). To change a trail, edit this file and rebuild.
  *
@@ -12,7 +12,8 @@
  *   - No alias may be used by two different trails, two different towns, or two different regions.
  *   - Three levels: regions (!trails), towns (!<region>), trails (!<town>). Lookup order is trail, then town, then region,
  *     so a trail name or alias that is also a town name wins: "!natural bridge" gives the trail.
- *   - A region lists its towns, a town lists its trails. Keep a town to about 12 trails or fewer (a list is at most 4 messages).
+ *   - A region lists its towns, a town lists its trails. There is no limit on trails per town: a list that does not fit in
+ *     one answer (4 messages) is paged, and the hikers send "!<town> 2" for the next page.
  *   - Grades are the Queensland Parks 1 to 5 scale. "ungraded" means there is no official grade.
  *   - Facts come from Queensland Parks and Wildlife Service pages, the City of Gold Coast, and hiker logs
  *     where no official figure exists (those rows say "~" or "off-track"). CHECK PARK ALERTS BEFORE WALKING.
@@ -45,6 +46,9 @@ static const TrailRegion TRAIL_REGIONS[] = {
   /* 3 */ {"Sunshine Coast", "sunny coast|sunshine coast hinterland"},
   /* 4 */ {"Moreton Bay Islands", "moreton bay|bay islands|islands"},
   /* 5 */ {"Ipswich and Somerset", "ipswich|somerset"},
+  /* 6 */ {"Lockyer and Toowoomba", "lockyer valley|lockyer|darling downs"},
+  /* 7 */ {"Northern Rivers NSW", "northern rivers|nsw border|new south wales"},
+  /* 8 */ {"Redlands", "redland|redlands coast|redland city"},
 };
 
 static const TrailTown TRAIL_TOWNS[] = {
@@ -61,7 +65,7 @@ static const TrailTown TRAIL_TOWNS[] = {
   /* 8  */ {"O'Reilly's", "green mountains", 1},
   /* 9  */ {"Binna Burra", "binna", 1},
   /* 10 */ {"Mount Barney", "mt barney|barney", 1},
-  /* 11 */ {"Cunninghams Gap", "cunningham gap|main range|main range np|main range national park|spicers gap", 1},
+  /* 11 */ {"Cunninghams Gap", "cunningham gap|main range|main range np|main range national park", 1},
   /* 12 */ {"Moogerah", "moogerah peaks|moogerah peaks np|lake moogerah|mount french|mt french", 1},
   // ---- Brisbane ----
   /* 13 */ {"Mount Coot-tha", "mt coot tha|coot tha|cootha|mt cootha|mount cootha", 2},
@@ -89,6 +93,19 @@ static const TrailTown TRAIL_TOWNS[] = {
   /* 32 */ {"Flinders-Goolman", "flinders goolman conservation estate|peak crossing|ipswich peaks", 5},
   /* 33 */ {"Mount Mee", "mt mee|neurum creek|the gantry|mount mee forest reserve", 5},
   /* 34 */ {"Numinbah Valley", "numinbah|neranwood|upper nerang|advancetown", 0},
+  // ---- added: Main Range, Toowoomba and Lockyer, Brisbane bush, Redlands, Sunshine Coast, Border Ranges NSW ----
+  /* 35 */ {"Spicers Gap", "spicers|spicers peak", 1},
+  /* 36 */ {"Queen Mary Falls", "queen mary|killarney", 1},
+  /* 37 */ {"Toowoomba", "toowoomba range|toowoomba escarpment", 6},
+  /* 38 */ {"Glen Rock", "glen rock state forest", 6},
+  /* 39 */ {"Karawatha Forest", "karawatha|karawatha forest park", 2},
+  /* 40 */ {"Boondall Wetlands", "boondall", 2},
+  /* 41 */ {"Brisbane Koala Bushlands", "koala bushlands|burbank", 2},
+  /* 42 */ {"Venman Bushland", "venman|venman np|venman bushland national park|mount cotton|mt cotton", 8},
+  /* 43 */ {"Coochiemudlo Island", "coochiemudlo|coochie", 8},
+  /* 44 */ {"Baroon Pocket", "baroon|baroon pocket dam", 3},
+  /* 45 */ {"Mooloolah River NP", "mooloolah|mooloolah river national park|sippy downs", 3},
+  /* 46 */ {"Border Ranges", "border ranges np|border ranges national park|tweed range", 7},
 };
 
 static const Trail TRAILS[] = {
@@ -266,6 +283,75 @@ static const Trail TRAILS[] = {
   // ---- Numinbah Valley (Neranwood, Upper Nerang) ----
   {34, "Pages Pinnacle", "pages|pages pinnacle track", "6.7km return, 2.5h, ungraded, steep fire trail, razorback scramble"},
   {34, "Bohgaban Falls", "boghaban falls|boggaban falls|bohgaban", "~4km return from Great Walk, 2-3h, ungraded, off-track rock hopping"},
+
+  // ---- Added: Lamington (O'Reilly's) ----
+  {8, "Toolona Creek Circuit", "toolona creek|toolona|toolona circuit", "17.4km circuit, 6h, Gr 4, waterfalls, gorge, creek crossings"},
+  {8, "West Canungra Creek Circuit", "west canungra creek|west canungra|yerralahla|west canungra circuit", "13.9km circuit, 5.5h, Gr 4, Yerralahla blue pool, creek"},
+
+  // ---- Added: Main Range National Park, Cunninghams Gap section ----
+  {11, "Cunninghams Box Forest Track", "cunninghams box forest|gap box forest", "5km return, 2h, Gr 3, forest, starts at West Gap Creek or The Crest"},
+  {11, "Cunninghams Rainforest Circuit", "cunninghams rainforest circuit|crest rainforest circuit", "1.6km return, 25min, Gr 3, rainforest, platform lookout"},
+  {11, "Cunninghams Palm Grove Circuit", "cunninghams palm grove|gap palm grove", "4.4km return, 2h, Gr 4, palm grove"},
+
+  // ---- Main Range National Park, Spicers Gap section ----
+  {35, "Governors Chair Lookout", "governors chair|governors chair lookout", "0.3km return, Gr 3, lookout, Lake Moogerah and Main Range views"},
+  {35, "Spicers Heritage Trail", "heritage trail|spicers gap road|old spicers gap road", "3.2km return, 80min, Gr 4, historic pioneer road"},
+  {35, "Mount Mathieson Trail", "mount mathieson|mt mathieson|mathieson", "8.1km return, Gr 4, physically challenging, ridge views"},
+
+  // ---- Main Range National Park, Queen Mary Falls section ----
+  {36, "Queen Mary Falls Circuit", "queen mary circuit|queen mary falls circuit", "2km, ~45min, Gr 3, 40m waterfall, lookout"},
+  {36, "Queen Mary Cliff Circuit", "cliff circuit|queen mary cliff", "0.4km return, Gr 2, lookout, cliff edge views"},
+  {36, "Sylvesters Lookout", "sylvesters|sylvesters lookout", "0.94km return, Gr 3, lookout"},
+  {36, "Mount Castle Lookout", "mount castle|mt castle", "0.96km return, Gr 3, lookout"},
+  {36, "Winder Track", "winder|winder trail", "12km return, Gr 4, natural lookout"},
+
+  // ---- Toowoomba range (Toowoomba Regional Council) ----
+  {37, "Table Top Mountain Walk", "table top|tabletop|table top mountain|mount meewah|mt meewah", "~2km return, ~1.25h, Gr 5, steep scramble, 360 views, Lockyer Valley"},
+  {37, "Pardalote Walk", "pardalote", "1.85km one way, 45min, Gr 3, escarpment, waterfall, Lockyer Valley views"},
+  {37, "Firetail Walk", "firetail", "~4.2km return, escarpment, Lockyer Valley and Table Top views, birds"},
+  {37, "Fantail Walk", "fantail", "3.2km return, base of Table Top, an easier option from Picnic Point"},
+  {37, "Picnic Point Rainforest Gully", "rainforest gully|rainforest gully circuit|picnic point rainforest", "0.67km loop, 10min, Gr 3, rainforest gully, uphill on the way back"},
+  {37, "Grasstree Eagles Nest Loop", "grasstree track|eagles nest trail|redwood park loop|redwood park", "~4km loop, ~2h, hard, forest, views, slippery when wet"},
+
+  // ---- Glen Rock State Forest (Lockyer Valley) ----
+  {38, "Christies Loop", "christies|christies loop", "~5km return, red volcanic outcrop, Glen Rock State Forest"},
+
+  // ---- Karawatha Forest (Brisbane City Council) ----
+  {39, "Karawatha Melaleuca Circuit", "melaleuca circuit|karawatha melaleuca", "1km circuit, 20-30min, wet heath, melaleuca wetland, creek crossings"},
+  {39, "Karawatha Rocks Circuit", "rocks circuit|karawatha rocks", "~3.4km return, ~45min, sandstone outcrops, leashed dogs allowed"},
+  {39, "Karawatha Banksia Track", "banksia track|karawatha banksia", "~4km return, ~1h, banksia, wallum"},
+  {39, "Karawatha Casuarina Loop", "casuarina maculata hakea|hakea trail|casuarina trail|maculata trail", "~4.5km return, ~1.5h, lagoons, open forest, four tracks joined"},
+
+  // ---- Boondall Wetlands (Brisbane City Council) ----
+  {40, "Billai dhagun Circuit", "billai dhagun|boondall circuit", "2km circuit, wetlands, birds, Ramsar wetland"},
+  {40, "Tabbil-ban dhagun Boardwalk", "tabbil ban dhagun|tabbil-ban|boondall boardwalk", "1.5km, boardwalk, wetlands, birds, Ramsar wetland"},
+  {40, "Tulla-yugaipa dhagun Track", "tulla yugaipa dhagun|tulla yugaipa|place of useful plants", "0.1km, 15min, short bush tucker plant walk"},
+
+  // ---- Brisbane Koala Bushlands, Toohey Forest ----
+  {41, "Stockyard Creek Track", "stockyard creek|stockyard creek walking track", "1.4km return, 50min, creek, koala bushland, signs"},
+  {26, "Nathan Ridge Track", "nathan ridge", "3.5km, 1h, forest ridge"},
+  {26, "Sandstone Circuit", "sandstone circuit|toohey sandstone", "1km, 30min, short forest circuit"},
+  {26, "Toohey Summit Track", "toohey summit|toohey summit track", "1.2km, 40min, forest, summit"},
+
+  // ---- Redlands: Venman Bushland National Park, Coochiemudlo Island ----
+  {42, "Venman Circuit", "venman circuit", "~7.5km, ~4h, Gr 3, eucalypt forest, creek, old quarry, wallabies"},
+  {42, "Tingalpa Creek Circuit", "tingalpa creek circuit|tingalpa circuit", "~2.5km circuit, Gr 3, creek, bushland"},
+  {43, "Coochiemudlo Foreshore Walk", "emerald fringe loop|coochiemudlo foreshore|coochiemudlo loop", "~5km loop, ~1.75h, Gr 2, island loop, beaches, ferry from Victoria Point"},
+
+  // ---- Sunshine Coast hinterland ----
+  {44, "Baroon Lookout Walk", "baroon lookout|baroon pocket to baroon lookout", "2.2km one way, 1-2h, Gr 3, lookout, Obi Obi Gorge and dam views"},
+  {20, "Linda Garrett Circuit", "linda garrett", "0.7km return, 20min, Gr 2, forest, Gheerulla Creek headwaters"},
+  {20, "Mapleton Falls Lookout", "mapleton falls lookout", "0.05km return, 5min, Gr 2, lookout, falls, peregrine falcons Aug-Sep"},
+  {20, "Mapleton Falls to Delicia Road", "delicia road|delicia road walk", "2.1km one way, 1.5h, Gr 4, Great Walk section, forest"},
+  {19, "Kondalilla to Flaxton Walk", "kondalilla to flaxton|flaxton mill road", "3km one way, 2h, Gr 2, Great Walk section, forest"},
+  {45, "Boronia Trail", "boronia trail|boronia", "~4.2km return, ~2h, wet heath, scribbly gum woodland"},
+  {45, "Mooloolah River Circuit", "mooloolah river circuit", "~0.5km return, ~20min, wetland, mangroves"},
+
+  // ---- Border Ranges National Park (New South Wales, Tweed Range Scenic Drive) ----
+  {46, "Pinnacle Walk", "pinnacle|pinnacle lookout|pinnacle walk and lookout", "0.6km return, 30-45min, Gr 2, lookout, Wollumbin and Tweed Valley views"},
+  {46, "Border Loop Walk", "border loop", "1.5km loop, 15-45min, Gr 2, rainforest, lookout"},
+  {46, "Bar Mountain Circuit", "bar mountain", "4km loop, 2h, Gr 3, lookout, eucalypt forest, Mount Barney views"},
+  {46, "Brindle Creek Walking Track", "brindle creek|brindle creek track", "6km one way, 3-4h, Gr 3, rainforest, creek, waterfalls, picnic areas"},
 };
 
 #define TRAIL_REGION_COUNT ((int)(sizeof(TRAIL_REGIONS) / sizeof(TRAIL_REGIONS[0])))
