@@ -179,6 +179,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
+  bool neighbor_alert_enabled;   // item 53: post 'New neighbour discovered' (RAM only, on after boot)
+  bool disc_report_on;           // item 52: a channel 'discover neighbors' is waiting to post its follow-up
+  uint8_t disc_heard, disc_new;  // item 52: answers heard / of them new neighbours, during that discover
+  unsigned long disc_report_at;  // item 52: when the follow-up is due
   uint8_t list_pages_kind;      // which list list_pages_pending sends: 0 = blockname, 1 = neighbors (item 51)
   uint8_t list_pages_pending;   // 'blockname list' over the channel: total pages to send (0 = just the one reply) (item 38)
 
@@ -239,7 +243,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   ESPNowBridge bridge;
 #endif
 
-  void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
+  bool putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);   // returns true when the repeater is a new neighbour (item 53)
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   bool handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply);
   bool handleSleepCommandsInner(uint32_t sender_timestamp, char* command, char* reply);
@@ -264,6 +268,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t blockNameCount() const;
   void blockNameCheckText(const char* text);
   int formatBlockNameList(char* reply, int page);   // returns the number of pages
+  void chanEnqueueSoon(const char* text);                   // items 52 and 53: an automatic message that goes out as soon as possible
+  void neighbourAlert(const mesh::Identity& id, int8_t snr4);   // item 53
+  void discoverReportService();                             // item 52: 'Discover: N heard, M new'
   void formatSnrReply(char* reply, const char* hex);   // item 50: 'snr <id>'
   void formatNeighborSummary(char* reply);            // item 51: 'neighbors summary'
   int formatNeighborList(char* reply, int page);      // item 51: 'neighbors list [page]', returns the number of pages

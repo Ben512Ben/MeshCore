@@ -24,6 +24,7 @@
 #define CRIT_WARN_MV      3300                    // 'battery critical' channel warning below this
 #define REPORT_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // daily report: every 24h from boot
 #define CHAN_GAP_MS       60000                   // gap between automatic channel messages
+#define DISCOVER_REPORT_MS 62000                  // item 52: the discover answers are collected for 60 s, then reported
 #define CHAN_PAIR_GAP_MS  10000                   // gap between the two daily report messages
 #define BLOCK_NOTICE_GAP_MS (60UL * 60UL * 1000UL)  // at most one auto-block notice per hour
 #define SLEEP_MSG_WAIT_MS 150000                  // sleep waits at most this long for queued channel messages
@@ -97,15 +98,17 @@
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 
-void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
+bool MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
   // find existing neighbour, else use least recently updated
   uint32_t oldest_timestamp = 0xFFFFFFFF;
   NeighbourInfo *neighbour = &neighbours[0];
+  bool known = false;
   for (int i = 0; i < MAX_NEIGHBOURS; i++) {
     // if neighbour already known, we should update it
     if (id.matches(neighbours[i].id)) {
       neighbour = &neighbours[i];
+      known = true;
       break;
     }
 
@@ -121,7 +124,12 @@ void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float sn
   neighbour->advert_timestamp = timestamp;
   neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
   neighbour->snr = (int8_t)(snr * 4);
+  if (!known) {   // item 53: a repeater that was not in the table
+    neighbourAlert(id, neighbour->snr);
+    return true;
+  }
 #endif
+  return false;
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -890,7 +898,8 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
     if (id.matches(self_id)) {
       return;
     }
-    putNeighbour(id, rtc_clock.getCurrentTime(), packet->getSNR());
+    if (disc_report_on && disc_heard < 255) disc_heard++;   // item 52
+    if (putNeighbour(id, rtc_clock.getCurrentTime(), packet->getSNR()) && disc_report_on && disc_new < 255) disc_new++;
   }
 }
 
@@ -951,6 +960,11 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   ron_snap_head = ron_snap_n = 0;
   list_pages_pending = 0;
   list_pages_kind = 0;
+  neighbor_alert_enabled = true;   // item 53: the new-neighbour alert is ON after every boot
+  disc_report_on = false;
+  disc_heard = 0;
+  disc_new = 0;
+  disc_report_at = 0;
   memset(temp_log, 0, sizeof(temp_log));
   memset(blockhop, 0, sizeof(blockhop));
   memset(blockname, 0, sizeof(blockname));
@@ -1838,11 +1852,49 @@ int MyMesh::formatBlockNameList(char* reply, int page) {   // returns the number
   return pages;
 }
 
+// ---------------------- discover and new-neighbour alert (items 52 and 53) ----------------------
+
+// An automatic message that goes out as soon as possible: 1 to 3 seconds when nothing is queued (even inside the gap that
+// follows an earlier automatic message), otherwise right behind what is queued (10 s after the message before it).
+// A burst of them goes out 10 s apart. A full queue drops the message.
+void MyMesh::chanEnqueueSoon(const char* text) {
+  if (!chan_key_set || chan_q_n >= CHAN_Q_MAX) return;
+  bool idle = (chan_q_n == 0);
+  if (!idle && chan_q[chan_q_n - 1].gap_after_ms > CHAN_PAIR_GAP_MS) chan_q[chan_q_n - 1].gap_after_ms = CHAN_PAIR_GAP_MS;
+  chanEnqueue(text, CHAN_PAIR_GAP_MS);
+  if (idle) {
+    unsigned long at = futureMillis(getRNG()->nextInt(1000, 3001));
+    if (!chan_gap_on || (long)(at - chan_next_send_at) < 0) chan_next_send_at = at;
+    chan_gap_on = true;
+  }
+}
+
+// item 53: "New neighbour discovered: 2F1E77 SNR +3.75dB". One message per new neighbour, no batching.
+void MyMesh::neighbourAlert(const mesh::Identity& id, int8_t snr4) {
+  if (!neighbor_alert_enabled || !chan_key_set) return;
+  char idh[8], snr[10];
+  for (int j = 0; j < 3; j++) sprintf(&idh[j * 2], "%02X", id.pub_key[j]);
+  fmtSnr(snr, sizeof(snr), snr4);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "New neighbour discovered: %s SNR %sdB", idh, snr);
+  chanEnqueueSoon(msg);
+}
+
+// item 52: about a minute after a channel 'discover neighbors', post how many repeaters answered and how many were new
+void MyMesh::discoverReportService() {
+  if (!disc_report_on || !millisHasNowPassed(disc_report_at)) return;
+  disc_report_on = false;
+  if (sleeping) return;   // the radio went off before the answers were in: nothing useful to report
+  char msg[40];
+  snprintf(msg, sizeof(msg), "Discover: %u heard, %u new", (unsigned)disc_heard, (unsigned)disc_new);
+  chanEnqueueSoon(msg);
+}
+
 // ---------------------- 'snr' and 'neighbors' (items 50 and 51) ----------------------
 // Both read the neighbour table: repeaters whose adverts this node heard directly (zero hops). The SNR is the one of the
 // last advert heard from that repeater, so it can be hours old (hence the age).
 
-// item 50: "2F1E snr +8.25dB 5m", or "2F1E not heard". A short id can match several repeaters: the strongest is shown, "(+N more)".
+// item 50: "2F1E SNR +8.25dB | Last heard 5m ago" (no age while the clock is unset), or "2F1E not heard". A short id can match several repeaters: the strongest is shown, "(+N more)".
 void MyMesh::formatSnrReply(char* reply, const char* hex) {
   uint8_t key[3];
   int len = parseHexId(hex, key);
@@ -1870,7 +1922,7 @@ void MyMesh::formatSnrReply(char* reply, const char* hex) {
     neighbourAgeStr(age, sizeof(age), getRTCClock()->getCurrentTime(), nb.heard_timestamp);
     more[0] = 0;
     if (found > 1) snprintf(more, sizeof(more), " (+%d more)", found - 1);
-    snprintf(reply, 80, "%s snr %sdB%s%s%s", id, snr, age[0] ? " " : "", age, more);
+    snprintf(reply, 100, "%s SNR %sdB%s%s%s%s", id, snr, age[0] ? " | Last heard " : "", age, age[0] ? " ago" : "", more);
     return;
   }
 #endif
@@ -2358,7 +2410,9 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   // item 46: 'reboot' and 'set tx <n>' are accepted only when addressed to this repeater by name (never to 'all')
   // item 51: the full 'neighbors list' is named-only too (every repeater sending several pages would cost too much airtime)
   bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0
-                    || strncmp(buf, "neighbors list", 14) == 0 || strncmp(buf, "neighbours list", 15) == 0;
+                    || strncmp(buf, "neighbors list", 14) == 0 || strncmp(buf, "neighbours list", 15) == 0
+                    || strcmp(buf, "discover neighbors") == 0 || strcmp(buf, "discover neighbours") == 0   // item 52 (named only: every
+                    || strcmp(buf, "discover.neighbors") == 0;                                           // repeater transmitting at once would collide)
   bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "batttrend") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
                  || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
@@ -2368,6 +2422,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
                  || strncmp(buf, "snr ", 4) == 0   // item 50: snr <id>
                  || strcmp(buf, "neighbors") == 0 || strcmp(buf, "neighbors summary") == 0   // item 51 (bare = summary over the channel)
                  || strcmp(buf, "neighbours") == 0 || strcmp(buf, "neighbours summary") == 0
+                 || strncmp(buf, "neighbors alert", 15) == 0 || strncmp(buf, "neighbours alert", 16) == 0   // item 53
                  || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
                  || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
@@ -2672,6 +2727,21 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
     return true;
   }
 
+  {   // item 52: 'discover neighbors' / 'discover neighbours' (and the stock 'discover.neighbors' over the channel)
+    bool spaced = strcmp(command, "discover neighbors") == 0 || strcmp(command, "discover neighbours") == 0;
+    if (spaced || (from_channel && strcmp(command, "discover.neighbors") == 0)) {
+      sendNodeDiscoverReq();   // the stock zero-hop discovery request; answers within about a minute are added to the neighbour table
+      strcpy(reply, "OK - discover sent");
+      if (from_channel) {      // a follow-up message once the answers are in
+        disc_heard = 0;
+        disc_new = 0;
+        disc_report_on = true;
+        disc_report_at = futureMillis(DISCOVER_REPORT_MS);
+      }
+      return true;
+    }
+  }
+
   if (memcmp(command, "snr", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {   // item 50
     const char* arg = command + 3;
     while (*arg == ' ') arg++;
@@ -2692,6 +2762,11 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
         } else {
           return false;                   // stock 'neighbors'
         }
+      } else if (strcmp(sub, "alert on") == 0 || strcmp(sub, "alert off") == 0) {   // item 53
+        neighbor_alert_enabled = (sub[7] == 'n');
+        strcpy(reply, neighbor_alert_enabled ? "OK - neighbors alert on" : "OK - neighbors alert off");
+      } else if (strcmp(sub, "alert") == 0) {
+        strcpy(reply, neighbor_alert_enabled ? "neighbors alert on" : "neighbors alert off");
       } else if (strcmp(sub, "summary") == 0) {
         formatNeighborSummary(reply);
       } else if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
@@ -2701,7 +2776,7 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
           list_pages_kind = 1;
         }
       } else {
-        strcpy(reply, "Err - neighbors summary|list [page]");
+        strcpy(reply, "Err - neighbors summary|list [page]|alert");
       }
       return true;
     }
@@ -3246,6 +3321,7 @@ void MyMesh::loop() {
   }
   dailyReport();           // 24h report timer (counts while asleep too)
   blockNoticeService();    // announce newly auto-blocked repeaters
+  discoverReportService();   // item 52
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
 
   // A packet leaves the send queue when its transmission STARTS, and the transmission takes seconds.
