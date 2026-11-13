@@ -87,6 +87,7 @@ struct NeighbourInfo {
 #define CHAN_MSG_MAX 150  // max bytes of a channel message ("name: text")
 #define MAX_BLOCKNAME 20        // names in the 'blockname' list
 #define BLOCKNAME_LEN 32        // 31 characters + terminator
+#define NEIGHBOR_PER_PAGE 6    // most entries shown by one 'neighbors list' page (item 51)
 #define BLOCKNAME_PER_PAGE 5    // most entries shown by one 'blockname list'
 #define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
 #define RON_SNAPS 25            // radio-on snapshots kept: boot + one per hourly log moment (25 = exactly 24 h span)
@@ -126,6 +127,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   // sleep cycle + battery monitor (+ hourly battery log)
   bool cycle_active, sleep_auto_enabled;
+  bool blockhop_auto_enabled;   // item 49: automatic blockhop adding from heard adverts (RAM only, on after boot)
   unsigned long cycle_awake_until;
   bool batt_check_armed;
   unsigned long next_batt_check;
@@ -177,6 +179,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
+  uint8_t list_pages_kind;      // which list list_pages_pending sends: 0 = blockname, 1 = neighbors (item 51)
   uint8_t list_pages_pending;   // 'blockname list' over the channel: total pages to send (0 = just the one reply) (item 38)
 
   // warnings / notices
@@ -261,6 +264,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t blockNameCount() const;
   void blockNameCheckText(const char* text);
   int formatBlockNameList(char* reply, int page);   // returns the number of pages
+  void formatSnrReply(char* reply, const char* hex);   // item 50: 'snr <id>'
+  void formatNeighborSummary(char* reply);            // item 51: 'neighbors summary'
+  int formatNeighborList(char* reply, int page);      // item 51: 'neighbors list [page]', returns the number of pages
   bool chanAllowBlocks(const mesh::Packet* packet);
   bool setChannelKey(const char* key);
   void saveChannelKey();

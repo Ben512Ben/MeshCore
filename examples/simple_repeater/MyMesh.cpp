@@ -697,7 +697,7 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
   // blockhop auto-add: a repeater advertising a location in the northern hemisphere (we are in Brisbane)
   {
     AdvertDataParser loc_parser(app_data, app_data_len);
-    if (loc_parser.isValid() && loc_parser.getType() == ADV_TYPE_REPEATER
+    if (blockhop_auto_enabled && loc_parser.isValid() && loc_parser.getType() == ADV_TYPE_REPEATER
         && loc_parser.hasLatLon() && loc_parser.getIntLat() > 0) {
       blockHopAdd(id.pub_key, 3, true);
     }
@@ -935,6 +935,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   sleep_duration_ms = 0;
   cycle_active = false;
   sleep_auto_enabled = true;   // low-voltage auto-start is ON after every boot
+  blockhop_auto_enabled = true;   // item 49: automatic blockhop adding is ON after every boot
   cycle_awake_until = 0;
   batt_check_armed = false;
   next_batt_check = 0;
@@ -949,6 +950,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(ron_snap_on, 0, sizeof(ron_snap_on));
   ron_snap_head = ron_snap_n = 0;
   list_pages_pending = 0;
+  list_pages_kind = 0;
   memset(temp_log, 0, sizeof(temp_log));
   memset(blockhop, 0, sizeof(blockhop));
   memset(blockname, 0, sizeof(blockname));
@@ -1170,6 +1172,28 @@ static int parseHexId(const char* s, uint8_t* key) {
     key[i / 2] = (uint8_t)((hi << 4) | lo);
   }
   return (int)(n / 2);
+}
+
+// Items 50 and 51. The neighbour table keeps SNR as dB x 4 (the radio reports it in 0.25 dB steps): "+8.25", "-2.75".
+static void fmtSnr(char* out, size_t n, int8_t snr4) {
+  int a = snr4 < 0 ? -(int)snr4 : (int)snr4;
+  snprintf(out, n, "%c%d.%02d", snr4 < 0 ? '-' : '+', a / 4, (a % 4) * 25);
+}
+
+// "45s", "5m", "2h", "3d" from a number of seconds
+static void fmtAgeSecs(char* out, size_t n, uint32_t s) {
+  if (s < 60) snprintf(out, n, "%us", (unsigned)s);
+  else if (s < 3600) snprintf(out, n, "%um", (unsigned)(s / 60));
+  else if (s < 86400) snprintf(out, n, "%uh", (unsigned)(s / 3600));
+  else snprintf(out, n, "%ud", (unsigned)(s / 86400));
+}
+
+// age of a neighbour entry. Empty string when it cannot be trusted: the clock is not set now, or was not set when the
+// advert was heard (the age would be wrong until the repeater is heard again).
+static void neighbourAgeStr(char* out, size_t n, uint32_t now, uint32_t heard) {
+  out[0] = 0;
+  if (now < CLOCK_VALID_AFTER || heard < CLOCK_VALID_AFTER || heard > now) return;
+  fmtAgeSecs(out, n, now - heard);
 }
 
 static int b64Val(char c) {
@@ -1814,6 +1838,157 @@ int MyMesh::formatBlockNameList(char* reply, int page) {   // returns the number
   return pages;
 }
 
+// ---------------------- 'snr' and 'neighbors' (items 50 and 51) ----------------------
+// Both read the neighbour table: repeaters whose adverts this node heard directly (zero hops). The SNR is the one of the
+// last advert heard from that repeater, so it can be hours old (hence the age).
+
+// item 50: "2F1E snr +8.25dB 5m", or "2F1E not heard". A short id can match several repeaters: the strongest is shown, "(+N more)".
+void MyMesh::formatSnrReply(char* reply, const char* hex) {
+  uint8_t key[3];
+  int len = parseHexId(hex, key);
+  if (len == 0) {
+    strcpy(reply, "Err - snr <id>, id is 2, 4 or 6 hex chars");
+    return;
+  }
+  char id[8];
+  for (int j = 0; j < len; j++) sprintf(&id[j * 2], "%02X", key[j]);
+  int found = 0;
+#if MAX_NEIGHBOURS
+  int best = -1;
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    const NeighbourInfo& nb = neighbours[i];
+    if (nb.heard_timestamp == 0) continue;
+    if (memcmp(nb.id.pub_key, key, len) != 0) continue;
+    found++;
+    if (best < 0 || nb.snr > neighbours[best].snr
+        || (nb.snr == neighbours[best].snr && nb.heard_timestamp > neighbours[best].heard_timestamp)) best = i;
+  }
+  if (found) {
+    const NeighbourInfo& nb = neighbours[best];
+    char snr[10], age[12], more[16];
+    fmtSnr(snr, sizeof(snr), nb.snr);
+    neighbourAgeStr(age, sizeof(age), getRTCClock()->getCurrentTime(), nb.heard_timestamp);
+    more[0] = 0;
+    if (found > 1) snprintf(more, sizeof(more), " (+%d more)", found - 1);
+    snprintf(reply, 80, "%s snr %sdB%s%s%s", id, snr, age[0] ? " " : "", age, more);
+    return;
+  }
+#endif
+  snprintf(reply, 40, "%s not heard", id);
+}
+
+// item 51: "Neighbours 12, best A3F122 +8.50dB, 7BC011 +6.00dB, 1F22A0 +4.50dB" (the three strongest)
+void MyMesh::formatNeighborSummary(char* reply) {
+  int limit = CLI_REPLY_MAX;
+  if (from_channel) {   // the repeater's name goes in front over the channel
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    limit = CHAN_MSG_MAX - prefix;
+  }
+  int count = 0;
+#if MAX_NEIGHBOURS
+  int top[3] = {-1, -1, -1};
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp == 0) continue;
+    count++;
+    int cur = i;   // insert into the top 3 (strongest first, newest first on a tie)
+    for (int k = 0; k < 3 && cur >= 0; k++) {
+      if (top[k] < 0 || neighbours[cur].snr > neighbours[top[k]].snr
+          || (neighbours[cur].snr == neighbours[top[k]].snr && neighbours[cur].heard_timestamp > neighbours[top[k]].heard_timestamp)) {
+        int t = top[k];
+        top[k] = cur;
+        cur = t;
+      }
+    }
+  }
+#endif
+  snprintf(reply, 24, "Neighbours %d", count);
+#if MAX_NEIGHBOURS
+  size_t pos = strlen(reply);
+  for (int k = 0; k < 3 && top[k] >= 0; k++) {
+    char id[8], snr[10];
+    for (int j = 0; j < 3; j++) sprintf(&id[j * 2], "%02X", neighbours[top[k]].id.pub_key[j]);
+    fmtSnr(snr, sizeof(snr), neighbours[top[k]].snr);
+    char item[40];
+    int il = snprintf(item, sizeof(item), "%s%s %sdB", k == 0 ? ", best " : ", ", id, snr);
+    if ((int)pos + il > limit) break;
+    memcpy(&reply[pos], item, il + 1);
+    pos += il;
+  }
+#endif
+}
+
+// item 51: one line per page, strongest first: "A3F122 +8.25dB 5m | 7BC011 +6.00dB 2h | ... p1/3". A page is filled as far
+// as the reply fits (at most NEIGHBOR_PER_PAGE entries); the page count is worked out the same way, so no entry is lost.
+int MyMesh::formatNeighborList(char* reply, int page) {
+#if MAX_NEIGHBOURS
+  const NeighbourInfo* sorted[MAX_NEIGHBOURS];
+  int total = 0;
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp > 0) sorted[total++] = &neighbours[i];
+  }
+  if (total == 0) {
+    strcpy(reply, "neighbors: list empty");
+    return 1;
+  }
+  std::sort(sorted, sorted + total, [](const NeighbourInfo* a, const NeighbourInfo* b) {
+    if (a->snr != b->snr) return a->snr > b->snr;   // strongest first
+    return a->heard_timestamp > b->heard_timestamp;
+  });
+  int limit = CLI_REPLY_MAX - 8;   // room for " pN/M"
+  if (from_channel) {
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    limit = CHAN_MSG_MAX - prefix - 8;
+  }
+  uint32_t now = getRTCClock()->getCurrentTime();
+  int pages = 1;
+  for (int pass = 0; pass < 2; pass++) {   // pass 0 counts the pages, pass 1 writes the wanted one
+    int cur_page = 1, in_page = 0, cur_len = 0;
+    size_t pos = 0;
+    reply[0] = 0;
+    for (int i = 0; i < total; i++) {
+      const NeighbourInfo& nb = *sorted[i];
+      char id[8], snr[10], age[12];
+      for (int j = 0; j < 3; j++) sprintf(&id[j * 2], "%02X", nb.id.pub_key[j]);
+      fmtSnr(snr, sizeof(snr), nb.snr);
+      neighbourAgeStr(age, sizeof(age), now, nb.heard_timestamp);
+      char item[40];
+      int il = snprintf(item, sizeof(item), "%s %sdB%s%s", id, snr, age[0] ? " " : "", age);
+      if (il >= (int)sizeof(item)) il = (int)sizeof(item) - 1;
+      int need = il + (in_page ? 3 : 0);   // " | " between entries
+      if (in_page >= NEIGHBOR_PER_PAGE || (in_page > 0 && cur_len + need > limit)) {
+        cur_page++;
+        in_page = 0;
+        cur_len = 0;
+        need = il;
+      }
+      if (pass == 1 && cur_page == page) {
+        if (in_page) {
+          memcpy(&reply[pos], " | ", 4);
+          pos += 3;
+        }
+        memcpy(&reply[pos], item, il + 1);
+        pos += il;
+      }
+      cur_len += need;
+      in_page++;
+    }
+    if (pass == 0) {
+      pages = cur_page;
+      if (page < 1) page = 1;
+      if (page > pages) page = pages;
+    } else if (pages > 1) {
+      snprintf(&reply[pos], 12, " p%d/%d", page, pages);
+    }
+  }
+  return pages;
+#else
+  strcpy(reply, "neighbors: list empty");
+  return 1;
+#endif
+}
+
 // true if the relay whitelist is on and this is a flood advert, or a channel message from a channel that is not allowed
 bool MyMesh::chanAllowBlocks(const mesh::Packet* packet) {
   if (!chanallow_on || !packet->isRouteFlood()) return false;
@@ -2181,13 +2356,18 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
     }
   }
   // item 46: 'reboot' and 'set tx <n>' are accepted only when addressed to this repeater by name (never to 'all')
-  bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0;
+  // item 51: the full 'neighbors list' is named-only too (every repeater sending several pages would cost too much airtime)
+  bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0
+                    || strncmp(buf, "neighbors list", 14) == 0 || strncmp(buf, "neighbours list", 15) == 0;
   bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "batttrend") == 0 || strcmp(buf, "templog") == 0
                  || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
                  || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
                  || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
                  || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
                  || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
+                 || strncmp(buf, "snr ", 4) == 0   // item 50: snr <id>
+                 || strcmp(buf, "neighbors") == 0 || strcmp(buf, "neighbors summary") == 0   // item 51 (bare = summary over the channel)
+                 || strcmp(buf, "neighbours") == 0 || strcmp(buf, "neighbours summary") == 0
                  || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
                  || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
@@ -2206,6 +2386,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   sleep_cmd_flag = false;   // startSleep() sets this if the command starts a sleep
   cmd_hops = hops;          // 'status' reports it
   list_pages_pending = 0;   // 'blockname list' sets this when it wants every page sent
+  list_pages_kind = 0;
   if (strcmp(buf, "advert") == 0) {   // flood advert: for 'all' delayed at random 2..60 s so repeaters don't all send at once,
                                       // for one repeater by name only 1..3 s (item 41)
     sendSelfAdvertisement(to_all ? getRNG()->nextInt(2000, 60001) : getRNG()->nextInt(1000, 3001), true);
@@ -2259,13 +2440,15 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
       from_channel = true;   // the page layout depends on it (room for the repeater name in front)
       for (int p = 2; p <= 1 + more_pages; p++) {
         char pg[192];
-        formatBlockNameList(pg, p);
+        if (list_pages_kind == 1) formatNeighborList(pg, p);   // item 51
+        else formatBlockNameList(pg, p);
         chanEnqueue(pg, p < 1 + more_pages ? CHAN_PAIR_GAP_MS : CHAN_GAP_MS);   // pages about 10 s apart
       }
       from_channel = false;
     }
   }
   list_pages_pending = 0;
+  list_pages_kind = 0;
   chan_gap_on = true;
   if (to_all && started_sleep) {
     // a sleep command for 'all': the furthest repeaters answer (and sleep) first, so every reply can still be
@@ -2489,11 +2672,51 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
     return true;
   }
 
+  if (memcmp(command, "snr", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {   // item 50
+    const char* arg = command + 3;
+    while (*arg == ' ') arg++;
+    formatSnrReply(reply, arg);   // no id, or a bad one: the reply says how to use it
+    return true;
+  }
+
+  {   // item 51: 'neighbors summary' and 'neighbors list [page]' (the bare CLI 'neighbors' stays the stock command)
+    int nb_len = memcmp(command, "neighbors", 9) == 0 ? 9 : (memcmp(command, "neighbours", 10) == 0 ? 10 : 0);
+    if (nb_len && (command[nb_len] == 0 || command[nb_len] == ' ')) {
+      const char* sub = command + nb_len;
+      while (*sub == ' ') sub++;
+      if (*sub == 0) {
+        if (from_channel) {
+          formatNeighborSummary(reply);   // over the channel a bare 'neighbors' is the summary
+        } else if (nb_len == 10) {
+          formatNeighborsReply(reply);    // the British spelling is not a stock command: give the stock output
+        } else {
+          return false;                   // stock 'neighbors'
+        }
+      } else if (strcmp(sub, "summary") == 0) {
+        formatNeighborSummary(reply);
+      } else if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
+        int pages = formatNeighborList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+        if (from_channel && sub[4] != ' ' && pages > 1) {   // no page number over the channel: send every page
+          list_pages_pending = (uint8_t)pages;
+          list_pages_kind = 1;
+        }
+      } else {
+        strcpy(reply, "Err - neighbors summary|list [page]");
+      }
+      return true;
+    }
+  }
+
   if (memcmp(command, "blockhop", 8) == 0 && (command[8] == 0 || command[8] == ' ')) {
     const char* sub = command + 8;
     while (*sub == ' ') sub++;
     if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
       formatBlockHopList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+    } else if (strcmp(sub, "auto on") == 0 || strcmp(sub, "auto off") == 0) {
+      blockhop_auto_enabled = (sub[6] == 'n');   // item 49
+      strcpy(reply, blockhop_auto_enabled ? "OK - blockhop auto on" : "OK - blockhop auto off");
+    } else if (strcmp(sub, "auto") == 0) {
+      strcpy(reply, blockhop_auto_enabled ? "blockhop auto on" : "blockhop auto off");
     } else if (strcmp(sub, "clear") == 0) {
       memset(blockhop, 0, sizeof(blockhop));
       strcpy(reply, "OK - blockhop cleared");
@@ -2519,7 +2742,7 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
         strcpy(reply, removed ? "OK - removed" : "Err - not in list");
       }
     } else {
-      strcpy(reply, "Err - blockhop add|remove|list|clear");
+      strcpy(reply, "Err - blockhop add|remove|list|clear|auto");
     }
     return true;
   }
