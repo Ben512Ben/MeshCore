@@ -87,6 +87,7 @@ struct NeighbourInfo {
 #define CHAN_MSG_MAX 150  // max bytes of a channel message ("name: text")
 #define MAX_BLOCKNAME 20        // names in the 'blockname' list
 #define BLOCKNAME_LEN 32        // 31 characters + terminator
+#define NEIGHBOR_PER_PAGE 6    // most entries shown by one 'neighbors list' page (item 51)
 #define BLOCKNAME_PER_PAGE 5    // most entries shown by one 'blockname list'
 #define MAX_FILTER_KEYS 4       // extra read-only channel keys ('filterchan')
 #define RON_SNAPS 25            // radio-on snapshots kept: boot + one per hourly log moment (25 = exactly 24 h span)
@@ -99,6 +100,18 @@ struct NeighbourInfo {
 #define BOT_ANS_MAX  3            // trail bot: answers waiting to be sent at once (a request is ignored when the queue is full)
 #define BOT_FIFO_MAX (BOT_ANS_MAX * BOT_Q_MAX)   // trail bot: messages waiting (3 answers of up to 4 messages)
 #define BOT_CD_MAX   8            // trail bot: people whose per-user cooldown is tracked
+#define BOT_RELAY_CMD_MAX   10    // trail bot relay: commands on the relay list ('botchan relay add')
+#define BOT_RELAY_REPLIES   10    // relay: most repeater replies kept for one relay
+#define BOT_RELAY_NAME_MAX  31    // relay: repeater name length kept (same as a node name)
+#define BOT_RELAY_TEXT_MAX  96    // relay: reply text kept per repeater (longer replies are cut)
+#define BOT_RELAY_WORD_MAX  15    // relay: command word length
+#define BOT_RELAY_ARG_MAX   20    // relay: longest argument and longest target name (longer requests are ignored)
+#define BOT_RELAY_CD_MAX    8     // relay: users / commands whose cooldown is tracked
+#define BOT_RELAY_USER_CD_MS (10UL * 60UL * 1000UL)   // one relay per person per 10 minutes
+#define BOT_RELAY_CMD_CD_MS  (2UL * 60UL * 1000UL)    // one relay per command + target per 2 minutes
+#define BOT_RELAY_ALL_MS    90000UL                   // collect replies for 90 s after a command to 'all'
+#define BOT_RELAY_NAMED_MS  20000UL                   // ... or 20 s after a command to one repeater
+#define BOT_RELAY_POST_MS   120000UL                  // give up if the command could not be posted within 2 minutes
 #define BOT_CH_BOT   0            // which channel a request came from / a reply goes to
 #define BOT_CH_TEST  1            // test channel slot i (0 to TEST_CH_MAX-1) is channel BOT_CH_TEST + i
 
@@ -137,6 +150,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   // sleep cycle + battery monitor (+ hourly battery log)
   bool cycle_active, sleep_auto_enabled;
+  bool blockhop_auto_enabled;   // item 49: automatic blockhop adding from heard adverts (RAM only, on after boot)
   unsigned long cycle_awake_until;
   bool batt_check_armed;
   unsigned long next_batt_check;
@@ -212,8 +226,46 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   BotCooldown bot_cd[BOT_CD_MAX];
   uint32_t bot_replies;
 
+  // relay ('botchan relay'): a "!<command> <target>" on the bot or a test channel is posted as "<command target>" on the command
+  // channel; the replies are collected and posted back, each with its repeater's name. One relay at a time. RAM only.
+  struct RelayCmd {
+    char word[BOT_RELAY_WORD_MAX + 1];
+    uint8_t has_arg;            // 1 = the command takes exactly one argument
+    uint8_t targets;            // 1 = 'all' only, 2 = a named repeater only, 3 = both
+  };
+  struct RelayCd {              // a cooldown: no new relay for this person / command until ready_at
+    uint16_t id;                // hash, 0 = free
+    unsigned long ready_at;
+  };
+  struct RelayEntry {
+    char name[BOT_RELAY_NAME_MAX + 1];
+    char text[BOT_RELAY_TEXT_MAX + 1];
+  };
+  RelayCmd relay_cmds[BOT_RELAY_CMD_MAX];
+  uint8_t relay_n;
+  RelayCd relay_user_cd[BOT_RELAY_CD_MAX];
+  RelayCd relay_cmd_cd[BOT_RELAY_CD_MAX];
+  bool relay_active;
+  uint8_t relay_phase;          // 0 = command waiting to be posted, 1 = collecting replies, 2 = results waiting to be queued
+  bool relay_all, relay_unsent;
+  bool relay_conflict;          // another 'get' command was on the channel at the same time (get answers do not name their setting)
+  bool relay_foreign_get;       // a 'get' command from someone else was heard ...
+  unsigned long relay_foreign_get_at;   // ... and its answers can still be arriving until this time
+  uint8_t relay_ch;             // channel the request came from (the results go back there)
+  char relay_line[BOT_RELAY_WORD_MAX + BOT_RELAY_ARG_MAX + 2];   // "ver" or "snr 2F1E"
+  char relay_target[BOT_RELAY_ARG_MAX + 1];                      // "all" or a repeater name
+  unsigned long relay_deadline;
+  uint8_t relay_count, relay_over;   // replies kept / replies beyond the ones kept
+  RelayEntry relay_ent[BOT_RELAY_REPLIES];
+  uint32_t last_post_ts;        // timestamp of the last message this node posted on the command channel
+
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
+  bool neighbor_alert_enabled;   // item 53: post 'New neighbour discovered' (RAM only, on after boot)
+  bool disc_report_on;           // item 52: a channel 'discover neighbors' is waiting to post its follow-up
+  uint8_t disc_heard, disc_new;  // item 52: answers heard / of them new neighbours, during that discover
+  unsigned long disc_report_at;  // item 52: when the follow-up is due
+  uint8_t list_pages_kind;      // which list list_pages_pending sends: 0 = blockname, 1 = neighbors (item 51)
   uint8_t list_pages_pending;   // 'blockname list' over the channel: total pages to send (0 = just the one reply) (item 38)
 
   // warnings / notices
@@ -234,6 +286,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
     char text[CHAN_MSG_MAX + 1];
     uint32_t gap_after_ms;
     bool is_report;
+    bool is_relay;     // the bot's relay command: posting it starts the reply collection window
   };
   ChanQueued chan_q[CHAN_Q_MAX];
   uint8_t chan_q_n;
@@ -273,7 +326,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   ESPNowBridge bridge;
 #endif
 
-  void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
+  bool putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);   // returns true when the repeater is a new neighbour (item 53)
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   bool handleSleepCommands(uint32_t sender_timestamp, char* command, char* reply);
   bool handleSleepCommandsInner(uint32_t sender_timestamp, char* command, char* reply);
@@ -314,7 +367,23 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool botUserBlocked(uint16_t id) const;
   void botUserDone(uint16_t id);
   void botChanCommand(const char* sub, char* reply);
+  bool chanCommandAllowed(const char* buf, bool to_all) const;   // the commands the repeaters accept over the command channel
+  int relayFind(const char* word) const;
+  bool relayCdBlocked(const RelayCd* t, uint16_t id) const;
+  void relayCdSet(RelayCd* t, uint16_t id, uint32_t ms);
+  bool relayRequest(const char* req, uint16_t who, uint8_t ch);
+  void relayCollect(const char* text);
+  void relayPosted();
+  void relayService();
+  void relayDeliver();
+  void relayCommand(const char* sub, char* reply);
   void testChanCommand(const char* sub, char* reply);
+  void chanEnqueueSoon(const char* text, bool is_relay = false);                   // items 52 and 53: an automatic message that goes out as soon as possible
+  void neighbourAlert(const mesh::Identity& id, int8_t snr4);   // item 53
+  void discoverReportService();                             // item 52: 'Discover: N heard, M new'
+  void formatSnrReply(char* reply, const char* hex);   // item 50: 'snr <id>'
+  void formatNeighborSummary(char* reply);            // item 51: 'neighbors summary'
+  int formatNeighborList(char* reply, int page);      // item 51: 'neighbors list [page]', returns the number of pages
   bool chanAllowBlocks(const mesh::Packet* packet);
   bool setChannelKey(const char* key);
   void saveChannelKey();
@@ -322,7 +391,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void queueReport();
   void formatStatus(char* reply);
   bool postChannel(const char* text);
-  void chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report = false);
+  void chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report = false, bool is_relay = false);
   void chanDropReports();
   void chanService();
   void dailyReport();
@@ -468,7 +537,7 @@ public:
   // true while timed channel work is waiting (ESP32 only): the main loop must not light-sleep for up to 30 s then
   bool needsFastLoop() const {
 #if defined(ESP32)
-    return sleep_pending || ((chan_q_n > 0 || bot_q_n > 0) && !sleeping);
+    return sleep_pending || ((chan_q_n > 0 || bot_q_n > 0 || relay_active) && !sleeping);
 #else
     return false;
 #endif

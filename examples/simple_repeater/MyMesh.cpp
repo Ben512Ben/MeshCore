@@ -25,6 +25,7 @@
 #define CRIT_WARN_MV      3300                    // 'battery critical' channel warning below this
 #define REPORT_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)  // daily report: every 24h from boot
 #define CHAN_GAP_MS       60000                   // gap between automatic channel messages
+#define DISCOVER_REPORT_MS 62000                  // item 52: the discover answers are collected for 60 s, then reported
 #define CHAN_PAIR_GAP_MS  10000                   // gap between the two daily report messages
 #define BLOCK_NOTICE_GAP_MS (60UL * 60UL * 1000UL)  // at most one auto-block notice per hour
 #define SLEEP_MSG_WAIT_MS 150000                  // sleep waits at most this long for queued channel messages
@@ -102,15 +103,17 @@
 
 #define LAZY_CONTACTS_WRITE_DELAY    5000
 
-void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
+bool MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float snr) {
 #if MAX_NEIGHBOURS // check if neighbours enabled
   // find existing neighbour, else use least recently updated
   uint32_t oldest_timestamp = 0xFFFFFFFF;
   NeighbourInfo *neighbour = &neighbours[0];
+  bool known = false;
   for (int i = 0; i < MAX_NEIGHBOURS; i++) {
     // if neighbour already known, we should update it
     if (id.matches(neighbours[i].id)) {
       neighbour = &neighbours[i];
+      known = true;
       break;
     }
 
@@ -126,7 +129,12 @@ void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float sn
   neighbour->advert_timestamp = timestamp;
   neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
   neighbour->snr = (int8_t)(snr * 4);
+  if (!known) {   // item 53: a repeater that was not in the table
+    neighbourAlert(id, neighbour->snr);
+    return true;
+  }
 #endif
+  return false;
 }
 
 uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
@@ -702,7 +710,7 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
   // blockhop auto-add: a repeater advertising a location in the northern hemisphere (we are in Brisbane)
   {
     AdvertDataParser loc_parser(app_data, app_data_len);
-    if (loc_parser.isValid() && loc_parser.getType() == ADV_TYPE_REPEATER
+    if (blockhop_auto_enabled && loc_parser.isValid() && loc_parser.getType() == ADV_TYPE_REPEATER
         && loc_parser.hasLatLon() && loc_parser.getIntLat() > 0) {
       blockHopAdd(id.pub_key, 3, true);
     }
@@ -895,7 +903,8 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
     if (id.matches(self_id)) {
       return;
     }
-    putNeighbour(id, rtc_clock.getCurrentTime(), packet->getSNR());
+    if (disc_report_on && disc_heard < 255) disc_heard++;   // item 52
+    if (putNeighbour(id, rtc_clock.getCurrentTime(), packet->getSNR()) && disc_report_on && disc_new < 255) disc_new++;
   }
 }
 
@@ -940,6 +949,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   sleep_duration_ms = 0;
   cycle_active = false;
   sleep_auto_enabled = true;   // low-voltage auto-start is ON after every boot
+  blockhop_auto_enabled = true;   // item 49: automatic blockhop adding is ON after every boot
   cycle_awake_until = 0;
   batt_check_armed = false;
   next_batt_check = 0;
@@ -954,6 +964,12 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(ron_snap_on, 0, sizeof(ron_snap_on));
   ron_snap_head = ron_snap_n = 0;
   list_pages_pending = 0;
+  list_pages_kind = 0;
+  neighbor_alert_enabled = true;   // item 53: the new-neighbour alert is ON after every boot
+  disc_report_on = false;
+  disc_heard = 0;
+  disc_new = 0;
+  disc_report_at = 0;
   memset(temp_log, 0, sizeof(temp_log));
   memset(blockhop, 0, sizeof(blockhop));
   memset(blockname, 0, sizeof(blockname));
@@ -997,6 +1013,19 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(bot_cd, 0, sizeof(bot_cd));
   bot_next_send_at = 0;
   bot_replies = 0;
+  relay_n = 0;   // relay: nothing on the list after every boot
+  memset(relay_cmds, 0, sizeof(relay_cmds));
+  memset(relay_user_cd, 0, sizeof(relay_user_cd));
+  memset(relay_cmd_cd, 0, sizeof(relay_cmd_cd));
+  relay_active = false;
+  relay_phase = 0;
+  relay_all = relay_unsent = relay_conflict = relay_foreign_get = false;
+  relay_foreign_get_at = 0;
+  relay_ch = BOT_CH_BOT;
+  relay_line[0] = relay_target[0] = 0;
+  relay_deadline = 0;
+  relay_count = relay_over = 0;
+  last_post_ts = 0;
   chan_q_n = 0;
   chan_enq_count = 0;
   reboot_pending = false;
@@ -1193,6 +1222,28 @@ static int parseHexId(const char* s, uint8_t* key) {
     key[i / 2] = (uint8_t)((hi << 4) | lo);
   }
   return (int)(n / 2);
+}
+
+// Items 50 and 51. The neighbour table keeps SNR as dB x 4 (the radio reports it in 0.25 dB steps): "+8.25", "-2.75".
+static void fmtSnr(char* out, size_t n, int8_t snr4) {
+  int a = snr4 < 0 ? -(int)snr4 : (int)snr4;
+  snprintf(out, n, "%c%d.%02d", snr4 < 0 ? '-' : '+', a / 4, (a % 4) * 25);
+}
+
+// "45s", "5m", "2h", "3d" from a number of seconds
+static void fmtAgeSecs(char* out, size_t n, uint32_t s) {
+  if (s < 60) snprintf(out, n, "%us", (unsigned)s);
+  else if (s < 3600) snprintf(out, n, "%um", (unsigned)(s / 60));
+  else if (s < 86400) snprintf(out, n, "%uh", (unsigned)(s / 3600));
+  else snprintf(out, n, "%ud", (unsigned)(s / 86400));
+}
+
+// age of a neighbour entry. Empty string when it cannot be trusted: the clock is not set now, or was not set when the
+// advert was heard (the age would be wrong until the repeater is heard again).
+static void neighbourAgeStr(char* out, size_t n, uint32_t now, uint32_t heard) {
+  out[0] = 0;
+  if (now < CLOCK_VALID_AFTER || heard < CLOCK_VALID_AFTER || heard > now) return;
+  fmtAgeSecs(out, n, now - heard);
 }
 
 static int b64Val(char c) {
@@ -1838,6 +1889,195 @@ int MyMesh::formatBlockNameList(char* reply, int page) {   // returns the number
   return pages;
 }
 
+// ---------------------- discover and new-neighbour alert (items 52 and 53) ----------------------
+
+// An automatic message that goes out as soon as possible: 1 to 3 seconds when nothing is queued (even inside the gap that
+// follows an earlier automatic message), otherwise right behind what is queued (10 s after the message before it).
+// A burst of them goes out 10 s apart. A full queue drops the message.
+void MyMesh::chanEnqueueSoon(const char* text, bool is_relay) {
+  if (!chan_key_set || chan_q_n >= CHAN_Q_MAX) return;
+  bool idle = (chan_q_n == 0);
+  if (!idle && chan_q[chan_q_n - 1].gap_after_ms > CHAN_PAIR_GAP_MS) chan_q[chan_q_n - 1].gap_after_ms = CHAN_PAIR_GAP_MS;
+  chanEnqueue(text, CHAN_PAIR_GAP_MS, false, is_relay);
+  if (idle) {
+    unsigned long at = futureMillis(getRNG()->nextInt(1000, 3001));
+    if (!chan_gap_on || (long)(at - chan_next_send_at) < 0) chan_next_send_at = at;
+    chan_gap_on = true;
+  }
+}
+
+// item 53: "New neighbour discovered: 2F1E77 SNR +3.75dB". One message per new neighbour, no batching.
+void MyMesh::neighbourAlert(const mesh::Identity& id, int8_t snr4) {
+  if (!neighbor_alert_enabled || !chan_key_set) return;
+  char idh[8], snr[10];
+  for (int j = 0; j < 3; j++) sprintf(&idh[j * 2], "%02X", id.pub_key[j]);
+  fmtSnr(snr, sizeof(snr), snr4);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "New neighbour discovered: %s SNR %sdB", idh, snr);
+  chanEnqueueSoon(msg);
+}
+
+// item 52: about a minute after a channel 'discover neighbors', post how many repeaters answered and how many were new
+void MyMesh::discoverReportService() {
+  if (!disc_report_on || !millisHasNowPassed(disc_report_at)) return;
+  disc_report_on = false;
+  if (sleeping) return;   // the radio went off before the answers were in: nothing useful to report
+  char msg[40];
+  snprintf(msg, sizeof(msg), "Discover: %u heard, %u new", (unsigned)disc_heard, (unsigned)disc_new);
+  chanEnqueueSoon(msg);
+}
+
+// ---------------------- 'snr' and 'neighbors' (items 50 and 51) ----------------------
+// Both read the neighbour table: repeaters whose adverts this node heard directly (zero hops). The SNR is the one of the
+// last advert heard from that repeater, so it can be hours old (hence the age).
+
+// item 50: "2F1E SNR +8.25dB | Last heard 5m ago" (no age while the clock is unset), or "2F1E not heard". A short id can match several repeaters: the strongest is shown, "(+N more)".
+void MyMesh::formatSnrReply(char* reply, const char* hex) {
+  uint8_t key[3];
+  int len = parseHexId(hex, key);
+  if (len == 0) {
+    strcpy(reply, "Err - snr <id>, id is 2, 4 or 6 hex chars");
+    return;
+  }
+  char id[8];
+  for (int j = 0; j < len; j++) sprintf(&id[j * 2], "%02X", key[j]);
+  int found = 0;
+#if MAX_NEIGHBOURS
+  int best = -1;
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    const NeighbourInfo& nb = neighbours[i];
+    if (nb.heard_timestamp == 0) continue;
+    if (memcmp(nb.id.pub_key, key, len) != 0) continue;
+    found++;
+    if (best < 0 || nb.snr > neighbours[best].snr
+        || (nb.snr == neighbours[best].snr && nb.heard_timestamp > neighbours[best].heard_timestamp)) best = i;
+  }
+  if (found) {
+    const NeighbourInfo& nb = neighbours[best];
+    char snr[10], age[12], more[16];
+    fmtSnr(snr, sizeof(snr), nb.snr);
+    neighbourAgeStr(age, sizeof(age), getRTCClock()->getCurrentTime(), nb.heard_timestamp);
+    more[0] = 0;
+    if (found > 1) snprintf(more, sizeof(more), " (+%d more)", found - 1);
+    snprintf(reply, 100, "%s SNR %sdB%s%s%s%s", id, snr, age[0] ? " | Last heard " : "", age, age[0] ? " ago" : "", more);
+    return;
+  }
+#endif
+  snprintf(reply, 40, "%s not heard", id);
+}
+
+// item 51: "Neighbours 12, best A3F122 +8.50dB, 7BC011 +6.00dB, 1F22A0 +4.50dB" (the three strongest)
+void MyMesh::formatNeighborSummary(char* reply) {
+  int limit = CLI_REPLY_MAX;
+  if (from_channel) {   // the repeater's name goes in front over the channel
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    limit = CHAN_MSG_MAX - prefix;
+  }
+  int count = 0;
+#if MAX_NEIGHBOURS
+  int top[3] = {-1, -1, -1};
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp == 0) continue;
+    count++;
+    int cur = i;   // insert into the top 3 (strongest first, newest first on a tie)
+    for (int k = 0; k < 3 && cur >= 0; k++) {
+      if (top[k] < 0 || neighbours[cur].snr > neighbours[top[k]].snr
+          || (neighbours[cur].snr == neighbours[top[k]].snr && neighbours[cur].heard_timestamp > neighbours[top[k]].heard_timestamp)) {
+        int t = top[k];
+        top[k] = cur;
+        cur = t;
+      }
+    }
+  }
+#endif
+  snprintf(reply, 24, "Neighbours %d", count);
+#if MAX_NEIGHBOURS
+  size_t pos = strlen(reply);
+  for (int k = 0; k < 3 && top[k] >= 0; k++) {
+    char id[8], snr[10];
+    for (int j = 0; j < 3; j++) sprintf(&id[j * 2], "%02X", neighbours[top[k]].id.pub_key[j]);
+    fmtSnr(snr, sizeof(snr), neighbours[top[k]].snr);
+    char item[40];
+    int il = snprintf(item, sizeof(item), "%s%s %sdB", k == 0 ? ", best " : ", ", id, snr);
+    if ((int)pos + il > limit) break;
+    memcpy(&reply[pos], item, il + 1);
+    pos += il;
+  }
+#endif
+}
+
+// item 51: one line per page, strongest first: "A3F122 +8.25dB 5m | 7BC011 +6.00dB 2h | ... p1/3". A page is filled as far
+// as the reply fits (at most NEIGHBOR_PER_PAGE entries); the page count is worked out the same way, so no entry is lost.
+int MyMesh::formatNeighborList(char* reply, int page) {
+#if MAX_NEIGHBOURS
+  const NeighbourInfo* sorted[MAX_NEIGHBOURS];
+  int total = 0;
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp > 0) sorted[total++] = &neighbours[i];
+  }
+  if (total == 0) {
+    strcpy(reply, "neighbors: list empty");
+    return 1;
+  }
+  std::sort(sorted, sorted + total, [](const NeighbourInfo* a, const NeighbourInfo* b) {
+    if (a->snr != b->snr) return a->snr > b->snr;   // strongest first
+    return a->heard_timestamp > b->heard_timestamp;
+  });
+  int limit = CLI_REPLY_MAX - 8;   // room for " pN/M"
+  if (from_channel) {
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    limit = CHAN_MSG_MAX - prefix - 8;
+  }
+  uint32_t now = getRTCClock()->getCurrentTime();
+  int pages = 1;
+  for (int pass = 0; pass < 2; pass++) {   // pass 0 counts the pages, pass 1 writes the wanted one
+    int cur_page = 1, in_page = 0, cur_len = 0;
+    size_t pos = 0;
+    reply[0] = 0;
+    for (int i = 0; i < total; i++) {
+      const NeighbourInfo& nb = *sorted[i];
+      char id[8], snr[10], age[12];
+      for (int j = 0; j < 3; j++) sprintf(&id[j * 2], "%02X", nb.id.pub_key[j]);
+      fmtSnr(snr, sizeof(snr), nb.snr);
+      neighbourAgeStr(age, sizeof(age), now, nb.heard_timestamp);
+      char item[40];
+      int il = snprintf(item, sizeof(item), "%s %sdB%s%s", id, snr, age[0] ? " " : "", age);
+      if (il >= (int)sizeof(item)) il = (int)sizeof(item) - 1;
+      int need = il + (in_page ? 3 : 0);   // " | " between entries
+      if (in_page >= NEIGHBOR_PER_PAGE || (in_page > 0 && cur_len + need > limit)) {
+        cur_page++;
+        in_page = 0;
+        cur_len = 0;
+        need = il;
+      }
+      if (pass == 1 && cur_page == page) {
+        if (in_page) {
+          memcpy(&reply[pos], " | ", 4);
+          pos += 3;
+        }
+        memcpy(&reply[pos], item, il + 1);
+        pos += il;
+      }
+      cur_len += need;
+      in_page++;
+    }
+    if (pass == 0) {
+      pages = cur_page;
+      if (page < 1) page = 1;
+      if (page > pages) page = pages;
+    } else if (pages > 1) {
+      snprintf(&reply[pos], 12, " p%d/%d", page, pages);
+    }
+  }
+  return pages;
+#else
+  strcpy(reply, "neighbors: list empty");
+  return 1;
+#endif
+}
+
 // true if the relay whitelist is on and this is a flood advert, or a channel message from a channel that is not allowed
 bool MyMesh::chanAllowBlocks(const mesh::Packet* packet) {
   if (!chanallow_on || !packet->isRouteFlood()) return false;
@@ -1926,6 +2166,7 @@ bool MyMesh::postChannel(const char* text) {
   if (!chan_key_set) return false;
   uint8_t temp[5 + CHAN_MSG_MAX + 40];
   uint32_t ts = getRTCClock()->getCurrentTime();
+  last_post_ts = ts;   // (trail bot relay: see relayPosted)
   memcpy(temp, &ts, 4);
   temp[4] = 0;   // TXT_TYPE_PLAIN
   int prefix_len = snprintf((char*)&temp[5], 40, "%s: ", _prefs.node_name);   // <sender>: <msg>
@@ -1940,7 +2181,7 @@ bool MyMesh::postChannel(const char* text) {
   return true;
 }
 
-void MyMesh::chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report) {
+void MyMesh::chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report, bool is_relay) {
   if (!chan_key_set) return;            // no key: skipped silently, never retried
   if (chan_q_n >= CHAN_Q_MAX) return;   // queue full: drop
   ChanQueued& q = chan_q[chan_q_n++];
@@ -1948,6 +2189,7 @@ void MyMesh::chanEnqueue(const char* text, uint32_t gap_after_ms, bool is_report
   q.text[CHAN_MSG_MAX] = 0;
   q.gap_after_ms = gap_after_ms;
   q.is_report = is_report;
+  q.is_relay = is_relay;
   chan_enq_count++;   // item 44: lets the caller see whether a command queued a reply
 }
 
@@ -1973,6 +2215,7 @@ void MyMesh::chanService() {   // post queued channel messages, one at a time, o
   for (int i = 1; i < chan_q_n; i++) chan_q[i - 1] = chan_q[i];
   chan_q_n--;
   postChannel(q.text);
+  if (q.is_relay) relayPosted();   // trail bot relay: the reply collection window starts now
   chan_gap_on = true;
   chan_next_send_at = futureMillis(q.gap_after_ms);
 }
@@ -2064,6 +2307,12 @@ void MyMesh::formatStatus(char* reply) {
     char tb[16];
     snprintf(tb, sizeof(tb), ", test %s x%d", test_on ? "on" : "off", tcount);
     strcat(reply, tb);
+  }
+  sl = (int)strlen(reply);
+  if ((bot_key_set || tcount > 0) && sl < CLI_REPLY_MAX - 12) {   // trail bot relay: how many commands are on the relay list
+    char rb[16];
+    snprintf(rb, sizeof(rb), ", relay %d", (int)relay_n);
+    strcat(reply, rb);
   }
 }
 
@@ -2242,10 +2491,12 @@ void MyMesh::loadTestKeys() {
 void MyMesh::botQueueClear() {
   bot_q_n = 0;
   bot_ans_n = 0;
+  relay_active = false;   // a relay in progress is dropped too (the radio is going to sleep)
 }
 
 // drop the waiting answers of channels ch_lo to ch_hi (switched off or key cleared); the other channels' answers stay
 void MyMesh::botQueueDropChannel(uint8_t ch_lo, uint8_t ch_hi) {
+  if (relay_active && relay_ch >= ch_lo && relay_ch <= ch_hi) relay_active = false;   // its results had nowhere to go
   int src = 0, dst = 0, dst_ans = 0;
   for (int a = 0; a < bot_ans_n; a++) {
     int len = bot_ans_len[a];
@@ -2330,6 +2581,7 @@ void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi, u
   chatCleanName(text, slen, nm);
   uint16_t who = chatHash(nm, (int)strlen(nm));                     // the same id the bot's memory of people uses
   if (botUserBlocked(who)) return;                                  // this person: one answer per 10 s at most
+  if (relayRequest(body + 1, who, ch)) return;                      // a relay command ("!ver all"): posted on the command channel, answered later
   HikeCtx hc;
   hc.sender = text;                                                 // the sender's name is the text before the ": "
   hc.slen = slen;
@@ -2402,6 +2654,550 @@ void MyMesh::botService() {   // post the queued bot messages, one at a time, on
   }
 }
 
+// ---------------------- command relay ('botchan relay') ----------------------
+// RELAY-BEGIN
+// The commands the repeaters accept over the command channel (what handleChannelCommand runs). `buf` is the command without
+// its target, `to_all` = it was addressed to 'all'. The relay uses this too, so a command can only be put on the relay list
+// if the repeaters would really run it.
+bool MyMesh::chanCommandAllowed(const char* buf, bool to_all) const {
+  bool timed_sleep = (strncmp(buf, "sleep until ", 12) == 0) || (strncmp(buf, "sleep ", 6) == 0 && buf[6] >= '0' && buf[6] <= '9');
+  bool secret_get = false;   // never hand out the private key or passwords over the channel
+  if (strncmp(buf, "get ", 4) == 0) {
+    for (const char* p = buf + 4; *p; p++) {
+      if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
+    }
+  }
+  // item 46: 'reboot' and 'set tx <n>' are accepted only when addressed to this repeater by name (never to 'all')
+  // item 51: the full 'neighbors list' is named-only too (every repeater sending several pages would cost too much airtime)
+  bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0
+                    || strncmp(buf, "neighbors list", 14) == 0 || strncmp(buf, "neighbours list", 15) == 0
+                    || strcmp(buf, "discover neighbors") == 0 || strcmp(buf, "discover neighbours") == 0   // item 52 (named only: every
+                    || strcmp(buf, "discover.neighbors") == 0;                                           // repeater transmitting at once would collide)
+  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "batttrend") == 0 || strcmp(buf, "templog") == 0
+                 || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
+                 || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
+                 || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
+                 || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
+                 || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
+                 || strncmp(buf, "snr ", 4) == 0   // item 50: snr <id>
+                 || strcmp(buf, "neighbors") == 0 || strcmp(buf, "neighbors summary") == 0   // item 51 (bare = summary over the channel)
+                 || strcmp(buf, "neighbours") == 0 || strcmp(buf, "neighbours summary") == 0
+                 || strncmp(buf, "neighbors alert", 15) == 0 || strncmp(buf, "neighbours alert", 16) == 0   // item 53
+                 || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
+                 || strcmp(buf, "botchan") == 0 || strncmp(buf, "botchan ", 8) == 0   // trail bot: get / set / clear / on / off / say / relay
+                 || strcmp(buf, "testchan") == 0 || strncmp(buf, "testchan ", 9) == 0   // #test channel: get / set / clear / on / off / say
+                 || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
+                 || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
+                 || strncmp(buf, "filterchan clear", 16) == 0
+                 || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
+                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0
+                 || (named_only && !to_all);   // item 46
+  return allowed;
+}
+
+static bool relayWordChar(char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.'; }
+static bool relayTextChar(char c) {   // arguments and target names: letters, digits, . _ -
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+}
+
+// Commands that can never go on the relay list, whatever the repeaters would accept: they change something, or make every
+// repeater transmit. ('neighbors' with an argument could become 'neighbors list'; a 'get' of a key or password is refused
+// by chanCommandAllowed.)
+static bool relayDenied(const char* w, bool has_arg) {
+  static const char* const deny[] = {"reboot", "set", "sleep", "advert", "discover", "discover.neighbors", "botchan", "testchan",
+                                     "blockhop", "blockname", "chanallow", "filterchan"};
+  for (size_t i = 0; i < sizeof(deny) / sizeof(deny[0]); i++) {
+    if (strcmp(w, deny[i]) == 0) return true;
+  }
+  if (has_arg && (strcmp(w, "neighbors") == 0 || strcmp(w, "neighbours") == 0)) return true;
+  return false;
+}
+
+// copy up to cap bytes of src, never cutting a multi-byte character in half
+static void relayCopyCut(char* dst, int cap, const char* src, int srclen) {
+  int n = srclen < cap ? srclen : cap;
+  while (n > 0 && n < srclen && (((unsigned char)src[n]) & 0xC0) == 0x80) n--;
+  memcpy(dst, src, n);
+  dst[n] = 0;
+}
+
+static bool relayNameEq(const char* a, int alen, const char* b) {   // case-insensitive, whole name
+  if ((int)strlen(b) != alen) return false;
+  for (int i = 0; i < alen; i++) {
+    if (lowerc(a[i]) != lowerc(b[i])) return false;
+  }
+  return true;
+}
+
+// Strict reply checks. Every command that can be relayed has an exact check of what its answer looks like, so nothing else heard on
+// the command channel (an automatic message, another command's answer, a person typing) is taken for an answer. A command with
+// no check here cannot be put on the relay list. (These do not prove who sent a reply: anyone with the channel key can type one.)
+static bool relayStarts(const char* b, const char* pre) { return strncmp(b, pre, strlen(pre)) == 0; }
+static bool relayDigit(char c) { return c >= '0' && c <= '9'; }
+
+static bool relayClockShape(const char* b) {   // "HH:MM - D/M/YYYY UTC"
+  if (!(relayDigit(b[0]) && relayDigit(b[1]) && b[2] == ':' && relayDigit(b[3]) && relayDigit(b[4]))) return false;
+  if (strncmp(b + 5, " - ", 3) != 0) return false;
+  const char* p = b + 8;
+  int slashes = 0, digits = 0;
+  while (*p && *p != ' ') {
+    if (*p == '/') slashes++;
+    else if (relayDigit(*p)) digits++;
+    else return false;
+    p++;
+  }
+  return slashes == 2 && digits >= 3 && strcmp(p, " UTC") == 0;
+}
+
+static bool relayShapeKnown(const char* w) {
+  static const char* const known[] = {"ver", "status", "report", "battlog", "battpct", "batttrend", "templog", "clock",
+                                      "stats-core", "stats-radio", "stats-packets", "get", "snr", "neighbors", "neighbours"};
+  for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+    if (strcmp(w, known[i]) == 0) return true;
+  }
+  return false;
+}
+
+// Does `body` look exactly like the answer to command `w` (with argument `arg`, if it has one)?
+static bool relayShapeOk(const char* w, const char* arg, const char* b) {
+  size_t bl = strlen(b);
+  if (bl == 0) return false;
+  if (strcmp(w, "ver") == 0) return strstr(b, " (Build: ") != NULL && b[bl - 1] == ')';          // "<firmware> (Build: <date>)"
+  if (strcmp(w, "status") == 0) return relayStarts(b, "Bat ") && strstr(b, ", up ") != NULL;       // "Bat 4.05V 80%, 21.5C, on 12%, ... up 3d"
+  if (strcmp(w, "report") == 0) return relayStarts(b, "Battery ") && relayDigit(b[8]);            // "Battery 80%, steady over 24h ..."
+  if (strcmp(w, "battlog") == 0) return relayStarts(b, "V/h old>new:") || relayStarts(b, "battlog: no data");
+  if (strcmp(w, "battpct") == 0) return relayStarts(b, "%/h old>new:") || relayStarts(b, "battpct: no data");
+  if (strcmp(w, "batttrend") == 0)
+    return relayStarts(b, "Battery steady (") || relayStarts(b, "Battery up ") || relayStarts(b, "Battery down ") || relayStarts(b, "batttrend: needs");
+  if (strcmp(w, "templog") == 0) return relayStarts(b, "C/h old>new:") || relayStarts(b, "templog: no data");
+  if (strcmp(w, "clock") == 0) return relayClockShape(b);
+  if (strcmp(w, "stats-core") == 0) return relayStarts(b, "{\"battery_mv\":");
+  if (strcmp(w, "stats-radio") == 0) return relayStarts(b, "{\"noise_floor\":");
+  if (strcmp(w, "stats-packets") == 0) return relayStarts(b, "{\"recv\":");
+  if (strcmp(w, "get") == 0) return relayStarts(b, "> ");                                          // every successful 'get' answer
+  if (strcmp(w, "neighbors") == 0 || strcmp(w, "neighbours") == 0) return relayStarts(b, "Neighbours ") && relayDigit(b[11]);
+  if (strcmp(w, "snr") == 0) {   // "<id> SNR +8.25dB | Last heard 5m ago" or "<id> not heard": it must repeat the id that was asked
+    size_t al = strlen(arg);
+    if (al == 0 || bl < al) return false;
+    for (size_t i = 0; i < al; i++) {
+      if (lowerc(b[i]) != lowerc(arg[i])) return false;
+    }
+    return relayStarts(b + al, " SNR ") || strcmp(b + al, " not heard") == 0;
+  }
+  return false;
+}
+
+int MyMesh::relayFind(const char* word) const {
+  for (int i = 0; i < relay_n; i++) {
+    if (strcmp(relay_cmds[i].word, word) == 0) return i;
+  }
+  return -1;
+}
+
+bool MyMesh::relayCdBlocked(const RelayCd* t, uint16_t id) const {
+  for (int i = 0; i < BOT_RELAY_CD_MAX; i++) {
+    if (t[i].id == id && !millisHasNowPassed(t[i].ready_at)) return true;
+  }
+  return false;
+}
+
+void MyMesh::relayCdSet(RelayCd* t, uint16_t id, uint32_t ms) {
+  int pick = -1;
+  for (int i = 0; i < BOT_RELAY_CD_MAX; i++) {
+    if (t[i].id == id) { pick = i; break; }
+  }
+  if (pick < 0) {
+    for (int i = 0; i < BOT_RELAY_CD_MAX; i++) {   // a free or expired entry
+      if (t[i].id == 0 || millisHasNowPassed(t[i].ready_at)) { pick = i; break; }
+    }
+  }
+  if (pick < 0) {   // all in use: replace the one that ends first
+    pick = 0;
+    for (int i = 1; i < BOT_RELAY_CD_MAX; i++) {
+      if ((long)(t[i].ready_at - t[pick].ready_at) < 0) pick = i;
+    }
+  }
+  t[pick].id = id;
+  t[pick].ready_at = futureMillis(ms);
+}
+
+// "!ver all", "!ver Tuna", "!snr 2F1E all" heard on the bot channel or a test channel (req = the text after the '!').
+// Returns false when the first word is not on the relay list (the normal bot handles the message). Returns true when it is:
+// then every refusal is silent (busy, cooldown, clock not set, bad characters, a target the command is not set up for ...).
+bool MyMesh::relayRequest(const char* req, uint16_t who, uint8_t ch) {
+  if (relay_n == 0) return false;
+  while (*req == ' ') req++;
+  char word[BOT_RELAY_WORD_MAX + 1];
+  int wl = 0;
+  while (req[wl] && req[wl] != ' ') {
+    if (wl >= BOT_RELAY_WORD_MAX) return false;
+    word[wl] = (char)lowerc(req[wl]);
+    wl++;
+  }
+  word[wl] = 0;
+  int idx = relayFind(word);
+  if (idx < 0) return false;
+  const RelayCmd rc = relay_cmds[idx];
+  const char* p = req + wl;
+  while (*p == ' ') p++;
+
+  if (relay_active) return true;                                              // one relay at a time
+  if (getRTCClock()->getCurrentTime() < CLOCK_VALID_AFTER) return true;       // a wrong clock here would be copied by the repeaters
+  if (!chan_key_set || chan_q_n >= CHAN_Q_MAX - 1 || bot_ans_n >= BOT_ANS_MAX) return true;   // (room for the command and a possible report)
+
+  char arg[BOT_RELAY_ARG_MAX + 1];
+  arg[0] = 0;
+  if (rc.has_arg) {
+    int al = 0;
+    while (p[al] && p[al] != ' ') {
+      if (al >= BOT_RELAY_ARG_MAX || !relayTextChar(p[al])) return true;
+      arg[al] = p[al];
+      al++;
+    }
+    if (al == 0) return true;
+    arg[al] = 0;
+    p += al;
+    while (*p == ' ') p++;
+  }
+  char target[BOT_RELAY_ARG_MAX + 1];
+  int tl = (int)strlen(p);
+  while (tl > 0 && p[tl - 1] == ' ') tl--;
+  if (tl == 0 || tl > BOT_RELAY_ARG_MAX) return true;
+  for (int i = 0; i < tl; i++) {
+    if (!relayTextChar(p[i]) && p[i] != ' ') return true;
+    target[i] = p[i];
+  }
+  target[tl] = 0;
+  bool is_all = tl == 3 && lowerc(target[0]) == 'a' && lowerc(target[1]) == 'l' && lowerc(target[2]) == 'l';
+  if (!(rc.targets & (is_all ? 1 : 2))) return true;
+
+  char line[BOT_RELAY_WORD_MAX + BOT_RELAY_ARG_MAX + 2];
+  if (rc.has_arg) snprintf(line, sizeof(line), "%s %s", word, arg);
+  else snprintf(line, sizeof(line), "%s", word);
+  if (relayDenied(word, rc.has_arg != 0)) return true;
+  if (!chanCommandAllowed(line, is_all)) return true;   // double check: the repeaters must accept exactly this
+
+  char key[BOT_RELAY_WORD_MAX + 2 * BOT_RELAY_ARG_MAX + 4];   // cooldown per command + argument + target
+  int kl = snprintf(key, sizeof(key), "%s|%s", line, target);
+  for (int i = 0; i < kl; i++) key[i] = (char)lowerc(key[i]);
+  uint16_t ck = chatHash(key, kl);
+  if (ck == 0) ck = 1;
+  if (who == 0) who = 1;
+  if (relayCdBlocked(relay_user_cd, who) || relayCdBlocked(relay_cmd_cd, ck)) return true;
+
+  bool is_self = !is_all && relayNameEq(target, (int)strlen(target), _prefs.node_name);
+  char lr[192];
+  lr[0] = 0;
+  if (is_all || is_self) {   // this repeater answers for itself: it cannot hear its own post
+    char lc[BOT_RELAY_WORD_MAX + BOT_RELAY_ARG_MAX + 2];
+    strcpy(lc, line);
+    from_channel = true;
+    cmd_hops = -1;
+    handleCommand(0, lc, lr);
+    from_channel = false;
+    list_pages_pending = 0;
+    list_pages_kind = 0;
+    // The local answer is also the test of the request: if it is not what this command should answer (a bad snr id, an
+    // unknown 'get' name ...) nobody would answer correctly, so nothing is sent. ('report' answers by posting, lr stays empty.)
+    if (lr[0] != 0 && !relayShapeOk(word, arg, lr)) return true;
+  }
+  relayCdSet(relay_user_cd, who, BOT_RELAY_USER_CD_MS);
+  relayCdSet(relay_cmd_cd, ck, BOT_RELAY_CMD_CD_MS);
+
+  relay_count = 0;
+  relay_over = 0;
+  relay_unsent = false;
+  relay_conflict = false;
+  relay_all = is_all;
+  relay_ch = ch;
+  strcpy(relay_line, line);
+  strcpy(relay_target, target);
+  if (lr[0] != 0) {
+    RelayEntry& e = relay_ent[relay_count++];
+    relayCopyCut(e.name, BOT_RELAY_NAME_MAX, _prefs.node_name, (int)strlen(_prefs.node_name));
+    relayCopyCut(e.text, BOT_RELAY_TEXT_MAX, lr, (int)strlen(lr));
+  }
+  relay_active = true;
+  if (is_self) {   // nothing to ask: the answer goes out as soon as the queue has room
+    relay_phase = 2;
+    relay_deadline = futureMillis(60000);
+    return true;
+  }
+
+  // acknowledgement on the channel the request came from: 1 to 3 s from now (one bot, so nothing to spread out)
+  if (is_all) snprintf(bot_q[bot_q_n], BOT_MSG_MAX + 1, "Asking all repeaters (%s), ~%d s...", line, (int)(BOT_RELAY_ALL_MS / 1000));
+  else snprintf(bot_q[bot_q_n], BOT_MSG_MAX + 1, "Asking %s (%s), ~%d s...", target, line, (int)(BOT_RELAY_NAMED_MS / 1000));
+  bool was_empty = bot_q_n == 0;
+  bool gap_over = millisHasNowPassed(bot_next_send_at);
+  botCommit(ch, who, 1, false);
+  if (was_empty && gap_over) bot_next_send_at = futureMillis(getRNG()->nextInt(1000, 3001));
+
+  relay_phase = 0;   // the collection window starts when the command is really on the air (relayPosted)
+  relay_deadline = futureMillis(BOT_RELAY_POST_MS);
+  char cmd[CHAN_MSG_MAX + 1];
+  snprintf(cmd, sizeof(cmd), "<%s %s>", line, target);
+  chanEnqueueSoon(cmd, true);
+  return true;
+}
+
+// called by chanService() the moment the relay command has been posted on the command channel
+void MyMesh::relayPosted() {
+  if (!relay_active || relay_phase != 0) return;
+  relay_phase = 1;
+  relay_deadline = futureMillis(relay_all ? BOT_RELAY_ALL_MS : BOT_RELAY_NAMED_MS);
+  // 'get' answers do not say which setting they are for: a different 'get' sent by someone else shortly before ours could still be
+  // being answered (the repeaters spread their answers over up to a minute)
+  if (relay_foreign_get && relayStarts(relay_line, "get ") && !millisHasNowPassed(relay_foreign_get_at)) relay_conflict = true;
+  // the repeaters ignore a command that is not newer than the last one they ran; the echo of our own post must not run here either
+  if (last_post_ts > last_cmd_ts) last_cmd_ts = last_post_ts;
+}
+
+// a message heard on the command channel: "<repeater name>: <reply>" while a relay collects
+void MyMesh::relayCollect(const char* text) {
+  const char* body = strstr(text, ": ");
+  if (body == NULL) return;
+  int nlen = (int)(body - text);
+  body += 2;
+  while (*body == ' ') body++;
+  if (nlen <= 0 || *body == 0) return;
+  if (*body == '<') {   // somebody's command (not an answer). A different 'get' than ours makes 'get' answers ambiguous: note it.
+    if (relayStarts(body, "<get ")) {
+      relay_foreign_get = true;
+      relay_foreign_get_at = futureMillis(70000);   // its answers can still be arriving for about a minute
+      if (relay_active && relay_phase < 2 && relayStarts(relay_line, "get ")) {
+        char ours[BOT_RELAY_WORD_MAX + 2 * BOT_RELAY_ARG_MAX + 6];
+        int ol = snprintf(ours, sizeof(ours), "<%s %s>", relay_line, relay_target);
+        bool same = (int)strlen(body) == ol;
+        for (int i = 0; same && i < ol; i++) same = lowerc(body[i]) == lowerc(ours[i]);
+        if (!same) relay_conflict = true;
+      }
+    }
+    return;
+  }
+  if (!relay_active || relay_phase != 1) return;
+  char word[BOT_RELAY_WORD_MAX + 1];
+  int wl = 0;
+  while (relay_line[wl] && relay_line[wl] != ' ' && wl < BOT_RELAY_WORD_MAX) { word[wl] = relay_line[wl]; wl++; }
+  word[wl] = 0;
+  const char* arg = relay_line[wl] == ' ' ? &relay_line[wl + 1] : "";
+  if (!relay_all && !relayNameEq(text, nlen, relay_target)) return;   // a named relay only wants that repeater
+  if (!relayShapeOk(word, arg, body)) return;
+  for (int i = 0; i < relay_count; i++) {   // one answer per repeater
+    if (relayNameEq(text, nlen, relay_ent[i].name)) return;
+  }
+  if (relay_count >= BOT_RELAY_REPLIES) {
+    if (relay_over < 255) relay_over++;
+    return;
+  }
+  RelayEntry& e = relay_ent[relay_count++];
+  relayCopyCut(e.name, BOT_RELAY_NAME_MAX, text, nlen);
+  relayCopyCut(e.text, BOT_RELAY_TEXT_MAX, body, (int)strlen(body));
+  if (!relay_all) {   // the one repeater asked has answered: no need to wait for the rest of the window
+    relay_phase = 2;
+    relay_deadline = futureMillis(60000);
+  }
+}
+
+void MyMesh::relayService() {
+  if (!relay_active) return;
+  if (relay_phase < 2) {
+    if (!millisHasNowPassed(relay_deadline)) return;
+    if (relay_phase == 0) relay_unsent = true;   // the command never got out
+    relay_phase = 2;
+    relay_deadline = futureMillis(60000);
+  }
+  bool ch_ok = relay_ch == BOT_CH_BOT ? (bot_key_set && bot_on)
+                                      : (test_on && (int)relay_ch - BOT_CH_TEST < TEST_CH_MAX && test_slot_set[(int)relay_ch - BOT_CH_TEST]);
+  if (!ch_ok) {   // the channel was switched off while we waited
+    relay_active = false;
+    return;
+  }
+  if (bot_ans_n >= BOT_ANS_MAX) {   // queue full: try again shortly, give up after a minute
+    if (millisHasNowPassed(relay_deadline)) relay_active = false;
+    return;
+  }
+  relayDeliver();
+  relay_active = false;
+}
+
+// Write the results into the bot queue: "<repeater>: <reply>" entries joined with " | ", as many to a message as fit, at most
+// BOT_Q_MAX messages, then "(N replied)" for a relay to 'all'. A named repeater that did not answer gives "<name>: no reply".
+void MyMesh::relayDeliver() {
+  int prefix = (int)strlen(_prefs.node_name) + 2;
+  if (prefix > 39) prefix = 39;
+  const int budget = BOT_MSG_MAX - prefix;
+  char (*out)[BOT_MSG_MAX + 1] = bot_q + bot_q_n;   // there is always room for BOT_Q_MAX messages while fewer than BOT_ANS_MAX answers wait
+  int n = 0, len = 0, shown = 0;
+  const int total = (int)relay_count + (int)relay_over;
+  if (relay_unsent) {
+    snprintf(out[0], BOT_MSG_MAX + 1, "%s %s: not sent", relay_line, relay_target);
+    n = 1;
+  } else if (relay_conflict) {   // another 'get' was on the channel at the same time: the answers cannot be told apart
+    snprintf(out[0], BOT_MSG_MAX + 1, "%s %s: another get was sent at the same time, try again", relay_line, relay_target);
+    n = 1;
+  } else if (relay_count == 0) {
+    snprintf(out[0], BOT_MSG_MAX + 1, "%s: no reply", relay_target);
+    n = 1;
+  } else {
+    for (int e = 0; e < relay_count; e++) {
+      char item[BOT_RELAY_NAME_MAX + BOT_RELAY_TEXT_MAX + 4];
+      int il = snprintf(item, sizeof(item), "%s: %s", relay_ent[e].name, relay_ent[e].text);
+      if (il >= (int)sizeof(item)) il = (int)sizeof(item) - 1;
+      if (il > budget) {
+        il = budget;
+        while (il > 0 && (((unsigned char)item[il]) & 0xC0) == 0x80) il--;
+        item[il] = 0;
+      }
+      if (n > 0 && len + 3 + il <= budget) {
+        memcpy(&out[n - 1][len], " | ", 3);
+        memcpy(&out[n - 1][len + 3], item, il + 1);
+        len += 3 + il;
+        shown++;
+        continue;
+      }
+      if (n == BOT_Q_MAX) break;   // no more messages: the rest is counted, not shown
+      memcpy(out[n], item, il + 1);
+      len = il;
+      n++;
+      shown++;
+    }
+    if (relay_all) {
+      char sm[40];
+      int not_shown = total - shown;
+      int sl = not_shown > 0 ? snprintf(sm, sizeof(sm), "(%d replied, %d not shown)", total, not_shown)
+                             : snprintf(sm, sizeof(sm), "(%d replied)", total);
+      if (len + 1 + sl <= budget) {
+        out[n - 1][len] = ' ';
+        memcpy(&out[n - 1][len + 1], sm, sl + 1);
+      } else if (n < BOT_Q_MAX) {
+        memcpy(out[n], sm, sl + 1);
+        n++;
+      } else {   // last message is full: make room for the count
+        int keep = budget - 1 - sl;
+        if (keep > len) keep = len;
+        while (keep > 0 && (((unsigned char)out[n - 1][keep]) & 0xC0) == 0x80) keep--;
+        out[n - 1][keep] = ' ';
+        memcpy(&out[n - 1][keep + 1], sm, sl + 1);
+      }
+    }
+  }
+  botCommit(relay_ch, 0, n, false);
+}
+
+// 'botchan relay': [list] | add <command> [arg] <all|named|both> | remove <command> | clear
+//   add ver both          the command takes no argument; "!ver all" and "!ver Tuna" both work
+//   add snr arg all       the command takes exactly one argument; "!snr 2F1E all"
+void MyMesh::relayCommand(const char* sub, char* reply) {
+  if (*sub == 0 || strcmp(sub, "list") == 0) {
+    if (relay_n == 0) {
+      strcpy(reply, "relay: no commands (botchan relay add <cmd> [arg] <all|named|both>)");
+      return;
+    }
+    int w = snprintf(reply, 24, "relay %d:", (int)relay_n);
+    for (int i = 0; i < relay_n; i++) {
+      char it[48];
+      int il = snprintf(it, sizeof(it), " %s%s %s%s", relay_cmds[i].word, relay_cmds[i].has_arg ? "+arg" : "",
+                        relay_cmds[i].targets == 1 ? "all" : (relay_cmds[i].targets == 2 ? "named" : "both"), i < relay_n - 1 ? "," : "");
+      if (w + il > 120) {
+        strcpy(&reply[w], " ...");
+        break;
+      }
+      memcpy(&reply[w], it, il + 1);
+      w += il;
+    }
+    return;
+  }
+  if (strcmp(sub, "clear") == 0) {
+    relay_n = 0;
+    relay_active = false;
+    memset(relay_cmds, 0, sizeof(relay_cmds));
+    strcpy(reply, "OK - relay list cleared");
+    return;
+  }
+  if (memcmp(sub, "remove ", 7) == 0) {
+    const char* a = sub + 7;
+    while (*a == ' ') a++;
+    char word[BOT_RELAY_WORD_MAX + 1];
+    int wl = 0;
+    while (a[wl] && a[wl] != ' ' && wl < BOT_RELAY_WORD_MAX) { word[wl] = (char)lowerc(a[wl]); wl++; }
+    word[wl] = 0;
+    int idx = relayFind(word);
+    if (idx < 0) {
+      strcpy(reply, "Err - not in the relay list");
+      return;
+    }
+    for (int i = idx; i < relay_n - 1; i++) relay_cmds[i] = relay_cmds[i + 1];
+    relay_n--;
+    memset(&relay_cmds[relay_n], 0, sizeof(relay_cmds[relay_n]));
+    snprintf(reply, 60, "OK - relay %s removed", word);
+    return;
+  }
+  if (memcmp(sub, "add ", 4) == 0) {
+    const char* a = sub + 4;
+    char tok[3][BOT_RELAY_WORD_MAX + 1];
+    int nt = 0;
+    while (*a) {
+      while (*a == ' ') a++;
+      if (*a == 0) break;
+      if (nt >= 3) { nt = 4; break; }
+      int tl = 0;
+      while (a[tl] && a[tl] != ' ') {
+        if (tl >= BOT_RELAY_WORD_MAX) { nt = 4; break; }
+        tok[nt][tl] = (char)lowerc(a[tl]);
+        tl++;
+      }
+      if (nt == 4) break;
+      tok[nt][tl] = 0;
+      a += tl;
+      nt++;
+    }
+    bool has_arg = nt == 3;
+    const char* mode = nt >= 2 && nt <= 3 ? tok[nt - 1] : "";
+    uint8_t targets = strcmp(mode, "all") == 0 ? 1 : (strcmp(mode, "named") == 0 ? 2 : (strcmp(mode, "both") == 0 ? 3 : 0));
+    if (nt < 2 || nt > 3 || targets == 0 || (has_arg && strcmp(tok[1], "arg") != 0)) {
+      strcpy(reply, "Err - botchan relay add <command> [arg] <all|named|both>");
+      return;
+    }
+    const char* word = tok[0];
+    for (const char* c = word; *c; c++) {
+      if (!relayWordChar(*c)) {
+        strcpy(reply, "Err - the command is one word (letters, digits, - and .)");
+        return;
+      }
+    }
+    if (relayDenied(word, has_arg)) {
+      snprintf(reply, 60, "Err - %s cannot be relayed", word);
+      return;
+    }
+    if (!relayShapeKnown(word)) {   // every relayed command needs an exact reply check
+      snprintf(reply, 70, "Err - no reply check exists for %s, it cannot be relayed", word);
+      return;
+    }
+    char test[BOT_RELAY_WORD_MAX + 4];
+    if (has_arg) snprintf(test, sizeof(test), "%s x", word);   // the repeaters must accept it, for every target chosen
+    else snprintf(test, sizeof(test), "%s", word);
+    if (((targets & 1) && !chanCommandAllowed(test, true)) || ((targets & 2) && !chanCommandAllowed(test, false))) {
+      strcpy(reply, "Err - the repeaters do not accept that over the channel (check the argument and all/named)");
+      return;
+    }
+    int idx = relayFind(word);
+    if (idx < 0) {
+      if (relay_n >= BOT_RELAY_CMD_MAX) {
+        snprintf(reply, 60, "Err - relay list full (%d)", BOT_RELAY_CMD_MAX);
+        return;
+      }
+      idx = relay_n++;
+    }
+    strcpy(relay_cmds[idx].word, word);
+    relay_cmds[idx].has_arg = has_arg ? 1 : 0;
+    relay_cmds[idx].targets = targets;
+    snprintf(reply, 80, "OK - relay %s%s %s", word, has_arg ? " +arg" : "", mode);
+    return;
+  }
+  strcpy(reply, "Err - botchan relay [list]|add <cmd> [arg] <all|named|both>|remove <cmd>|clear");
+}
+// RELAY-END
+
 int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
   int n = 0;
   if (chan_key_set && n < max_matches && chan.hash[0] == hash[0]) {   // the private command channel
@@ -2454,6 +3250,7 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
     blockNameCheckText((const char*)&data[5]);
     return;
   }
+  relayCollect((const char*)&data[5]);   // trail bot relay: a repeater's reply to the relayed command (and a watch for other 'get' commands)
   // item 44: any valid <...> message on the command channel can set an unset or stale clock, before the command runs
   uint32_t behind_s = 0;
   bool was_unset = false;
@@ -2614,8 +3411,12 @@ void MyMesh::botChanCommand(const char* sub, char* reply) {
         snprintf(reply, 100, "OK - bot key set and saved (hash %02X), bot is %s", bot_chan.hash[0], bot_on ? "on" : "off");
       }
     }
+  } else if (strcmp(sub, "relay") == 0 || memcmp(sub, "relay ", 6) == 0) {   // command relay: which '!' commands go to the command channel
+    const char* rs = sub + 5;
+    while (*rs == ' ') rs++;
+    relayCommand(rs, reply);
   } else {
-    strcpy(reply, "Err - botchan [get]|set <key or #name>|clear|on|off|say <text>");
+    strcpy(reply, "Err - botchan [get]|set <key or #name>|clear|on|off|say <text>|relay ...");
   }
 }
 
@@ -2789,30 +3590,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   while (cmd_len > 0 && buf[cmd_len - 1] == ' ') cmd_len--;
   buf[cmd_len] = 0;
 
-  bool timed_sleep = (strncmp(buf, "sleep until ", 12) == 0) || (strncmp(buf, "sleep ", 6) == 0 && buf[6] >= '0' && buf[6] <= '9');
-  bool secret_get = false;   // never hand out the private key or passwords over the channel
-  if (strncmp(buf, "get ", 4) == 0) {
-    for (const char* p = buf + 4; *p; p++) {
-      if (strncmp(p, "prv", 3) == 0 || strncmp(p, "password", 8) == 0 || strncmp(p, "secret", 6) == 0) secret_get = true;
-    }
-  }
-  // item 46: 'reboot' and 'set tx <n>' are accepted only when addressed to this repeater by name (never to 'all')
-  bool named_only = strcmp(buf, "reboot") == 0 || strncmp(buf, "set tx ", 7) == 0;
-  bool allowed = timed_sleep || strcmp(buf, "battlog") == 0 || strcmp(buf, "battpct") == 0 || strcmp(buf, "batttrend") == 0 || strcmp(buf, "templog") == 0
-                 || strcmp(buf, "status") == 0 || strcmp(buf, "report") == 0 || strcmp(buf, "advert") == 0
-                 || strcmp(buf, "ver") == 0 || strcmp(buf, "clock") == 0   // read-only commands
-                 || strcmp(buf, "stats-core") == 0 || strcmp(buf, "stats-radio") == 0 || strcmp(buf, "stats-packets") == 0
-                 || (strncmp(buf, "get ", 4) == 0 && !secret_get)   // every 'get' command except the secrets
-                 || strncmp(buf, "blockhop ", 9) == 0   // blockhop add / remove / list / clear
-                 || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
-                 || strcmp(buf, "botchan") == 0 || strncmp(buf, "botchan ", 8) == 0   // trail bot: get / set / clear / on / off / say
-                 || strcmp(buf, "testchan") == 0 || strncmp(buf, "testchan ", 9) == 0   // #test channel: get / set / clear / on / off / say
-                 || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
-                 || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
-                 || strncmp(buf, "filterchan clear", 16) == 0
-                 || strcmp(buf, "sleep cycle on") == 0 || strcmp(buf, "sleep cycle off") == 0
-                 || strcmp(buf, "sleep auto on") == 0 || strcmp(buf, "sleep auto off") == 0
-                 || (named_only && !to_all);   // item 46
+  bool allowed = chanCommandAllowed(buf, to_all);   // (the whitelist lives in chanCommandAllowed, shared with the trail bot relay)
   if (!allowed) return;   // only these commands can be given over the channel
 
   if (ts <= last_cmd_ts) return;   // replayed or duplicate command
@@ -2824,6 +3602,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   sleep_cmd_flag = false;   // startSleep() sets this if the command starts a sleep
   cmd_hops = hops;          // 'status' reports it
   list_pages_pending = 0;   // 'blockname list' sets this when it wants every page sent
+  list_pages_kind = 0;
   if (strcmp(buf, "advert") == 0) {   // flood advert: for 'all' delayed at random 2..60 s so repeaters don't all send at once,
                                       // for one repeater by name only 1..3 s (item 41)
     sendSelfAdvertisement(to_all ? getRNG()->nextInt(2000, 60001) : getRNG()->nextInt(1000, 3001), true);
@@ -2877,13 +3656,15 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
       from_channel = true;   // the page layout depends on it (room for the repeater name in front)
       for (int p = 2; p <= 1 + more_pages; p++) {
         char pg[192];
-        formatBlockNameList(pg, p);
+        if (list_pages_kind == 1) formatNeighborList(pg, p);   // item 51
+        else formatBlockNameList(pg, p);
         chanEnqueue(pg, p < 1 + more_pages ? CHAN_PAIR_GAP_MS : CHAN_GAP_MS);   // pages about 10 s apart
       }
       from_channel = false;
     }
   }
   list_pages_pending = 0;
+  list_pages_kind = 0;
   chan_gap_on = true;
   if (to_all && started_sleep) {
     // a sleep command for 'all': the furthest repeaters answer (and sleep) first, so every reply can still be
@@ -3125,11 +3906,71 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
     return true;
   }
 
+  {   // item 52: 'discover neighbors' / 'discover neighbours' (and the stock 'discover.neighbors' over the channel)
+    bool spaced = strcmp(command, "discover neighbors") == 0 || strcmp(command, "discover neighbours") == 0;
+    if (spaced || (from_channel && strcmp(command, "discover.neighbors") == 0)) {
+      sendNodeDiscoverReq();   // the stock zero-hop discovery request; answers within about a minute are added to the neighbour table
+      strcpy(reply, "OK - discover sent");
+      if (from_channel) {      // a follow-up message once the answers are in
+        disc_heard = 0;
+        disc_new = 0;
+        disc_report_on = true;
+        disc_report_at = futureMillis(DISCOVER_REPORT_MS);
+      }
+      return true;
+    }
+  }
+
+  if (memcmp(command, "snr", 3) == 0 && (command[3] == 0 || command[3] == ' ')) {   // item 50
+    const char* arg = command + 3;
+    while (*arg == ' ') arg++;
+    formatSnrReply(reply, arg);   // no id, or a bad one: the reply says how to use it
+    return true;
+  }
+
+  {   // item 51: 'neighbors summary' and 'neighbors list [page]' (the bare CLI 'neighbors' stays the stock command)
+    int nb_len = memcmp(command, "neighbors", 9) == 0 ? 9 : (memcmp(command, "neighbours", 10) == 0 ? 10 : 0);
+    if (nb_len && (command[nb_len] == 0 || command[nb_len] == ' ')) {
+      const char* sub = command + nb_len;
+      while (*sub == ' ') sub++;
+      if (*sub == 0) {
+        if (from_channel) {
+          formatNeighborSummary(reply);   // over the channel a bare 'neighbors' is the summary
+        } else if (nb_len == 10) {
+          formatNeighborsReply(reply);    // the British spelling is not a stock command: give the stock output
+        } else {
+          return false;                   // stock 'neighbors'
+        }
+      } else if (strcmp(sub, "alert on") == 0 || strcmp(sub, "alert off") == 0) {   // item 53
+        neighbor_alert_enabled = (sub[7] == 'n');
+        strcpy(reply, neighbor_alert_enabled ? "OK - neighbors alert on" : "OK - neighbors alert off");
+      } else if (strcmp(sub, "alert") == 0) {
+        strcpy(reply, neighbor_alert_enabled ? "neighbors alert on" : "neighbors alert off");
+      } else if (strcmp(sub, "summary") == 0) {
+        formatNeighborSummary(reply);
+      } else if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
+        int pages = formatNeighborList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+        if (from_channel && sub[4] != ' ' && pages > 1) {   // no page number over the channel: send every page
+          list_pages_pending = (uint8_t)pages;
+          list_pages_kind = 1;
+        }
+      } else {
+        strcpy(reply, "Err - neighbors summary|list [page]|alert");
+      }
+      return true;
+    }
+  }
+
   if (memcmp(command, "blockhop", 8) == 0 && (command[8] == 0 || command[8] == ' ')) {
     const char* sub = command + 8;
     while (*sub == ' ') sub++;
     if (strcmp(sub, "list") == 0 || memcmp(sub, "list ", 5) == 0) {
       formatBlockHopList(reply, sub[4] == ' ' ? atoi(&sub[5]) : 1);
+    } else if (strcmp(sub, "auto on") == 0 || strcmp(sub, "auto off") == 0) {
+      blockhop_auto_enabled = (sub[6] == 'n');   // item 49
+      strcpy(reply, blockhop_auto_enabled ? "OK - blockhop auto on" : "OK - blockhop auto off");
+    } else if (strcmp(sub, "auto") == 0) {
+      strcpy(reply, blockhop_auto_enabled ? "blockhop auto on" : "blockhop auto off");
     } else if (strcmp(sub, "clear") == 0) {
       memset(blockhop, 0, sizeof(blockhop));
       strcpy(reply, "OK - blockhop cleared");
@@ -3155,7 +3996,7 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
         strcpy(reply, removed ? "OK - removed" : "Err - not in list");
       }
     } else {
-      strcpy(reply, "Err - blockhop add|remove|list|clear");
+      strcpy(reply, "Err - blockhop add|remove|list|clear|auto");
     }
     return true;
   }
@@ -3676,8 +4517,10 @@ void MyMesh::loop() {
   }
   dailyReport();           // 24h report timer (counts while asleep too)
   blockNoticeService();    // announce newly auto-blocked repeaters
+  discoverReportService();   // item 52
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
   if (!sleeping) botService();    // post queued trail bot replies while the radio is awake
+  if (!sleeping) relayService();  // trail bot relay: collect the replies, then queue the results
 
   // A packet leaves the send queue when its transmission STARTS, and the transmission takes seconds.
   // So after the last queued send, stay awake for a quiet period before the radio may go to sleep.
@@ -3697,7 +4540,7 @@ void MyMesh::loop() {
 
   // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
   if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork() && radio_quiet
-      && ((chan_q_n == 0 && bot_q_n == 0) || millisHasNowPassed(sleep_deadline))) {
+      && ((chan_q_n == 0 && bot_q_n == 0 && !relay_active) || millisHasNowPassed(sleep_deadline))) {
     sleep_pending = false;
     if (!(sleep_target_abs && millisHasNowPassed(sleep_target_at))) {   // (target already passed: nothing to sleep)
       radioSleep(sleep_duration_ms);
@@ -3741,7 +4584,7 @@ void MyMesh::loop() {
   }
   // end of an awake window: back to sleep (an admin login stops the cycle before this)
   if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet
-      && bot_q_n == 0) {
+      && bot_q_n == 0 && !relay_active) {
     radioSleep(CYCLE_SLEEP_MS);
     return;
   }
