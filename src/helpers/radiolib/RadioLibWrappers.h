@@ -53,6 +53,16 @@ public:
   void setTxPower(int8_t dbm);
 
   virtual float getCurrentRSSI() =0;
+
+  // item 54 (lightning detector): one instantaneous RSSI reading, taken only while the radio is in plain receive mode
+  // (not while transmitting, idle or starting up). Returns false, and reads nothing, otherwise.
+  bool sampleRSSI(float& dbm) {
+    if (!isInRecvMode()) return false;
+    dbm = getCurrentRSSI();
+    return true;
+  }
+  // item 54: true while a LoRa packet is arriving (preamble or header seen). The same test the dispatcher uses; no CAD scan.
+  bool packetInProgress() { return isReceivingPacket(); }
   virtual uint8_t getSpreadingFactor() const { return LORA_SF; }
   static uint16_t preambleLengthForSF(uint8_t sf) { return sf <= 8 ? 32 : 16; }
   void updatePreamble(uint8_t sf) { _preamble_sf = sf; _radio->setPreambleLength(preambleLengthForSF(sf)); }
