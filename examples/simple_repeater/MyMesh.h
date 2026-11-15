@@ -266,6 +266,34 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t disc_heard, disc_new;  // item 52: answers heard / of them new neighbours, during that discover
   unsigned long disc_report_at;  // item 52: when the follow-up is due
   uint8_t list_pages_kind;      // which list list_pages_pending sends: 0 = blockname, 1 = neighbors (item 51)
+
+  // item 54: lightning detector (RAM only, OFF after every boot). Reads the radio's instantaneous RSSI while it is idle in receive.
+  bool lightning_enabled;
+  uint8_t lightning_thresh;               // dB above the learned floor that counts as a spike
+  bool light_floor_ok;                    // the floor has been learned (about 1 s after switching on or waking)
+  float light_floor;                      // slow rolling noise floor, built only from samples that are not spikes
+  float light_blk_sum;                    // the floor's current 1 s block: sum and count of non-spike samples
+  uint16_t light_blk_n;
+  unsigned long light_blk_start;
+  bool light_prev_hot, light_wait_quiet;  // previous sample was a spike / ignoring spikes until one quiet sample
+  unsigned long light_hot_since;          // when the current run of spike samples began
+  bool light_cl_on;                       // a cluster (a flash's worth of spikes) is being collected
+  uint16_t light_cl_spikes;
+  unsigned long light_cl_start, light_cl_last;
+  uint32_t light_cl_rx_mark;              // packets received (good or bad) when the cluster began
+  float light_cl_peak;
+  uint32_t light_spikes_total, light_events_total;   // since boot
+  bool light_peak_ok;                     // 'lightning peak': highest non-packet RSSI since it was last read
+  float light_peak;
+  uint16_t light_pend_spikes;             // accepted spikes not yet posted
+  float light_pend_peak;
+  unsigned long light_pend_first, light_pend_last;
+  bool light_gap_on;                      // a post was sent less than LIGHT_POST_GAP_MS ago
+  unsigned long light_next_post;
+  uint16_t light_hour_spikes;             // spikes this hour (the hourly log moment stores and clears it)
+  bool light_hour_on;                     // lightning was on at some time this hour
+  uint16_t light_log[24];                 // spikes per hour (0xFFFF = off that hour)
+  uint8_t light_log_head, light_log_count;
   uint8_t list_pages_pending;   // 'blockname list' over the channel: total pages to send (0 = just the one reply) (item 38)
 
   // warnings / notices
@@ -381,6 +409,13 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void chanEnqueueSoon(const char* text, bool is_relay = false);                   // items 52 and 53: an automatic message that goes out as soon as possible
   void neighbourAlert(const mesh::Identity& id, int8_t snr4);   // item 53
   void discoverReportService();                             // item 52: 'Discover: N heard, M new'
+  void lightningService();                                  // item 54: sample, detect, post
+  void lightningSample(float rssi, unsigned long now);      // item 54
+  void lightningPost();                                     // item 54
+  void lightningEnable(bool on);                            // item 54
+  void formatLightning(char* reply);                        // item 54: 'lightning'
+  void formatLightningPeak(char* reply);                    // item 54: 'lightning peak'
+  void formatLightLog(char* reply);                         // item 54: 'lightlog'
   void formatSnrReply(char* reply, const char* hex);   // item 50: 'snr <id>'
   void formatNeighborSummary(char* reply);            // item 51: 'neighbors summary'
   int formatNeighborList(char* reply, int page);      // item 51: 'neighbors list [page]', returns the number of pages
@@ -536,6 +571,7 @@ public:
 
   // true while timed channel work is waiting (ESP32 only): the main loop must not light-sleep for up to 30 s then
   bool needsFastLoop() const {
+    if (lightning_enabled && !sleeping) return true;   // item 54: the detector needs the loop to keep running (no CPU sleep)
 #if defined(ESP32)
     return sleep_pending || ((chan_q_n > 0 || bot_q_n > 0 || relay_active) && !sleeping);
 #else

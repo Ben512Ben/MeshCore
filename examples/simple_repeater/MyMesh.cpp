@@ -42,6 +42,18 @@
 #define WD_TX_STUCK_MS    (10UL * 60UL * 1000UL)  // watchdog: packets queued but none sent for this long (radio awake) = stuck
 #define WD_SILENCE_MS     (24UL * 60UL * 60UL * 1000UL)  // watchdog: this much awake time with nothing heard = silent
 #define WD_REBOOT_GRACE_MS (6UL * 60UL * 60UL * 1000UL)  // a radio check may only cause a reboot once the node has been up this long
+#define LIGHT_THRESH_DEFAULT 10                   // item 54: a sample this many dB above the learned floor is a spike (settable 3..40)
+#define LIGHT_THRESH_MIN  3
+#define LIGHT_THRESH_MAX  40
+#define LIGHT_BURST_MAX   16                      // item 54: at most this many RSSI reads per loop pass ...
+#define LIGHT_BURST_US    1000                    //   ... and never more than 1 ms of reading per pass
+#define LIGHT_FLOOR_BLOCK_MS 1000                 // item 54: the floor is updated from one block of non-spike samples a second ...
+#define LIGHT_FLOOR_ALPHA_DIV 8                   //   ... moving 1/8 of the way to each block's mean (time constant about 8 s)
+#define LIGHT_CLUSTER_GAP_MS 250                  // item 54: spikes closer together than this belong to one flash
+#define LIGHT_MIN_SPIKES  2                       // item 54: a cluster needs at least this many spikes to count
+#define LIGHT_HOT_MAX_MS  60                      // item 54: a spike run longer than this is a packet or an interferer, not lightning
+#define LIGHT_STUCK_MS    5000                    // item 54: 'spiking' for this long means the floor is wrong: learn it again
+#define LIGHT_POST_GAP_MS 10000                   // item 54: at least this long between lightning posts
 #define WD_SILENCE_ACTION 0                       // 0 = silence rule only posts a message; 1 = it also restarts the radio
 
 /* ------------------------------ Config -------------------------------- */
@@ -966,6 +978,32 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   list_pages_pending = 0;
   list_pages_kind = 0;
   neighbor_alert_enabled = true;   // item 53: the new-neighbour alert is ON after every boot
+  lightning_enabled = false;       // item 54: lightning detection is OFF after every boot
+  lightning_thresh = LIGHT_THRESH_DEFAULT;
+  light_floor_ok = false;
+  light_floor = 0;
+  light_blk_sum = 0;
+  light_blk_n = 0;
+  light_blk_start = 0;
+  light_prev_hot = light_wait_quiet = false;
+  light_hot_since = 0;
+  light_cl_on = false;
+  light_cl_spikes = 0;
+  light_cl_start = light_cl_last = 0;
+  light_cl_rx_mark = 0;
+  light_cl_peak = -200;
+  light_spikes_total = light_events_total = 0;
+  light_peak_ok = false;
+  light_peak = -200;
+  light_pend_spikes = 0;
+  light_pend_peak = -200;
+  light_pend_first = light_pend_last = 0;
+  light_gap_on = false;
+  light_next_post = 0;
+  light_hour_spikes = 0;
+  light_hour_on = false;
+  memset(light_log, 0, sizeof(light_log));
+  light_log_head = light_log_count = 0;
   disc_report_on = false;
   disc_heard = 0;
   disc_new = 0;
@@ -1492,6 +1530,11 @@ void MyMesh::batteryMonitor() {
     batt_log_head = (batt_log_head + 1) % 24;
     if (batt_log_count < 24) batt_log_count++;
     ronSnapshot();   // radio-on snapshot at the same moment (item 34)
+    light_log[light_log_head] = light_hour_on ? (light_hour_spikes < 0xFFFE ? light_hour_spikes : 0xFFFE) : 0xFFFF;   // item 54
+    light_log_head = (light_log_head + 1) % 24;
+    if (light_log_count < 24) light_log_count++;
+    light_hour_spikes = 0;
+    light_hour_on = lightning_enabled;
   }
   batt_check_n++;
 
@@ -1925,6 +1968,190 @@ void MyMesh::discoverReportService() {
   char msg[40];
   snprintf(msg, sizeof(msg), "Discover: %u heard, %u new", (unsigned)disc_heard, (unsigned)disc_new);
   chanEnqueueSoon(msg);
+}
+
+// ---------------------- lightning detector (item 54) ----------------------
+// Lightning is a broadband impulse source, so a close strike lifts the radio's instantaneous RSSI for a moment. While the radio
+// is idle in receive, lightningService() reads that RSSI as fast as the loop allows and compares it with a slow floor that it
+// learns itself from samples that are not spikes. A flash is a cluster of spikes (rising edges), closed after a short quiet
+// gap. Packets and steady interferers are rejected, and nothing is read while the radio transmits or sleeps.
+
+void MyMesh::lightningEnable(bool on) {
+  lightning_enabled = on;
+  light_floor_ok = false;   // learn the floor again
+  light_blk_sum = 0;
+  light_blk_n = 0;
+  light_blk_start = millis();
+  light_prev_hot = light_wait_quiet = false;
+  light_cl_on = false;
+  light_pend_spikes = 0;
+  light_peak_ok = false;
+  if (on) light_hour_on = true;
+}
+
+// one RSSI reading
+void MyMesh::lightningSample(float rssi, unsigned long now) {
+  if (!light_floor_ok) {   // learning the floor: about one second of readings
+    light_blk_sum += rssi;
+    light_blk_n++;
+    if ((unsigned long)(now - light_blk_start) >= LIGHT_FLOOR_BLOCK_MS) {
+      if (light_blk_n >= 50) {
+        light_floor = light_blk_sum / (float)light_blk_n;
+        light_floor_ok = true;
+      }
+      light_blk_sum = 0;
+      light_blk_n = 0;
+      light_blk_start = now;
+    }
+    return;
+  }
+
+  bool hot = rssi > light_floor + (float)lightning_thresh;
+  if (!hot) {
+    light_prev_hot = false;
+    light_wait_quiet = false;
+    if (!light_peak_ok || rssi > light_peak) { light_peak = rssi; light_peak_ok = true; }
+    light_blk_sum += rssi;   // only quiet samples build the floor, so a storm cannot lift its own baseline
+    light_blk_n++;
+    if ((unsigned long)(now - light_blk_start) >= LIGHT_FLOOR_BLOCK_MS) {
+      if (light_blk_n >= 50) light_floor += (light_blk_sum / (float)light_blk_n - light_floor) / (float)LIGHT_FLOOR_ALPHA_DIV;
+      light_blk_sum = 0;
+      light_blk_n = 0;
+      light_blk_start = now;
+    }
+    return;
+  }
+
+  // a spike candidate
+  if (radio_driver.packetInProgress()) {   // a packet is arriving: not lightning
+    light_cl_on = false;
+    light_wait_quiet = true;
+    light_prev_hot = true;
+    return;
+  }
+  if (!light_prev_hot) {
+    light_hot_since = now;
+  } else if ((unsigned long)(now - light_hot_since) > LIGHT_STUCK_MS) {   // 'hot' for seconds: the floor is wrong (new interferer)
+    light_floor_ok = false;
+    light_blk_sum = 0;
+    light_blk_n = 0;
+    light_blk_start = now;
+    light_prev_hot = light_wait_quiet = false;
+    light_cl_on = false;
+    return;
+  } else if ((unsigned long)(now - light_hot_since) > LIGHT_HOT_MAX_MS) {   // too long for lightning: a packet or an interferer
+    light_cl_on = false;
+    light_wait_quiet = true;
+  }
+  if (!light_wait_quiet) {
+    if (!light_peak_ok || rssi > light_peak) { light_peak = rssi; light_peak_ok = true; }
+    if (!light_prev_hot) {   // rising edge = one spike
+      if (!light_cl_on) {
+        light_cl_on = true;
+        light_cl_spikes = 0;
+        light_cl_start = now;
+        light_cl_rx_mark = radio_driver.getPacketsRecv() + radio_driver.getPacketsRecvErrors();
+        light_cl_peak = rssi;
+      }
+      if (light_cl_spikes < 0xFFFF) light_cl_spikes++;
+      light_cl_last = now;
+    }
+    if (light_cl_on && rssi > light_cl_peak) light_cl_peak = rssi;
+  }
+  light_prev_hot = true;
+}
+
+void MyMesh::lightningPost() {
+  if (light_pend_spikes == 0) return;
+  if (chan_key_set) {
+    unsigned long secs = (light_pend_last - light_pend_first + 999UL) / 1000UL;
+    if (secs < 1) secs = 1;
+    char msg[CHAN_MSG_MAX + 1];
+    snprintf(msg, sizeof(msg), "Lightning: %u spikes in %lus, peak %ddBm (floor %d)", (unsigned)light_pend_spikes, secs,
+             (int)lroundf(light_pend_peak), (int)lroundf(light_floor));
+    chanEnqueueSoon(msg);   // 1 to 3 s when nothing is queued, otherwise right behind what is queued
+  }
+  light_pend_spikes = 0;
+  light_gap_on = true;
+  light_next_post = futureMillis(LIGHT_POST_GAP_MS);
+}
+
+void MyMesh::lightningService() {   // runs on every loop pass
+  if (!lightning_enabled) return;
+  if (sleeping) {   // the radio is off: nothing to read, and the floor must be learned again after the wake
+    light_floor_ok = false;
+    light_blk_sum = 0;
+    light_blk_n = 0;
+    light_prev_hot = light_wait_quiet = false;
+    light_cl_on = false;
+    return;
+  }
+  uint32_t t0 = micros();
+  for (int i = 0; i < LIGHT_BURST_MAX; i++) {
+    float rssi;
+    if (!radio_driver.sampleRSSI(rssi)) {   // transmitting, or not yet back in receive: skip this pass
+      light_prev_hot = false;
+      break;
+    }
+    lightningSample(rssi, millis());
+    if ((uint32_t)(micros() - t0) > LIGHT_BURST_US) break;
+  }
+  unsigned long now = millis();
+  if (light_cl_on && (unsigned long)(now - light_cl_last) > LIGHT_CLUSTER_GAP_MS) {   // the flash is over: judge it
+    light_cl_on = false;
+    uint32_t rx = radio_driver.getPacketsRecv() + radio_driver.getPacketsRecvErrors();
+    if (light_cl_spikes >= LIGHT_MIN_SPIKES && rx == light_cl_rx_mark) {   // (a packet received meanwhile means the cluster is suspect)
+      light_events_total++;
+      light_spikes_total += light_cl_spikes;
+      uint32_t h = (uint32_t)light_hour_spikes + light_cl_spikes;
+      light_hour_spikes = h < 0xFFFE ? (uint16_t)h : 0xFFFE;
+      if (light_pend_spikes == 0) {
+        light_pend_first = light_cl_start;
+        light_pend_peak = light_cl_peak;
+      } else if (light_cl_peak > light_pend_peak) {
+        light_pend_peak = light_cl_peak;
+      }
+      uint32_t p = (uint32_t)light_pend_spikes + light_cl_spikes;
+      light_pend_spikes = p < 9999 ? (uint16_t)p : 9999;
+      light_pend_last = light_cl_last;
+    }
+  }
+  if (light_pend_spikes > 0 && (!light_gap_on || millisHasNowPassed(light_next_post))) lightningPost();
+}
+
+// 'lightning': state, threshold, floor and counts since boot
+void MyMesh::formatLightning(char* reply) {
+  char fl[8];
+  if (lightning_enabled && light_floor_ok) snprintf(fl, sizeof(fl), "%d", (int)lroundf(light_floor));
+  else strcpy(fl, "-");
+  snprintf(reply, CLI_REPLY_MAX, "lightning %s, thresh %udB, floor %s, spikes %lu, events %lu", lightning_enabled ? "on" : "off",
+           (unsigned)lightning_thresh, fl, (unsigned long)light_spikes_total, (unsigned long)light_events_total);
+}
+
+// 'lightning peak': the highest reading that was not a packet since it was last asked, then it starts again
+void MyMesh::formatLightningPeak(char* reply) {
+  if (!light_peak_ok) {
+    strcpy(reply, lightning_enabled ? "lightning peak: no data yet" : "lightning peak: off");
+    return;
+  }
+  if (light_floor_ok) snprintf(reply, CLI_REPLY_MAX, "lightning peak %ddBm (floor %d)", (int)lroundf(light_peak), (int)lroundf(light_floor));
+  else snprintf(reply, CLI_REPLY_MAX, "lightning peak %ddBm", (int)lroundf(light_peak));
+  light_peak_ok = false;
+}
+
+// 'lightlog': spikes per hour for the last 24 hours, oldest to newest ('-' = lightning was off that hour)
+void MyMesh::formatLightLog(char* reply) {
+  if (light_log_count == 0) {
+    strcpy(reply, "lightlog: no data yet (first reading 5 min after boot)");
+    return;
+  }
+  int pos = snprintf(reply, 20, "L/h old>new:");
+  for (int i = 0; i < light_log_count; i++) {
+    int idx = (light_log_head + 24 - light_log_count + i) % 24;
+    if (pos > CLI_REPLY_MAX - 8) break;   // never overrun the reply buffer
+    if (light_log[idx] == 0xFFFF) pos += snprintf(&reply[pos], 4, " -");
+    else pos += snprintf(&reply[pos], 8, " %u", (unsigned)light_log[idx]);
+  }
 }
 
 // ---------------------- 'snr' and 'neighbors' (items 50 and 51) ----------------------
@@ -2683,6 +2910,8 @@ bool MyMesh::chanCommandAllowed(const char* buf, bool to_all) const {
                  || strcmp(buf, "neighbors") == 0 || strcmp(buf, "neighbors summary") == 0   // item 51 (bare = summary over the channel)
                  || strcmp(buf, "neighbours") == 0 || strcmp(buf, "neighbours summary") == 0
                  || strncmp(buf, "neighbors alert", 15) == 0 || strncmp(buf, "neighbours alert", 16) == 0   // item 53
+                 || strcmp(buf, "lightning") == 0 || strncmp(buf, "lightning ", 10) == 0   // item 54: lightning on / off / thresh / peak
+                 || strcmp(buf, "lightlog") == 0                                           // item 54
                  || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
                  || strcmp(buf, "botchan") == 0 || strncmp(buf, "botchan ", 8) == 0   // trail bot: get / set / clear / on / off / say / relay
                  || strcmp(buf, "testchan") == 0 || strncmp(buf, "testchan ", 9) == 0   // #test channel: get / set / clear / on / off / say
@@ -3646,7 +3875,7 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
     more_pages = want < room ? want : room;
   }
   if (reply[0] != 0) {
-    if ((reply[0] == 'V' || reply[0] == 'C' || reply[0] == '%') && reply[1] == '/') {   // battlog / battpct / templog line: make it fit
+    if ((reply[0] == 'V' || reply[0] == 'C' || reply[0] == '%' || reply[0] == 'L') && reply[1] == '/') {   // battlog / battpct / templog / lightlog line: make it fit
       int prefix = (int)strlen(_prefs.node_name) + 2;
       if (prefix > 39) prefix = 39;
       trimLogToFit(reply, 12, prefix);
@@ -3925,6 +4154,44 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
     const char* arg = command + 3;
     while (*arg == ' ') arg++;
     formatSnrReply(reply, arg);   // no id, or a bad one: the reply says how to use it
+    return true;
+  }
+
+  if (strcmp(command, "lightlog") == 0) {   // item 54
+    formatLightLog(reply);
+    return true;
+  }
+  if (memcmp(command, "lightning", 9) == 0 && (command[9] == 0 || command[9] == ' ')) {   // item 54
+    const char* sub = command + 9;
+    while (*sub == ' ') sub++;
+    if (*sub == 0) {
+      formatLightning(reply);
+    } else if (strcmp(sub, "on") == 0 || strcmp(sub, "off") == 0) {
+      lightningEnable(sub[1] == 'n');
+      strcpy(reply, lightning_enabled ? "OK - lightning on" : "OK - lightning off");
+    } else if (strcmp(sub, "peak") == 0) {
+      formatLightningPeak(reply);
+    } else if (strcmp(sub, "thresh") == 0) {
+      snprintf(reply, CLI_REPLY_MAX, "lightning thresh %udB", (unsigned)lightning_thresh);
+    } else if (memcmp(sub, "thresh ", 7) == 0) {
+      const char* q = sub + 7;
+      while (*q == ' ') q++;
+      int val = 0, digits = 0;
+      while (*q >= '0' && *q <= '9' && digits < 4) {
+        val = val * 10 + (*q - '0');
+        q++;
+        digits++;
+      }
+      if (digits == 0 || *q != 0 || val < LIGHT_THRESH_MIN || val > LIGHT_THRESH_MAX) {
+        snprintf(reply, CLI_REPLY_MAX, "Err - thresh must be %d..%d", LIGHT_THRESH_MIN, LIGHT_THRESH_MAX);
+      } else {
+        lightning_thresh = (uint8_t)val;
+        light_peak_ok = false;
+        snprintf(reply, CLI_REPLY_MAX, "OK - lightning thresh %d", val);
+      }
+    } else {
+      strcpy(reply, "Err - lightning on|off|thresh <dB>|peak");
+    }
     return true;
   }
 
@@ -4518,6 +4785,7 @@ void MyMesh::loop() {
   dailyReport();           // 24h report timer (counts while asleep too)
   blockNoticeService();    // announce newly auto-blocked repeaters
   discoverReportService();   // item 52
+  lightningService();        // item 54 (does nothing unless 'lightning on')
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
   if (!sleeping) botService();    // post queued trail bot replies while the radio is awake
   if (!sleeping) relayService();  // trail bot relay: collect the replies, then queue the results
