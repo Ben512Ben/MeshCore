@@ -1,5 +1,6 @@
 #include "MyMesh.h"
 #include "HikeBot.h"    // one bot for every "!" message: trails, hiking help, signal test and chat (uses TrailBot.h, ChatBot.h)
+#include "CmdBot.h"     // command channel bot: remembers what the repeaters post there and answers "!" questions (pure functions)
 #include <algorithm>
 #ifdef HELTEC_LORA_V4
 #include <driver/gpio.h>   // gpio_pulldown_en() for DIO1 while the radio sleeps
@@ -17,6 +18,16 @@
 #define CYCLE_AWAKE_MS    (3UL * 60UL * 1000UL)   // sleep cycle: radio on
 #define BRISBANE_UTC_OFFSET_SECS  (10L * 3600L)   // 'sleep until' uses Brisbane time (UTC+10, no DST)
 #define CLOCK_VALID_AFTER 1767225600UL            // 1 Jan 2026: any earlier clock is considered 'not set'
+
+// seconds since power on, never wraps (millis() does after 49 days): must be called at least once every few weeks
+static uint32_t cmdbotNow() {
+  static uint32_t last = 0;
+  static uint64_t acc = 0;
+  uint32_t m = millis();
+  acc += (uint32_t)(m - last);
+  last = m;
+  return (uint32_t)(acc / 1000ULL);
+}
 #define CLOCK_SYNC_MARGIN_S 300UL                 // item 44: a channel message moves the clock only if it is more than 5 min ahead (or the clock is unset)
 #define CLI_REPLY_MAX     150                     // keep replies well inside the 160 byte CLI buffer
 #define HOT_START_C       60                      // chip temperature warning: 60C or more ...
@@ -2936,6 +2947,7 @@ bool MyMesh::relayRequest(const char* req, uint16_t who, uint8_t ch) {
   relay_deadline = futureMillis(BOT_RELAY_POST_MS);
   char cmd[CHAN_MSG_MAX + 1];
   snprintf(cmd, sizeof(cmd), "<%s %s>", line, target);
+  cbCommand(&cmd[1], cmdbotNow());   // a relayed "get tx ..." opens the TX power window too (the bot cannot hear its own post)
   chanEnqueueSoon(cmd, true);
   return true;
 }
@@ -3225,6 +3237,53 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
   return n;
 }
 
+// ---------------------- command channel bot ("!" questions on the command channel, see CmdBot.h) ----------------------
+// every command channel message goes through here: it updates the ledger, and a "!" question gets its answer posted
+void MyMesh::cmdbotHear(const char* text) {
+  uint32_t now = cmdbotNow();
+  uint32_t rtc = getRTCClock()->getCurrentTime();
+  int32_t sod = rtc < CLOCK_VALID_AFTER ? -1 : (int32_t)((rtc + BRISBANE_UTC_OFFSET_SECS) % 86400UL);
+  const char* q = cbHear(text, now, _prefs.node_name, sod);
+  if (q != NULL) cmdbotAnswer(q, sod);
+}
+
+void MyMesh::cmdbotAnswer(const char* q, int32_t sod) {
+  if (!chan_key_set) return;
+  uint32_t now = cmdbotNow();
+  // this repeater's own row is read from the board, so it is always current
+  float t = board.getMCUTemperature();
+  int t10 = isnan(t) ? CB_NO_TEMP : (int)(t * 10.0f + (t < 0 ? -0.5f : 0.5f));
+  int neigh = 0;
+#if MAX_NEIGHBOURS
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp != 0) neigh++;
+  }
+#endif
+  int thi = CB_NO_TEMP, tlo = CB_NO_TEMP;   // 24 hour high and low from its own hourly log (needs 2 readings)
+  {
+    int tmin = 0, tmax = 0, nread = 0;
+    for (int i = 0; i < batt_log_count; i++) {
+      int idx = (batt_log_head + 24 - batt_log_count + i) % 24;
+      if (temp_log[idx] == INT16_MIN) continue;
+      int v = temp_log[idx];
+      if (nread == 0 || v < tmin) tmin = v;
+      if (nread == 0 || v > tmax) tmax = v;
+      nread++;
+    }
+    if (nread >= 2) {
+      thi = tmax >= 0 ? (tmax + 5) / 10 : -((-tmax + 5) / 10);   // nearest whole degree, as the daily report does
+      tlo = tmin >= 0 ? (tmin + 5) / 10 : -((-tmin + 5) / 10);
+    }
+  }
+  cbSelf(_prefs.node_name, board.getBattMilliVolts(), t10, thi, tlo, (int)_prefs.tx_power_dbm, neigh, now);
+  int prefix = (int)strlen(_prefs.node_name) + 2;
+  if (prefix > 41) prefix = 41;
+  int budget = CHAN_MSG_MAX - prefix - 2;
+  char out[CB_MAX_MSGS][CB_BUF];
+  int n = cbAnswer(q, now, sod, budget, out, CB_MAX_MSGS);
+  for (int i = 0; i < n; i++) chanEnqueueSoon(out[i]);   // 1 to 3 s for the first, then 10 s apart
+}
+
 void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
   if (type != PAYLOAD_TYPE_GRP_TXT || len < 6) return;
   if ((data[4] >> 2) != 0) return;   // plain text only
@@ -3250,6 +3309,7 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
     blockNameCheckText((const char*)&data[5]);
     return;
   }
+  cmdbotHear((const char*)&data[5]);   // command channel bot: remember what the repeaters post, answer "!" questions
   relayCollect((const char*)&data[5]);   // trail bot relay: a repeater's reply to the relayed command (and a watch for other 'get' commands)
   // item 44: any valid <...> message on the command channel can set an unset or stale clock, before the command runs
   uint32_t behind_s = 0;
@@ -4483,6 +4543,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 }
 
 void MyMesh::loop() {
+  cmdbotNow();   // keeps the command channel bot clock from missing a millis() wrap
   watchdogService();   // radio health checks (item 43)
   // battery monitor: every 5 min (also runs while the radio sleeps)
   if (!batt_check_armed) {

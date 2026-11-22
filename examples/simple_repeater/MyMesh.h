@@ -373,6 +373,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void relayCdSet(RelayCd* t, uint16_t id, uint32_t ms);
   bool relayRequest(const char* req, uint16_t who, uint8_t ch);
   void relayCollect(const char* text);
+  void cmdbotHear(const char* text);                   // command channel bot (CmdBot.h)
+  void cmdbotAnswer(const char* q, int32_t sod);
   void relayPosted();
   void relayService();
   void relayDeliver();
