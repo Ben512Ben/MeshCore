@@ -95,6 +95,7 @@ struct NeighbourInfo {
 #define BOT_KEY_FILE "/bot_key"   // trail bot channel key (item 32), same layout as /chan_key
 #define TEST_KEY_FILE "/test_key" // #test channel keys ('testchan'): TEST_CH_MAX records of 33 bytes, same layout as /chan_key
 #define TEST_CH_MAX  3            // most test channels at once (one on/off switch for all of them)
+#define CALC_KEY_FILE "/calc_key" // calculator channel key ('calcchan'): same layout as /bot_key
 #define BOT_MSG_MAX  134          // trail bot: max bytes of a message INCLUDING "<node name>: "
 #define BOT_Q_MAX    4            // trail bot: most messages one request can produce
 #define BOT_ANS_MAX  3            // trail bot: answers waiting to be sent at once (a request is ignored when the queue is full)
@@ -114,6 +115,7 @@ struct NeighbourInfo {
 #define BOT_RELAY_POST_MS   120000UL                  // give up if the command could not be posted within 2 minutes
 #define BOT_CH_BOT   0            // which channel a request came from / a reply goes to
 #define BOT_CH_TEST  1            // test channel slot i (0 to TEST_CH_MAX-1) is channel BOT_CH_TEST + i
+#define BOT_CH_CALC  (BOT_CH_TEST + TEST_CH_MAX)   // the calculator channel ('calcchan'): answers only maths and unit conversions
 
 #define PACKET_LOG_FILE  "/packet_log"
 
@@ -146,6 +148,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long set_radio_at, revert_radio_at;
   bool sleep_pending, sleeping;
   unsigned long sleep_start_at, sleep_wake_at;
+  bool rem_awake;                  // the radio was woken only to send a reminder (during a sleep cycle)
+  unsigned long rem_back_at;       // the normal wake time of that sleep, restored when the reminder has gone out
   uint32_t sleep_duration_ms;
 
   // sleep cycle + battery monitor (+ hourly battery log)
@@ -211,6 +215,12 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t test_key_len[TEST_CH_MAX];
   mesh::GroupChannel test_chans[TEST_CH_MAX];
   uint32_t test_replies;
+  // calculator channel ('calcchan'): one channel with its own key, answers only maths and unit conversions (CalcBot.h).
+  // Off after every boot, uses no memory slot, shares the reply queue and the per-person cooldown.
+  bool calc_key_set, calc_on;
+  uint8_t calc_key_len;
+  mesh::GroupChannel calc_chan;
+  uint32_t calc_replies;
   // reply queue shared by both channels: up to BOT_ANS_MAX answers, each of up to BOT_Q_MAX messages, sent oldest first
   char bot_q[BOT_FIFO_MAX][BOT_MSG_MAX + 1];   // messages waiting to be posted
   uint8_t bot_q_n;                          // messages waiting (0 = nothing queued)
@@ -358,9 +368,15 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void loadBotKey();
   void saveTestKeys();
   void loadTestKeys();
+  void saveCalcKey();
+  void loadCalcKey();
+  void calcChanCommand(const char* sub, char* reply);
   void handleBotMessage(const char* text, int hops, float snr, int rssi, uint8_t ch);
   bool postBotMessage(const char* text, uint8_t ch);
   void botService();
+  int remindDecide(bool radio_quiet, uint32_t* now_out);   // reminders: what to do now (RemindBot.h remindSleepStep)
+  void remindService();                                    // post a due reminder, or wake the radio just for it
+  bool remindSleepBack(bool radio_quiet);                  // back to sleep after a reminder wake: true if the radio went to sleep
   void botQueueClear();
   void botQueueDropChannel(uint8_t ch_lo, uint8_t ch_hi);
   void botCommit(uint8_t ch, uint16_t who, int n, bool spread);

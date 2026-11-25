@@ -32,7 +32,8 @@ static const HikeTopic HIKE_TOPICS[] = {
    "instructions;commands;menu;help;how do i use you;what are you for", 30,
    "I'm a hiking helper. Ask about trails, what to take, how long, when to start, sunset, the moon or meteors.~"
    "Say I am starting now, then finished hike, to time a walk. Ask for a walk idea, or say radio check.~"
-   "!trails browses by region, !wildlife covers animals and plants. No weather or closures: parks.qld.gov.au."},
+   "Try !trails for regions, !wildlife for animals and plants. No weather or closures: parks.qld.gov.au.~"
+   "Also maths and units (12*(3+4), 10km in miles), how long until 5pm, or remind me at 10am to take my boots."},
 
   // ---- numbers and getting help ----
   {"emergency number;emergency numbers;triple zero;who do i call;who to call;phone number;phone numbers;lifeline;"

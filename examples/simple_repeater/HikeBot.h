@@ -40,6 +40,8 @@
 #include "ChatBot.h"
 #include "hikeknowledge.h"
 #include "WildBot.h"
+#include "CalcBot.h"
+#include "RemindBot.h"
 
 #ifndef BOT_MSG_MAX
   #define BOT_MSG_MAX 134
@@ -78,6 +80,7 @@ struct HikeCtx {
   int hops;
   uint32_t seed;        // random number, for variety
   bool test_only;       // #test channel: answer only the signal-test commands, ignore everything else
+  bool calc_only;       // calcchan: answer only calculator and unit-conversion requests (CalcBot.h), ignore everything else
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -477,9 +480,18 @@ static bool hbNumberWord(const char* w, int n, int* v) {
   return false;
 }
 
+// Easter Sunday of a year, as days since 1970-01-01 (the anonymous Gregorian algorithm)
+static long hbEasterLd(int y) {
+  int a = y % 19, b = y / 100, c = y % 100, d = b / 4, e = b % 4, f = (b + 8) / 25, g = (b - f + 1) / 3;
+  int h = (19 * a + b - d - g + 15) % 30, i = c / 4, k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+  int m = (a + 11 * h + 22 * l) / 451;
+  int month = (h + l - 7 * m + 114) / 31, day = ((h + l - 7 * m + 114) % 31) + 1;
+  return hbDaysFromCivil(y, month, day);
+}
+
 // The first day the sentence names, as days since 1970-01-01 (local). false if none.
 // tomorrow, yesterday, today, tonight, the day after tomorrow, in 3 days, in a week, Friday (the next one),
-// 25 December, 25th of December, December 25, with an optional year.
+// 25 December, 25th of December, December 25, with an optional year, Christmas Day, New Year's Day, Easter (Sunday).
 static bool hbFindDay(const char* norm, long today_ld, long* out_ld) {
   const char* tp[32];
   int tl[32];
@@ -519,6 +531,25 @@ static bool hbFindDay(const char* norm, long today_ld, long* out_ld) {
       else if (hbNumberWord(tp[i + 1], tl[i + 1], &v) && v >= 1 && v <= 366) {
         if (hbWordIs(tp[i + 2], tl[i + 2], "day") || hbWordIs(tp[i + 2], tl[i + 2], "days")) { ld = today_ld + v; found = true; }
         else if (hbWordIs(tp[i + 2], tl[i + 2], "week") || hbWordIs(tp[i + 2], tl[i + 2], "weeks")) { ld = today_ld + 7L * v; found = true; }
+      }
+    }
+    if (!found) {   // holidays: Christmas Day, New Year's Day, Easter (Sunday). This year's, or next year's if it has passed.
+      int hm = 0, hd = 0;
+      bool hol = false, easter = false;
+      if (hbWordIs(w, n, "christmas") || hbWordIs(w, n, "xmas")) {
+        hol = true; hm = 12; hd = (i + 1 < nt && hbWordIs(tp[i + 1], tl[i + 1], "eve")) ? 24 : 25;
+      } else if (hbWordIs(w, n, "new") && i + 1 < nt && (hbWordIs(tp[i + 1], tl[i + 1], "year") || hbWordIs(tp[i + 1], tl[i + 1], "years"))) {
+        hol = true;
+        bool eve = (i + 2 < nt && hbWordIs(tp[i + 2], tl[i + 2], "eve"));
+        hm = eve ? 12 : 1; hd = eve ? 31 : 1;
+      } else if (hbWordIs(w, n, "easter")) {
+        hol = true; easter = true;
+      }
+      if (hol) {
+        for (int pass = 0; pass < 2 && !found; pass++) {
+          long cand = easter ? hbEasterLd(ty + pass) : hbDaysFromCivil(ty + pass, hm, hd);
+          if (cand >= today_ld) { ld = cand; found = true; }
+        }
       }
     }
     if (!found) {
@@ -2080,6 +2111,647 @@ static HB_NOINLINE bool hbWildAsk(HbCtx* H) {
 #define HB_RADIO_PHRASES "radio check;signal check;can you hear me;do you copy;how is my signal;how is my reception;am i getting through;" \
                          "test message;radio test;signal test;do you read me;are you receiving me;can you read me"
 
+// ---------------------------------------------------------------------------------------------------------------
+// time until / since, and reminders. Bot channel only. All times are Queensland time (UTC+10, no daylight saving).
+
+// dates written 25/12 or 25/12/2026 (day first, as in Australia) become "25 december [2026]" for the day parser, but only in a
+// sentence that is about time, so "3/4 of the way" and a bare "!25/12" (a division) are left alone
+static void hbSlashDates(const char* raw, char* out, int osz) {
+  static const char* const key[] = {"sunrise", "sunset", "moon", "daylight", "light", "dark", "glow", "date", "until", "till", "since",
+                                    "remind", "days", "start", "leave", "what day", "how long"};
+  char lc[CHAT_WORK_MAX + 8];
+  int ln = 0;
+  for (const char* p = raw; *p && ln < (int)sizeof(lc) - 1; p++) lc[ln++] = (*p >= 'A' && *p <= 'Z') ? (char)(*p + 32) : *p;
+  lc[ln] = 0;
+  bool about_time = false;
+  for (size_t k = 0; k < sizeof(key) / sizeof(key[0]); k++) if (strstr(lc, key[k])) { about_time = true; break; }
+  int n = 0, i = 0;
+  while (raw[i] && n < osz - 24) {
+    bool start = (i == 0) || !(calcIsDig(raw[i - 1]) || raw[i - 1] == '/' || raw[i - 1] == '.');
+    if (about_time && start && calcIsDig(raw[i])) {
+      int j = i, d1 = 0, d2 = 0, yv = 0, yl = 0;
+      while (calcIsDig(raw[j]) && j - i < 2) { d1 = d1 * 10 + (raw[j] - '0'); j++; }
+      if (raw[j] == '/' && calcIsDig(raw[j + 1])) {
+        int k = j + 1;
+        while (calcIsDig(raw[k]) && k - (j + 1) < 2) { d2 = d2 * 10 + (raw[k] - '0'); k++; }
+        int e = k;
+        if (raw[k] == '/' && calcIsDig(raw[k + 1])) {
+          int y0 = k + 1, y = y0;
+          while (calcIsDig(raw[y]) && y - y0 < 4) { yv = yv * 10 + (raw[y] - '0'); y++; }
+          yl = y - y0;
+          if (yl == 2 || yl == 4) { e = y; if (yl == 2) yv += 2000; } else yv = 0;
+        }
+        bool tail_ok = !(calcIsDig(raw[e]) || raw[e] == '/');
+        int yy = yv ? yv : 2026;
+        if (tail_ok && d1 >= 1 && d1 <= 31 && d2 >= 1 && d2 <= 12 && d1 <= hbDaysInMonth(yy, d2)) {
+          n += snprintf(out + n, osz - n, "%d %s", d1, HB_MONTHS[d2 - 1]);
+          if (yv) n += snprintf(out + n, osz - n, " %d", yv);
+          i = e;
+          continue;
+        }
+      }
+    }
+    out[n++] = raw[i++];
+  }
+  out[n] = 0;
+}
+
+// a clock time in lower case text, searching from index 'from'. 1 = found (*mins 0..1440, *end = index after it), 0 = none,
+// -1 = "at 5" with no am or pm. Understands 5pm, 5:30pm, 5.30 pm, 17:30, noon, midday, midnight (= 1440, the end of the day).
+static int hbClockAt(const char* s, int from, int* mins, int* end) {
+  int n = (int)strlen(s);
+  for (int i = from; i < n; i++) {
+    bool edge = (i == 0) || !(calcIsAlpha(s[i - 1]) || calcIsDig(s[i - 1]) || s[i - 1] == ':' || s[i - 1] == '.' || s[i - 1] == '/');
+    if (!edge) continue;
+    if (strncmp(s + i, "noon", 4) == 0 && !calcIsAlpha(s[i + 4])) { *mins = 720; *end = i + 4; return 1; }
+    if (strncmp(s + i, "midday", 6) == 0 && !calcIsAlpha(s[i + 6])) { *mins = 720; *end = i + 6; return 1; }
+    if (strncmp(s + i, "midnight", 8) == 0 && !calcIsAlpha(s[i + 8])) { *mins = 1440; *end = i + 8; return 1; }
+    if (!calcIsDig(s[i])) continue;
+    int j = i, h = 0, mm = 0;
+    while (calcIsDig(s[j]) && j - i < 3) { h = h * 10 + (s[j] - '0'); j++; }
+    if (calcIsDig(s[j]) || j - i > 2) continue;                         // a long number is not a time
+    bool colon = false, dot = false;
+    if ((s[j] == ':' || s[j] == '.') && calcIsDig(s[j + 1]) && calcIsDig(s[j + 2]) && !calcIsDig(s[j + 3])) {
+      colon = (s[j] == ':');
+      dot = !colon;
+      mm = (s[j + 1] - '0') * 10 + (s[j + 2] - '0');
+      j += 3;
+    }
+    int k = j;
+    if (s[k] == ' ') k++;
+    int ap = 0;   // 1 am, 2 pm
+    if ((s[k] == 'a' || s[k] == 'p') && s[k + 1] == 'm' && !calcIsAlpha(s[k + 2])) { ap = s[k] == 'a' ? 1 : 2; k += 2; }
+    else if ((s[k] == 'a' || s[k] == 'p') && s[k + 1] == '.' && s[k + 2] == 'm' && !calcIsAlpha(s[k + 3])) { ap = s[k] == 'a' ? 1 : 2; k += 3; if (s[k] == '.') k++; }
+    if (ap) {
+      if (h < 1 || h > 12 || mm > 59) continue;
+      *mins = (h % 12) * 60 + mm + (ap == 2 ? 720 : 0);
+      *end = k;
+      return 1;
+    }
+    if (colon) {
+      if (h > 23 || mm > 59) continue;
+      *mins = h * 60 + mm;
+      *end = j;
+      return 1;
+    }
+    if (dot) continue;   // 5.30 on its own could be a distance
+    // a bare hour: only an "at 5" or "5 o'clock" is taken for a time, and it needs am or pm
+    int b = i - 1;
+    while (b >= 0 && s[b] == ' ') b--;
+    bool after_at = b >= 1 && s[b] == 't' && s[b - 1] == 'a' && (b == 1 || !calcIsAlpha(s[b - 2]));
+    if (!after_at && b >= 4 && (strncmp(s + b - 4, "until", 5) == 0 || strncmp(s + b - 4, "since", 5) == 0)) after_at = true;
+    if (!after_at && b >= 3 && strncmp(s + b - 3, "till", 4) == 0) after_at = true;
+    bool oclock = strncmp(s + j, " o'clock", 8) == 0 || strncmp(s + j, " oclock", 7) == 0;
+    if ((after_at || oclock) && h >= 1 && h <= 12) return -1;
+  }
+  return 0;
+}
+
+static void hbLower(const char* in, char* out, int osz) {   // same length as the input (ASCII lower case)
+  int n = 0;
+  for (; in[n] && n < osz - 1; n++) out[n] = (in[n] >= 'A' && in[n] <= 'Z') ? (char)(in[n] + 32) : in[n];
+  out[n] = 0;
+}
+
+// a span of minutes: "45 min", "2 hr 14 min", "4 days 3 hr"
+static void hbFmtSpan(long m, char* out, int osz) {
+  if (m < 0) m = -m;
+  if (m >= 2880) {
+    long d = m / 1440, h = (m % 1440) / 60;
+    if (h == 0) snprintf(out, osz, "%ld days", d);
+    else snprintf(out, osz, "%ld days %ld hr", d, h);
+  } else {
+    hbFmtMin((int)m, out, osz);
+  }
+}
+
+static void hbDayShort(long ld, char* out, int osz, bool with_year) {   // "Sat 28 Nov", "Fri 25 Dec 2026"
+  int y, m, d;
+  hbCivil(ld, &y, &m, &d);
+  int wd = (int)((ld + 4) % 7);
+  if (with_year) snprintf(out, osz, "%.3s %d %.3s %d", HB_DAYS[wd], d, HB_MONTHS[m - 1], y);
+  else snprintf(out, osz, "%.3s %d %.3s", HB_DAYS[wd], d, HB_MONTHS[m - 1]);
+}
+
+static const char* hbHolidayName(const HbCtx* H) {
+  if (hbHas(H->padded, "christmas eve;xmas eve")) return "Christmas Eve";
+  if (hbHas(H->padded, "christmas;xmas")) return "Christmas Day";
+  if (hbHas(H->padded, "new year eve;new years eve")) return "New Year's Eve";
+  if (hbHas(H->padded, "new year;new years")) return "New Year's Day";
+  if (hbHas(H->padded, "easter")) return "Easter Sunday";
+  return NULL;
+}
+
+// minute of the day (local) of a sun or moon event on a day. ev: 0 sunrise, 1 sunset, 2 first light, 3 last light, 4 moonrise, 5 moonset.
+// -1 if there is none that day (the moon can skip a rise or set).
+static int hbEventMin(int ev, long ld) {
+  int y, m, d, rise, set;
+  hbCivil(ld, &y, &m, &d);
+  if (ev <= 3) {
+    hbSun(y, m, d, &rise, &set);
+    if (ev == 0) return rise;
+    if (ev == 1) return set;
+    if (ev == 2) return rise - 25;
+    return set + 25;
+  }
+  int mr, ms;
+  hbMoonRiseSet(ld * 86400L - HIKE_TZ_SECS, &mr, &ms);
+  return ev == 4 ? mr : ms;
+}
+
+// "how long until ...", "how long since ...", "how long from 6am to 2:30pm", "how long have I been walking"
+static HB_NOINLINE int hbTimeChat(HbCtx* H, const char* src) {
+  bool between_q = hbHas(H->padded, "from;between") && hbHas(H->padded, "how long;how many hours;how many minutes;how many mins;how much time;duration;hours between");
+  bool walked = hbHas(H->padded, "have i been walking;have i been hiking;have i been out;have i been going;have we been walking;have we been hiking;"
+                                 "have we been out;been on the trail;been on the track;been on the hike;been on this walk;been on the walk;"
+                                 "how long since i started;how long since we started;how long since i left;how long since we left;"
+                                 "how long have i walked;how long have i hiked;how long have we walked;how long have we hiked;how long was i out");
+  bool until = hbHas(H->padded, "until;till;til") &&
+               hbHas(H->padded, "how long;how many;how much time;time until;time till;countdown;how far away;sleeps;how soon");
+  bool since = (hbHas(H->padded, "since") && hbHas(H->padded, "how long;how many;how much time;time since;it been;it has been")) ||
+               hbHas(H->padded, "how long ago");
+  if (!between_q && !walked && !until && !since) return 0;
+
+  static char lc[CHAT_WORK_MAX + 8];
+  hbLower(src, lc, sizeof(lc));
+  uint32_t now = H->c->now_utc;
+
+  // between two times of day: needs no clock
+  if (between_q && !walked) {
+    int m1 = 0, e1 = 0, m2 = 0, e2 = 0;
+    int r1 = hbClockAt(lc, 0, &m1, &e1);
+    int r2 = r1 == 1 ? hbClockAt(lc, e1, &m2, &e2) : 0;
+    if (r1 == -1 || r2 == -1) { hbMsg(&H->o, "Please give am or pm, for example: how long from 6am to 2:30pm."); return H->o.n; }
+    if (r1 == 1 && r2 == 1 && m1 != m2) {
+      char f[14], t[14], sp[24];
+      int d = m2 - m1;
+      if (d < 0) d += 1440;
+      hbFmtClock(m1, f, sizeof(f));
+      hbFmtClock(m2, t, sizeof(t));
+      hbFmtSpan(d, sp, sizeof(sp));
+      hbMsg(&H->o, "From %s to %s is %s.", f, t, sp);
+      return H->o.n;
+    }
+    if (!until && !since) return 0;
+  }
+
+  if (walked) {
+    if (!H->clk.ok) { hbMsg(&H->o, "My clock isn't set, so I can't tell how long you've been out."); return H->o.n; }
+    if (!hikeTimerLive(H->who, now)) {
+      hbMsg(&H->o, "I don't have a hike timer running for you. Say I am starting now when you set off, and I'll time the walk.");
+      return H->o.n;
+    }
+    long el = ((long)now - (long)H->who->t_start) / 60L;
+    long sl = ((long)H->who->t_start + HIKE_TZ_SECS) % 86400L / 60L;
+    char sp[24], st[14];
+    hbFmtSpan(el, sp, sizeof(sp));
+    hbFmtClock((int)sl, st, sizeof(st));
+    hbMsg(&H->o, "You've been out about %s. Your timer started at %s (Qld time).", sp, st);
+    return H->o.n;
+  }
+
+  if (!H->clk.ok) { hbNoClock(H); return H->o.n; }
+  long today_ld = ((long)now + HIKE_TZ_SECS) / 86400L;
+  int nowmin = H->clk.mins;
+  long now_lmin = today_ld * 1440L + nowmin;
+  long dld = 0;
+  bool have_day = hbFindDay(H->norm, today_ld, &dld);
+  int cm = 0, ce = 0;
+  int cr = hbClockAt(lc, 0, &cm, &ce);
+  char sp[24], tm[14], dl[28], dl2[28];
+
+  if (until) {
+    // sun and moon events
+    int ev = -1;
+    if (hbHas(H->padded, "moonrise;moon rise;moon rises")) ev = 4;
+    else if (hbHas(H->padded, "moonset;moon set;moon sets")) ev = 5;
+    else if (hbHas(H->padded, "first light;dawn")) ev = 2;
+    else if (hbHas(H->padded, "last light;dusk;dark;nightfall;get dark;gets dark")) ev = 3;
+    else if (hbHas(H->padded, "sunrise;sun rise;sun rises")) ev = 0;
+    else if (hbHas(H->padded, "sunset;sun set;sun sets")) ev = 1;
+    if (ev >= 0) {
+      static const char* const nm[] = {"Sunrise", "Sunset", "First light", "Last light", "Moonrise", "Moonset"};
+      long tld = have_day ? dld : today_ld;
+      if (tld < today_ld) { hbMsg(&H->o, "That day has passed."); return H->o.n; }
+      bool rolled = false;
+      int em = -1;
+      for (int tries = 0; tries < 3; tries++) {
+        em = hbEventMin(ev, tld);
+        if (em >= 0 && tld * 1440L + em > now_lmin) break;
+        if (em >= 0 && tld == today_ld) rolled = true;
+        em = -1;
+        tld++;
+      }
+      if (em < 0) { hbMsg(&H->o, "I can't find a %s in the next few days.", nm[ev]); return H->o.n; }
+      hbFmtClock(em, tm, sizeof(tm));
+      hbFmtSpan(tld * 1440L + em - now_lmin, sp, sizeof(sp));
+      hbDayShort(tld, dl, sizeof(dl), false);
+      if (rolled) hbMsg(&H->o, "%s has passed today. Tomorrow's is about %s (Qld time), in %s.", nm[ev], tm, sp);
+      else if (tld == today_ld) hbMsg(&H->o, "%s is about %s (Qld time), in %s.", nm[ev], tm, sp);
+      else hbMsg(&H->o, "%s on %s is about %s (Qld time), in %s.", nm[ev], dl, tm, sp);
+      return H->o.n;
+    }
+    if (cr == -1) { hbMsg(&H->o, "Please give am or pm, for example: how long until 5pm."); return H->o.n; }
+    if (cr == 1) {   // a time of day, perhaps on a named day
+      long tld = have_day ? dld : today_ld;
+      bool rolled = false;
+      if (!have_day && cm <= nowmin) { tld = today_ld + 1; rolled = true; }
+      long diff = tld * 1440L + cm - now_lmin;
+      hbFmtClock(cm, tm, sizeof(tm));
+      hbDayShort(tld, dl, sizeof(dl), false);
+      if (diff <= 0) {
+        hbFmtSpan(-diff, sp, sizeof(sp));
+        hbMsg(&H->o, "%s on %s (Qld time) was %s ago.", tm, dl, sp);
+      } else {
+        hbFmtSpan(diff, sp, sizeof(sp));
+        if (rolled) hbMsg(&H->o, "%s has passed today, so I took tomorrow's: %s, %s (Qld time) is in %s.", tm, dl, tm, sp);
+        else if (tld == today_ld) hbMsg(&H->o, "%s (Qld time) is in %s.", tm, sp);
+        else hbMsg(&H->o, "%s, %s (Qld time) is in %s.", dl, tm, sp);
+      }
+      return H->o.n;
+    }
+    if (have_day && dld != today_ld) {   // a day only: how many days
+      const char* hn = hbHolidayName(H);
+      long off = dld - today_ld;
+      hbDayShort(dld, dl, sizeof(dl), true);
+      if (off == 1) hbMsg(&H->o, "%s%s%s is tomorrow.", hn ? hn : "", hn ? ": " : "", dl);
+      else if (off == -1) hbMsg(&H->o, "%s%s%s was yesterday.", hn ? hn : "", hn ? ": " : "", dl);
+      else if (off > 0) hbMsg(&H->o, "%s%s%s is in %ld days.", hn ? hn : "", hn ? ": " : "", dl, off);
+      else hbMsg(&H->o, "%s%s%s was %ld days ago.", hn ? hn : "", hn ? ": " : "", dl, -off);
+      return H->o.n;
+    }
+    return 0;
+  }
+
+  // since
+  long tld = today_ld;
+  bool rolled = false;
+  if (have_day) {
+    tld = dld;
+    if (tld > today_ld) {   // a future day cannot be "since": take the latest one that has passed
+      if (hbHas(H->padded, "monday;tuesday;wednesday;thursday;friday;saturday;sunday;mon;tues;weds;thur;thurs;tue;wed;thu;fri;sat;sun")) tld -= 7;
+      else {
+        int ty, tmo, tdd;
+        hbCivil(today_ld, &ty, &tmo, &tdd);
+        long shifted = hbDaysFromCivil(ty - 1, tmo, tdd > hbDaysInMonth(ty - 1, tmo) ? hbDaysInMonth(ty - 1, tmo) : tdd);
+        long d2 = 0;
+        if (hbFindDay(H->norm, shifted, &d2) && d2 <= today_ld) tld = d2;
+        else { hbMsg(&H->o, "That day hasn't happened yet. Try: how long until..."); return H->o.n; }
+      }
+    }
+  }
+  if (cr == -1) { hbMsg(&H->o, "Please give am or pm, for example: how long since 2pm."); return H->o.n; }
+  if (cr == 1) {
+    if (!have_day && cm > nowmin) { tld = today_ld - 1; rolled = true; }
+    long diff = now_lmin - (tld * 1440L + cm);
+    hbFmtClock(cm, tm, sizeof(tm));
+    hbDayShort(tld, dl, sizeof(dl), false);
+    if (diff < 0) { hbMsg(&H->o, "%s on %s hasn't happened yet. Try: how long until...", tm, dl); return H->o.n; }
+    hbFmtSpan(diff, sp, sizeof(sp));
+    if (rolled) hbMsg(&H->o, "%s hasn't come yet today, so I took yesterday's: it's been %s (Qld time).", tm, sp);
+    else hbMsg(&H->o, "It's been %s since %s on %s (Qld time).", sp, tm, dl);
+    return H->o.n;
+  }
+  if (have_day) {
+    const char* hn = hbHolidayName(H);
+    long off = today_ld - tld;
+    hbDayShort(tld, dl, sizeof(dl), true);
+    if (off == 0) hbMsg(&H->o, "%s%sThat's today.", hn ? hn : "", hn ? ": " : "");
+    else if (off == 1) hbMsg(&H->o, "%s%s%s was yesterday.", hn ? hn : "", hn ? ": " : "", dl);
+    else hbMsg(&H->o, "It's been %ld days since %s%s%s.", off, hn ? hn : "", hn ? ", " : "", dl);
+    (void)dl2;
+    return H->o.n;
+  }
+  return 0;
+}
+
+// ---- reminders ------------------------------------------------------------------------------------------------
+
+// a word (lower case, apostrophes removed) that can be part of "at 10am on Saturday", "in 2 hours", "tomorrow", "25 December"
+static bool hbWhenWord(const char* w, int n) {
+  static const char* const L[] = {"at", "on", "in", "this", "next", "the", "of", "and", "a", "an", "tomorrow", "tmrw", "tomorow", "tommorow",
+                                  "tmr", "today", "tonight", "day", "month", "months", "after", "noon", "midday", "midnight", "am", "pm", "oclock", "minute",
+                                  "minutes", "min", "mins", "hour", "hours", "hr", "hrs", "week", "weeks", "days", "christmas", "xmas", "new",
+                                  "year", "years", "easter", "eve"};
+  for (size_t i = 0; i < sizeof(L) / sizeof(L[0]); i++) if (hbWordIs(w, n, L[i])) return true;
+  int v;
+  if (hbWeekdayWord(w, n) >= 0 || hbMonthWord(w, n) > 0 || hbNumberWord(w, n, &v)) return true;
+  if (calcIsDig(w[0])) {   // 10am, 10:30pm, 17:30, 9.15am
+    int i = 0;
+    while (i < n && (calcIsDig(w[i]) || w[i] == ':' || w[i] == '.')) i++;
+    if (i == n) return true;
+    if (n - i == 2 && (w[i] == 'a' || w[i] == 'p') && w[i + 1] == 'm') return true;
+  }
+  return false;
+}
+
+// 0 = ok, 1 = no time found, 2 = that time has passed, 3 = more than 7 days ahead, 4 = needs am or pm, 5 = needs a time of day
+static HB_NOINLINE int hbWhenParse(HbCtx* H, const char* when, uint32_t* due, bool* rolled) {
+  uint32_t now = H->c->now_utc;
+  long today_ld = ((long)now + HIKE_TZ_SECS) / 86400L;
+  long now_lsec = (long)now + HIKE_TZ_SECS;
+  *rolled = false;
+  // "in 2 hours", "in 30 minutes" (days and weeks go with a time of day below)
+  {
+    char nm[CHAT_WORK_MAX + 8];
+    chatNorm(when, nm, sizeof(nm));
+    HbWords w;
+    hbSplit(nm, &w);
+    for (int i = 0; i + 2 < w.n; i++) {
+      if (!hbWordIs(w.p[i], w.l[i], "in")) continue;
+      int v = 0;
+      bool art = hbWordIs(w.p[i + 1], w.l[i + 1], "a") || hbWordIs(w.p[i + 1], w.l[i + 1], "an");
+      if (!art && !hbNumberWord(w.p[i + 1], w.l[i + 1], &v)) continue;
+      if (art) v = 1;
+      const char* u = w.p[i + 2];
+      int ul = w.l[i + 2];
+      long secs = 0;
+      if (hbWordIs(u, ul, "minute") || hbWordIs(u, ul, "minutes") || hbWordIs(u, ul, "min") || hbWordIs(u, ul, "mins")) secs = 60L * v;
+      else if (hbWordIs(u, ul, "hour") || hbWordIs(u, ul, "hours") || hbWordIs(u, ul, "hr") || hbWordIs(u, ul, "hrs")) secs = 3600L * v;
+      if (secs > 0) {
+        if (secs > REM_MAX_AHEAD_S) return 3;
+        *due = now + (uint32_t)secs;
+        return 0;
+      }
+    }
+  }
+  int cm = 0, ce = 0;
+  int cr = hbClockAt(when, 0, &cm, &ce);
+  if (cr == -1) return 4;
+  long dld = 0;
+  char nm2[CHAT_WORK_MAX + 8];
+  chatNorm(when, nm2, sizeof(nm2));
+  bool have_day = hbFindDay(nm2, today_ld, &dld);
+  if (!have_day && (strstr(when, "next ") || strstr(when, "this ") || strstr(when, "month"))) return 1;   // "next month", "this week": say a day
+  long due_lsec;
+  if (cr == 1 && have_day) {
+    if (dld < today_ld) return 2;
+    due_lsec = dld * 86400L + (long)cm * 60L;
+  } else if (cr == 1) {
+    due_lsec = today_ld * 86400L + (long)cm * 60L;
+    if (due_lsec <= now_lsec) { due_lsec += 86400L; *rolled = true; }
+  } else if (have_day) {
+    return 5;
+  } else {
+    return 1;
+  }
+  if (due_lsec <= now_lsec) return 2;
+  if (due_lsec - now_lsec > REM_MAX_AHEAD_S) return 3;
+  *due = (uint32_t)(due_lsec - HIKE_TZ_SECS);
+  return 0;
+}
+
+// "Sat 28 Nov, 10:00 am (in 4 days)"
+static void hbDueLabel(uint32_t due, uint32_t now, char* out, int osz) {
+  long dl = (long)due + HIKE_TZ_SECS;
+  char d[24], t[14], sp[24];
+  hbDayShort(dl / 86400L, d, sizeof(d), false);
+  hbFmtClock((int)(dl % 86400L / 60L), t, sizeof(t));
+  long delta = ((long)due - (long)now) / 60L;
+  if (delta < 1) delta = 1;
+  hbFmtSpan(delta, sp, sizeof(sp));
+  snprintf(out, osz, "%s, %s Qld time (in %s)", d, t, sp);
+}
+
+static const char* hbRemindHelp = "Try: remind me at 10am on Saturday to take my hiking boots. Or: remind me in 2 hours to ...";
+
+static HB_NOINLINE int hbRemindChat(HbCtx* H, const char* src, uint16_t id) {
+  bool list_q = hbHas(H->padded, "my reminder;my reminders;what reminders;any reminders;do i have a reminder;show reminders;list reminders;list my reminders");
+  bool cancel_q = hbHas(H->padded, "cancel my reminder;cancel my reminders;cancel reminder;cancel the reminder;delete my reminder;delete reminder;"
+                                   "remove my reminder;remove reminder;clear my reminder;clear my reminders;forget my reminder;stop my reminder");
+  static char lc[CHAT_WORK_MAX + 8];
+  hbLower(src, lc, sizeof(lc));
+  // where the arguments of "remind me ..." start
+  static const char* const kw[] = {"remind me", "set a reminder", "set me a reminder", "set reminder", "add a reminder", "make a reminder", "create a reminder"};
+  int args = -1;
+  for (size_t k = 0; k < sizeof(kw) / sizeof(kw[0]); k++) {
+    const char* f = strstr(lc, kw[k]);
+    if (!f) continue;
+    int at = (int)(f - lc);
+    if (at > 0 && calcIsAlpha(lc[at - 1])) continue;
+    int e = at + (int)strlen(kw[k]);
+    if (calcIsAlpha(lc[e])) continue;
+    if (args < 0 || e < args) args = e;
+  }
+  if (args < 0 && !list_q && !cancel_q) return 0;
+  if (hbSafetyWins(H->padded, true)) return 0;   // a real emergency comes first (snake, tick and gear words do not count here)
+
+  if (args < 0 && cancel_q) {
+    RemindItem* r = remindFor(id);
+    if (!r) { hbMsg(&H->o, "You don't have a reminder set."); return H->o.n; }
+    char t[REM_TEXT_MAX + 1];
+    strcpy(t, r->text);
+    remindCancel(id);
+    hbMsg(&H->o, "Cancelled your reminder: %s", t);
+    return H->o.n;
+  }
+  if (args < 0 && list_q) {
+    RemindItem* r = remindFor(id);
+    if (!r) { hbMsg(&H->o, "You don't have a reminder set. %s", hbRemindHelp); return H->o.n; }
+    char lab[64];
+    hbDueLabel(r->due, H->c->now_utc, lab, sizeof(lab));
+    hbMsg(&H->o, "Your reminder: %s: %s", lab, r->text);
+    return H->o.n;
+  }
+  if (cancel_q) return 0;   // "remind me ... cancel my reminder" is too mixed up to act on
+  if (!H->clk.ok) { hbMsg(&H->o, "My clock isn't set, so I can't set reminders."); return H->o.n; }
+
+  // the words after "remind me": the time part is made of time words only, the rest is the reminder text
+  const char* wp[28];
+  int wl[28];
+  char wlow[28][22];
+  int nw = 0;
+  {
+    const char* s = src + args;
+    while (*s && nw < 28) {
+      while (*s == ' ') s++;
+      if (!*s) break;
+      const char* e = s;
+      while (*e && *e != ' ') e++;
+      wp[nw] = s;
+      wl[nw] = (int)(e - s);
+      // lower case, without punctuation at the ends or apostrophes
+      int k = 0;
+      for (const char* q = s; q < e && k < 20; q++) {
+        char c = (*q >= 'A' && *q <= 'Z') ? (char)(*q + 32) : *q;
+        if (c == '\'') continue;
+        if ((c == ',' || c == '.' || c == ';' || c == '!' || c == '?') && (q + 1 == e || q == s)) { if (!(calcIsDig(c) )) continue; }
+        wlow[nw][k++] = c;
+      }
+      wlow[nw][k] = 0;
+      nw++;
+      s = e;
+    }
+  }
+  int i0 = 0;
+  while (i0 < nw && (strcmp(wlow[i0], "please") == 0 || strcmp(wlow[i0], "for") == 0)) i0++;
+  auto isWhen = [&](int a, int b) {   // words a .. b-1 are all time words
+    if (a >= b) return false;
+    for (int i = a; i < b; i++) if (!hbWhenWord(wlow[i], (int)strlen(wlow[i]))) return false;
+    return true;
+  };
+  auto joinWhen = [&](int a, int b, char* out, int osz) {
+    int n = 0;
+    for (int i = a; i < b && n < osz - 24; i++) n += snprintf(out + n, osz - n, "%s%s", n ? " " : "", wlow[i]);
+    out[n] = 0;
+  };
+  static char when[CHAT_WORK_MAX + 8];
+  int tstart = -1, tend = -1;   // the text is words tstart .. tend-1
+  int status = 1;
+  uint32_t due = 0;
+  bool rolled = false;
+  bool text_first = i0 < nw && (strcmp(wlow[i0], "to") == 0 || strcmp(wlow[i0], "that") == 0 || strcmp(wlow[i0], "about") == 0);
+  {   // "what does that remind me of", "remind me how to tie a knot": not a reminder, leave it to the normal chat
+    bool when_start = i0 < nw && hbWhenWord(wlow[i0], (int)strlen(wlow[i0])) && strcmp(wlow[i0], "of") != 0 && strcmp(wlow[i0], "and") != 0 &&
+                      strcmp(wlow[i0], "the") != 0 && strcmp(wlow[i0], "a") != 0 && strcmp(wlow[i0], "an") != 0;
+    if (!text_first && !when_start) return 0;
+  }
+  if (!text_first) {
+    // "at 10am on Saturday to take my boots": the time first, then " to ", then the text
+    int k0 = -1;
+    for (int k = i0 + 1; k < nw; k++) if (strcmp(wlow[k], "to") == 0 || strcmp(wlow[k], "that") == 0) { k0 = k; break; }
+    if (k0 > 0 && isWhen(i0, k0)) {
+      joinWhen(i0, k0, when, sizeof(when));
+      status = hbWhenParse(H, when, &due, &rolled);
+      tstart = k0 + 1;
+      tend = nw;
+    } else {
+      // "at 10am take my boots": the longest run of time words, then the text
+      for (int k = nw - 1; k > i0; k--) {
+        if (!isWhen(i0, k)) continue;
+        joinWhen(i0, k, when, sizeof(when));
+        status = hbWhenParse(H, when, &due, &rolled);
+        tstart = k;
+        tend = nw;
+        break;
+      }
+    }
+  } else {
+    // "to take my boots at 10am on Saturday": the text first, the time at the end
+    for (int i = i0 + 2; i < nw; i++) {
+      if (!isWhen(i, nw)) continue;
+      joinWhen(i, nw, when, sizeof(when));
+      int st = hbWhenParse(H, when, &due, &rolled);
+      if (st == 1) continue;
+      status = st;
+      tstart = i0 + 1;
+      tend = i;
+      break;
+    }
+  }
+  if (tstart < 0 || status == 1) {
+    hbMsg(&H->o, "I couldn't find a time in that. %s", hbRemindHelp);
+    return H->o.n;
+  }
+  if (status == 2) { hbMsg(&H->o, "That time has already passed. Try a later time, or say tomorrow."); return H->o.n; }
+  if (status == 3) { hbMsg(&H->o, "I can only set reminders up to 7 days ahead."); return H->o.n; }
+  if (status == 4) { hbMsg(&H->o, "Please give am or pm, for example: remind me at 10am to ..."); return H->o.n; }
+  if (status == 5) { hbMsg(&H->o, "What time? For example: remind me at 8am on Saturday to ..."); return H->o.n; }
+  while (tstart < tend && (strcmp(wlow[tstart], "to") == 0 || strcmp(wlow[tstart], "that") == 0 || strcmp(wlow[tstart], "about") == 0)) tstart++;
+  if (tstart >= tend) { hbMsg(&H->o, "What should I remind you about? %s", hbRemindHelp); return H->o.n; }
+  // the text as typed, from the first word to the last (trailing punctuation dropped)
+  const char* ts = wp[tstart];
+  int tlen = (int)((wp[tend - 1] + wl[tend - 1]) - ts);
+  while (tlen > 0 && (ts[tlen - 1] == '.' || ts[tlen - 1] == '!' || ts[tlen - 1] == '?' || ts[tlen - 1] == ',')) tlen--;
+  static char text[CHAT_WORK_MAX + 8];
+  if (tlen > (int)sizeof(text) - 1) tlen = (int)sizeof(text) - 1;
+  memcpy(text, ts, tlen);
+  text[tlen] = 0;
+
+  bool cut = false;
+  int r = remindAdd(id, H->c->sender, H->c->slen, text, due, &cut);
+  char lab[64];
+  if (r == 1) {
+    RemindItem* old = remindFor(id);
+    hbDueLabel(old->due, H->c->now_utc, lab, sizeof(lab));
+    hbMsg(&H->o, "You already have a reminder: %s: %s", lab, old->text);
+    hbMsg(&H->o, "Say cancel my reminder first, then set the new one.");
+    return H->o.n;
+  }
+  if (r == 2) { hbMsg(&H->o, "Reminders are full right now. Try again later."); return H->o.n; }
+  RemindItem* it = remindFor(id);
+  hbDueLabel(due, H->c->now_utc, lab, sizeof(lab));
+  hbMsg(&H->o, "Reminder set for %s: %s%s", lab, it->text, cut ? " (text cut to fit)" : "");
+  hbMsg(&H->o, "Best effort: lost if the repeater restarts, and everyone on this channel can read it.");
+  return H->o.n;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// calculator, unit conversions and hiking maths (CalcBot.h). Called after the safety rules, so those always win.
+//   "I'm going on a hike, it's 8km and climbs 300m. How long will it take?"  -> Naismith's rule (rough), scaled to the person's pace
+//   "how many miles is 10km", "30c in f", "what is 12*(3+4)", "15% of 80"      -> conversions and maths
+// Returns the number of messages, or 0 if the sentence is not for the calculator.
+static HB_NOINLINE int hbCalcChat(HbCtx* H, const char* text, uint16_t id) {
+  CalcHike hk;
+  if (calcHikeParse(text, &hk)) {
+    bool timeq = hbHas(H->padded, "how long;how many hours;how many hrs;how many minutes;how many mins;how much time;will it take;would it take;"
+                                  "does it take;take me;estimate;naismith;time for;how fast;eta");
+    bool startq = hbHas(H->padded, "when should i start;when should i leave;what time should i start;what time should i leave;latest start;"
+                                   "when should i set off;what time should i set off;when do i need to start;when do i need to leave");
+    bool gradeq = hk.has_climb && hbHas(H->padded, "how steep;gradient;slope;what grade;how hard;steepness;average grade");
+    // a trail named with no climb given ("how long is the 4km Natural Bridge walk") is a question about that trail: leave it to the trail lookup
+    bool trail_named = !hk.has_climb && hbTrailIn(H, false, false) >= 0;
+    if ((timeq || startq) && !trail_named) {
+      int need = calcNaismithMin(&hk);
+      if (need < 0) {
+        hbMsg(&H->o, "Those numbers look off. Give the distance in km (or miles) and the climb in metres, for example: 8km and climbs 300m.");
+        return H->o.n;
+      }
+      char dd[16], cc[16], ds[16], head[96], tm[20], tp[20];
+      calcFmt(hk.dist_km, 4, dd, sizeof(dd));
+      int hl = snprintf(head, sizeof(head), "%skm%s", dd, hk.one_way ? " one way" : "");
+      if (hk.has_climb) { calcFmt(hk.climb_m, 4, cc, sizeof(cc)); hl += snprintf(head + hl, sizeof(head) - hl, " with %sm climb", cc); }
+      if (hk.has_desc) { calcFmt(hk.desc_m, 4, ds, sizeof(ds)); snprintf(head + hl, sizeof(head) - hl, " and %sm descent", ds); }
+      hbFmtMin(need, tm, sizeof(tm));
+      if (H->who->pace_pct) {
+        hbFmtMin(need * H->who->pace_pct / 100, tp, sizeof(tp));
+        hbMsg(&H->o, "%s: about %s on foot (rough, Naismith's rule), plus rests. At your pace, about %s.", head, tm, tp);
+        need = need * H->who->pace_pct / 100;
+      } else {
+        hbMsg(&H->o, "%s: about %s on foot (rough, Naismith's rule), plus rests.", head, tm);
+      }
+      HbDay td;
+      bool use_start = startq || hbDayInfo(H, &td);   // a question about when to start, or a walk on another day
+      char tot[16];
+      if (hk.one_way) calcFmt(hk.dist_km * 2.0, 4, tot, sizeof(tot));
+      if (use_start) {
+        hbDoStartAdvice(H, -1, need);
+        if (!hk.one_way && !hk.full) hbMsg(&H->o, "I took %skm as the whole walk. Say 'one way' if you walk it twice.", dd);
+      } else {
+        if (hk.one_way) hbMsg(&H->o, "That is %skm walked in total (there and back).", tot);
+        else if (!hk.full) hbMsg(&H->o, "I took %skm as the whole walk. Say 'one way' if you walk it twice.", dd);
+        if (H->clk.ok) {
+          int latest = H->clk.set - need - 30;
+          if (latest > H->clk.mins) {
+            char sl[14], lt[14];
+            hbFmtClock(H->clk.set, sl, sizeof(sl));
+            hbFmtClock(latest, lt, sizeof(lt));
+            hbMsg(&H->o, "To finish 30 min before sunset (about %s), leave by %s.", sl, lt);
+          } else {
+            hbDaylightVerdict(H, H->clk.mins, need);
+          }
+        }
+        if (!hk.has_climb) hbMsg(&H->o, "No climb given: add something like 'climbs 300m' for a better figure.");
+      }
+      return H->o.n;
+    }
+    if (gradeq && !timeq && !startq && !trail_named) {
+      int t10 = calcSlopeTenths(hk.climb_m, hk.dist_km);
+      char dd[16], cc[16];
+      calcFmt(hk.dist_km, 4, dd, sizeof(dd));
+      calcFmt(hk.climb_m, 4, cc, sizeof(cc));
+      hbMsg(&H->o, "Climbing %sm over %skm is an average slope of about %d.%d%% (roughly Gr %d).", cc, dd, t10 / 10, t10 % 10, calcSlopeGrade(t10));
+      hbMsg(&H->o, "The listed grade also counts steps and surface, so check the park page for the track.");
+      return H->o.n;
+    }
+  }
+  static char ans[BOT_MSG_MAX];
+  int r = calcAnswer(text, false, id, ans, sizeof(ans));
+  if (r == 0) return 0;
+  hbMsg(&H->o, "%s", ans);
+  return H->o.n;
+}
+
 static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out[][BOT_MSG_MAX + 1]) {
   if (!g_hike_ready) {
     memset(g_hike_cyc, 255, sizeof(g_hike_cyc));
@@ -2097,7 +2769,18 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (H.o.budget > BOT_MSG_MAX) H.o.budget = BOT_MSG_MAX;
   if (H.o.budget < 30) return 0;
 
-  chatNorm(text, H.norm, sizeof(H.norm));
+  if (c->calc_only) {   // calcchan: only calculator and conversion requests, nothing remembered and no memory slot used
+    char cn[CHAT_NAME_MAX + 8];
+    chatCleanName(c->sender, c->slen, cn);
+    static char cans[BOT_MSG_MAX];
+    if (calcAnswer(text, true, chatHash(cn, (int)strlen(cn)), cans, sizeof(cans)) == 0) return 0;
+    hbMsg(&H.o, "%s", cans);
+    return H.o.n;
+  }
+
+  static char dtxt[CHAT_WORK_MAX + 40];   // the text with day-first dates (25/12) written out, for the time and reminder code
+  hbSlashDates(text, dtxt, sizeof(dtxt));
+  chatNorm(dtxt, H.norm, sizeof(H.norm));
   snprintf(H.padded, sizeof(H.padded), " %s ", H.norm);
   {   // a signal test needs nothing remembered: no memory slot is used for it (and none for anything else on a test channel)
     char tq[TRAILBOT_QUERY_MAX + 8];
@@ -2125,6 +2808,12 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (H.norm[0] == 0) return hbChat(&H, text);   // just "!"
 
   bool q_words = H.question || hbHas(H.padded, "should i;what time;when should;if i;can i;is it;how long;will i");
+
+  // reminders ("remind me at 10am on Saturday to take my hiking boots"). Before the hike timer, so "remind me to start at 6am" does not start a timer.
+  {
+    int rr = hbRemindChat(&H, dtxt, chatHash(name, (int)strlen(name)));
+    if (rr > 0) return rr;
+  }
 
   // 4. hike timer
   bool has_finish = hbHas(H.padded, "finished;finish hike;finished hike;finished the hike;finished my hike;finished the walk;finished my walk;"
@@ -2241,6 +2930,18 @@ static HB_NOINLINE int hikebotReply(const HikeCtx* c, const char* text, char out
   if (P->last_intent == HI_SUGGEST && hbWordCount(H.norm) <= 4 &&
       hbHas(H.padded, "more;another;what else;anything else;others;next;more options;other options;show me more;give me more")) {
     return hbSuggestList(&H, true);
+  }
+
+  // 5a. time until and since ("how long until 5pm", "how many days until Christmas", "how long have I been walking")
+  {
+    int tr = hbTimeChat(&H, dtxt);
+    if (tr > 0) return tr;
+  }
+
+  // 5a. calculator, unit conversions, hiking maths (after the safety rules, which have already had their turn)
+  {
+    int cr = hbCalcChat(&H, text, chatHash(name, (int)strlen(name)));
+    if (cr > 0) return cr;
   }
 
   // 5b. a walk planned for another day

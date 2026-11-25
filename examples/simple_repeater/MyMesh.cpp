@@ -1016,6 +1016,12 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(test_key_len, 0, sizeof(test_key_len));
   memset(test_chans, 0, sizeof(test_chans));
   test_replies = 0;
+  calc_key_set = calc_on = false;   // calculator channel: off after every boot too
+  calc_key_len = 0;
+  memset(&calc_chan, 0, sizeof(calc_chan));
+  calc_replies = 0;
+  rem_awake = false;
+  rem_back_at = 0;
   bot_q_n = 0;
   bot_ans_n = 0;
   memset(bot_ans_len, 0, sizeof(bot_ans_len));
@@ -1138,6 +1144,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   loadChannelKey();   // channel key saved by 'channel set'
   loadBotKey();       // trail bot key saved by 'botchan set' (the bot itself stays off until 'botchan on')
   loadTestKeys();     // test channel keys saved by 'testchan set' (they stay off until 'testchan on')
+  loadCalcKey();      // calculator channel key saved by 'calcchan set' (it stays off until 'calcchan on')
 
   // establish default-scope
   {
@@ -2320,6 +2327,8 @@ void MyMesh::formatStatus(char* reply) {
     strcat(reply, tb);
   }
   sl = (int)strlen(reply);
+  if (calc_key_set && sl < CLI_REPLY_MAX - 10) strcat(reply, calc_on ? ", calc on" : ", calc off");   // calculator channel: shown only when its key is set
+  sl = (int)strlen(reply);
   if ((bot_key_set || tcount > 0) && sl < CLI_REPLY_MAX - 12) {   // trail bot relay: how many commands are on the relay list
     char rb[16];
     snprintf(rb, sizeof(rb), ", relay %d", (int)relay_n);
@@ -2367,25 +2376,38 @@ bool MyMesh::botSameAsCommandChannel(const mesh::GroupChannel& ch) const {
 // being replaced (it may match itself), or -1.
 const char* MyMesh::botKeyConflict(const mesh::GroupChannel& ch, uint8_t which, int skip_slot) const {
   const bool is_test = which == BOT_CH_TEST;
+  const bool is_calc = which == BOT_CH_CALC;
+  const char* who = is_test ? "test" : (is_calc ? "calc" : "bot");
+  static char msg[64];
   if (memcmp(ch.secret, public_chan.secret, sizeof(ch.secret)) == 0) return "Err - not the Public key";
   if (botSameAsCommandChannel(ch)) {
-    return is_test ? "Err - test key (or its hash) matches the command channel"
-                   : "Err - bot key (or its hash) matches the command channel";
+    snprintf(msg, sizeof(msg), "Err - %s key (or its hash) matches the command channel", who);
+    return msg;
+  }
+  if (which != BOT_CH_BOT) {   // a test or calculator key must differ from the bot channel
+    if (bot_key_set && (memcmp(ch.secret, bot_chan.secret, sizeof(ch.secret)) == 0 || ch.hash[0] == bot_chan.hash[0])) {
+      snprintf(msg, sizeof(msg), "Err - %s key (or its hash) matches the bot channel", who);
+      return msg;
+    }
   }
   if (is_test) {
-    if (bot_key_set && (memcmp(ch.secret, bot_chan.secret, sizeof(ch.secret)) == 0 || ch.hash[0] == bot_chan.hash[0]))
-      return "Err - test key (or its hash) matches the bot channel";
     for (int i = 0; i < TEST_CH_MAX; i++) {
       if (i == skip_slot || !test_slot_set[i]) continue;
       if (memcmp(ch.secret, test_chans[i].secret, sizeof(ch.secret)) == 0 || ch.hash[0] == test_chans[i].hash[0])
         return "Err - test key (or its hash) matches another test channel";
     }
-  } else {
+  } else {   // the bot and calculator keys must differ from every test channel
     for (int i = 0; i < TEST_CH_MAX; i++) {
       if (!test_slot_set[i]) continue;
-      if (memcmp(ch.secret, test_chans[i].secret, sizeof(ch.secret)) == 0 || ch.hash[0] == test_chans[i].hash[0])
-        return "Err - bot key (or its hash) matches a test channel";
+      if (memcmp(ch.secret, test_chans[i].secret, sizeof(ch.secret)) == 0 || ch.hash[0] == test_chans[i].hash[0]) {
+        snprintf(msg, sizeof(msg), "Err - %s key (or its hash) matches a test channel", who);
+        return msg;
+      }
     }
+  }
+  if (!is_calc && calc_key_set && (memcmp(ch.secret, calc_chan.secret, sizeof(ch.secret)) == 0 || ch.hash[0] == calc_chan.hash[0])) {
+    snprintf(msg, sizeof(msg), "Err - %s key (or its hash) matches the calc channel", who);
+    return msg;
   }
   return NULL;
 }
@@ -2497,6 +2519,50 @@ void MyMesh::loadTestKeys() {
   }
 }
 
+// /calc_key: 1 byte key length + 32 bytes key (same layout as /bot_key)
+void MyMesh::saveCalcKey() {
+  if (_fs == NULL || !calc_key_set) return;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(CALC_KEY_FILE);
+  File f = _fs->open(CALC_KEY_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(CALC_KEY_FILE, "w");
+#else
+  File f = _fs->open(CALC_KEY_FILE, "w", true);
+#endif
+  if (f) {
+    uint8_t buf[33];
+    buf[0] = calc_key_len;
+    memcpy(&buf[1], calc_chan.secret, 32);
+    f.write(buf, sizeof(buf));
+    f.close();
+  }
+}
+
+void MyMesh::loadCalcKey() {
+  if (_fs == NULL || !_fs->exists(CALC_KEY_FILE)) return;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(CALC_KEY_FILE, "r");
+#else
+  File f = _fs->open(CALC_KEY_FILE);
+#endif
+  if (f) {
+    uint8_t buf[33];
+    int n = f.read(buf, sizeof(buf));
+    f.close();
+    if (n == 33 && (buf[0] == 16 || buf[0] == 32)) {
+      mesh::GroupChannel tmp;
+      memset(&tmp, 0, sizeof(tmp));
+      memcpy(tmp.secret, &buf[1], 32);
+      mesh::Utils::sha256(tmp.hash, sizeof(tmp.hash), tmp.secret, buf[0]);
+      if (botKeyConflict(tmp, BOT_CH_CALC, -1) != NULL) return;   // never share the command channel / Public / the bot or a test channel
+      calc_chan = tmp;
+      calc_key_len = buf[0];
+      calc_key_set = true;
+    }
+  }
+}
+
 // ---- reply queue: up to BOT_ANS_MAX answers (each up to BOT_Q_MAX messages) shared by the bot channel and the #test channel ----
 
 void MyMesh::botQueueClear() {
@@ -2592,7 +2658,7 @@ void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi, u
   chatCleanName(text, slen, nm);
   uint16_t who = chatHash(nm, (int)strlen(nm));                     // the same id the bot's memory of people uses
   if (botUserBlocked(who)) return;                                  // this person: one answer per 10 s at most
-  if (relayRequest(body + 1, who, ch)) return;                      // a relay command ("!ver all"): posted on the command channel, answered later
+  if (ch != BOT_CH_CALC && relayRequest(body + 1, who, ch)) return;                      // a relay command ("!ver all"): posted on the command channel, answered later
   HikeCtx hc;
   hc.sender = text;                                                 // the sender's name is the text before the ": "
   hc.slen = slen;
@@ -2603,25 +2669,28 @@ void MyMesh::handleBotMessage(const char* text, int hops, float snr, int rssi, u
   hc.rssi = rssi;
   hc.hops = hops;
   hc.seed = (uint32_t)getRNG()->nextInt(0, 65536);
-  hc.test_only = (ch != BOT_CH_BOT);
+  hc.test_only = (ch >= BOT_CH_TEST && ch < BOT_CH_CALC);
+  hc.calc_only = (ch == BOT_CH_CALC);
   // the reply is written straight after the messages already waiting; there is always room for BOT_Q_MAX more while
   // fewer than BOT_ANS_MAX answers wait (an answer is never longer than BOT_Q_MAX messages)
   int n = hikebotReply(&hc, body + 1, bot_q + bot_q_n);
   if (n <= 0) return;
   if (n > BOT_Q_MAX) n = BOT_Q_MAX;
   botCommit(ch, who, n, true);
-  if (ch != BOT_CH_BOT) test_replies++;
+  if (ch == BOT_CH_CALC) calc_replies++;
+  else if (ch != BOT_CH_BOT) test_replies++;
   else bot_replies++;
 }
 
 // build and flood a text message on the bot channel (ch = BOT_CH_BOT) or a test channel (BOT_CH_TEST + slot), the same way
 // postChannel() does but with that channel's key and the bot length limit
 bool MyMesh::postBotMessage(const char* text, uint8_t ch) {
-  const bool is_test = ch != BOT_CH_BOT;
+  const bool is_calc = ch == BOT_CH_CALC;
+  const bool is_test = ch != BOT_CH_BOT && !is_calc;
   int slot = (int)ch - BOT_CH_TEST;
   if (is_test && (slot < 0 || slot >= TEST_CH_MAX)) return false;
-  if (!(is_test ? test_slot_set[slot] : bot_key_set)) return false;
-  const mesh::GroupChannel& kc = is_test ? test_chans[slot] : bot_chan;
+  if (!(is_calc ? calc_key_set : (is_test ? test_slot_set[slot] : bot_key_set))) return false;
+  const mesh::GroupChannel& kc = is_calc ? calc_chan : (is_test ? test_chans[slot] : bot_chan);
   uint8_t temp[5 + BOT_MSG_MAX + 40];
   uint32_t ts = getRTCClock()->getCurrentTime();
   memcpy(temp, &ts, 4);
@@ -2641,8 +2710,9 @@ bool MyMesh::postBotMessage(const char* text, uint8_t ch) {
 void MyMesh::botService() {   // post the queued bot messages, one at a time, only while the radio is awake
   if (bot_q_n == 0) return;
   uint8_t ch = bot_ans_ch[0];
-  bool key_ok = ch == BOT_CH_BOT ? bot_key_set
-                : ((int)ch - BOT_CH_TEST < TEST_CH_MAX && test_slot_set[(int)ch - BOT_CH_TEST]);
+  bool key_ok = ch == BOT_CH_CALC ? calc_key_set
+                : (ch == BOT_CH_BOT ? bot_key_set
+                   : ((int)ch - BOT_CH_TEST < TEST_CH_MAX && test_slot_set[(int)ch - BOT_CH_TEST]));
   if (!key_ok) {   // (a 'say' may be queued while the channel is off; 'off', 'clear' and sleep empty the queue themselves)
     botQueueDropChannel(ch, ch);
     return;
@@ -2697,6 +2767,7 @@ bool MyMesh::chanCommandAllowed(const char* buf, bool to_all) const {
                  || strncmp(buf, "blockname ", 10) == 0   // blockname add / remove / list / clear
                  || strcmp(buf, "botchan") == 0 || strncmp(buf, "botchan ", 8) == 0   // trail bot: get / set / clear / on / off / say / relay
                  || strcmp(buf, "testchan") == 0 || strncmp(buf, "testchan ", 9) == 0   // #test channel: get / set / clear / on / off / say
+                 || strcmp(buf, "calcchan") == 0 || strncmp(buf, "calcchan ", 9) == 0   // calculator channel: get / set / clear / on / off / say
                  || strcmp(buf, "chanallow") == 0 || strncmp(buf, "chanallow ", 10) == 0   // chanallow on / off / set / clear
                  || strcmp(buf, "filterchan get") == 0 || strncmp(buf, "filterchan set ", 15) == 0   // (never 'filterchan get <slot>': it shows a key)
                  || strncmp(buf, "filterchan clear", 16) == 0
@@ -2715,7 +2786,7 @@ static bool relayTextChar(char c) {   // arguments and target names: letters, di
 // repeater transmit. ('neighbors' with an argument could become 'neighbors list'; a 'get' of a key or password is refused
 // by chanCommandAllowed.)
 static bool relayDenied(const char* w, bool has_arg) {
-  static const char* const deny[] = {"reboot", "set", "sleep", "advert", "discover", "discover.neighbors", "botchan", "testchan",
+  static const char* const deny[] = {"reboot", "set", "sleep", "advert", "discover", "discover.neighbors", "botchan", "testchan", "calcchan",
                                      "blockhop", "blockname", "chanallow", "filterchan"};
   for (size_t i = 0; i < sizeof(deny) / sizeof(deny[0]); i++) {
     if (strcmp(w, deny[i]) == 0) return true;
@@ -3221,6 +3292,9 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
   for (int i = 0; test_on && i < TEST_CH_MAX; i++) {   // the test channels (read for "!test" requests only)
     if (test_slot_set[i] && n < max_matches && test_chans[i].hash[0] == hash[0]) channels[n++] = test_chans[i];
   }
+  if (calc_key_set && calc_on && n < max_matches && calc_chan.hash[0] == hash[0]) {   // the calculator channel (read for "!" requests only)
+    channels[n++] = calc_chan;
+  }
   if (blockNameCount() == 0) return n;   // empty blockname list: Public / filter channels are not decrypted at all
   if (n < max_matches && public_chan.hash[0] == hash[0]) {
     channels[n++] = public_chan;
@@ -3304,6 +3378,12 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
       }
       return;
     }
+  }
+  if (!is_command_channel && calc_key_set && memcmp(channel.secret, calc_chan.secret, sizeof(channel.secret)) == 0) {
+    if (calc_on) {   // the calculator channel: maths and unit conversions only, NEVER commands
+      handleBotMessage((const char*)&data[5], (int)packet->getPathHashCount(), packet->getSNR(), (int)radio_driver.getLastRSSI(), BOT_CH_CALC);
+    }
+    return;
   }
   if (!is_command_channel) {   // Public or a filter channel: only check the sender name, NEVER run commands
     blockNameCheckText((const char*)&data[5]);
@@ -3477,6 +3557,90 @@ void MyMesh::botChanCommand(const char* sub, char* reply) {
     relayCommand(rs, reply);
   } else {
     strcpy(reply, "Err - botchan [get]|set <key or #name>|clear|on|off|say <text>|relay ...");
+  }
+}
+
+// 'calcchan': [get] | set <key or #name> | clear | on | off | say <text>. The calculator channel answers only maths and unit
+// conversions ("12*(3+4)", "10km in miles"). Same rules as botchan: off after every boot, no relay, never runs commands.
+void MyMesh::calcChanCommand(const char* sub, char* reply) {
+  bool is_get = strcmp(sub, "get") == 0;
+  if (*sub == 0 || is_get) {
+    if (!calc_key_set) {
+      strcpy(reply, "calcchan key not set");
+    } else if (is_get) {   // shows the key (over the command channel too: only command channel members can read it)
+      char b64[48];
+      b64Encode(calc_chan.secret, calc_key_len, b64);
+      snprintf(reply, 120, "calcchan %s, hash %02X, replies %lu, key: %s", calc_on ? "on" : "off", calc_chan.hash[0], (unsigned long)calc_replies, b64);
+    } else {
+      snprintf(reply, 80, "calcchan %s, hash %02X, replies %lu", calc_on ? "on" : "off", calc_chan.hash[0], (unsigned long)calc_replies);
+    }
+  } else if (strcmp(sub, "on") == 0) {
+    if (!calc_key_set) {
+      strcpy(reply, "Err - calcchan key not set (calcchan set <key or #name>)");
+    } else {
+      calc_on = true;
+      strcpy(reply, "OK - calcchan on");
+    }
+  } else if (strcmp(sub, "off") == 0) {
+    calc_on = false;
+    botQueueDropChannel(BOT_CH_CALC, BOT_CH_CALC);   // the calculator channel's waiting replies go; the other channels' stay
+    strcpy(reply, "OK - calcchan off");
+  } else if (strcmp(sub, "say") == 0 || memcmp(sub, "say ", 4) == 0) {   // post a text to the calculator channel
+    const char* txt = sub + 3;
+    while (*txt == ' ') txt++;
+    int prefix = (int)strlen(_prefs.node_name) + 2;   // the channel shows "<node name>: <text>"
+    if (prefix > 39) prefix = 39;
+    int maxlen = BOT_MSG_MAX - prefix;
+    if (!calc_key_set) {
+      strcpy(reply, "Err - calcchan key not set (calcchan set <key or #name>)");
+    } else if (*txt == 0) {
+      strcpy(reply, "Err - calcchan say <text>");
+    } else if (bot_ans_n >= BOT_ANS_MAX) {
+      strcpy(reply, "Err - bot busy, try again in a moment");
+    } else {
+      int tl = (int)strlen(txt);
+      if (tl > maxlen) {
+        tl = maxlen;
+        while (tl > 0 && (((unsigned char)txt[tl]) & 0xC0) == 0x80) tl--;   // never cut an accented letter / emoji in half
+      }
+      memcpy(bot_q[bot_q_n], txt, tl);
+      bot_q[bot_q_n][tl] = 0;
+      botCommit(BOT_CH_CALC, 0, 1, from_channel);
+      strcpy(reply, tl < (int)strlen(txt) ? "OK - calcchan say queued (cut to fit)" : "OK - calcchan say queued");
+    }
+  } else if (strcmp(sub, "clear") == 0) {
+    calc_key_set = false;
+    calc_on = false;
+    calc_key_len = 0;
+    memset(&calc_chan, 0, sizeof(calc_chan));
+    botQueueDropChannel(BOT_CH_CALC, BOT_CH_CALC);
+    if (_fs) _fs->remove(CALC_KEY_FILE);
+    strcpy(reply, "OK - calcchan key cleared");
+  } else if (memcmp(sub, "set ", 4) == 0) {
+    const char* key = sub + 4;
+    while (*key == ' ') key++;
+    uint8_t tmpk[32];
+    int len = parseBotKey(key, tmpk);
+    if (len < 0) {
+      strcpy(reply, "Err - key must be #name, or base64 / hex, 16 or 32 bytes");
+    } else {
+      mesh::GroupChannel tc;
+      memset(&tc, 0, sizeof(tc));
+      memcpy(tc.secret, tmpk, len);
+      mesh::Utils::sha256(tc.hash, sizeof(tc.hash), tc.secret, len);
+      const char* err = botKeyConflict(tc, BOT_CH_CALC, -1);
+      if (err != NULL) {
+        strcpy(reply, err);
+      } else {
+        calc_chan = tc;
+        calc_key_len = (uint8_t)len;
+        calc_key_set = true;
+        saveCalcKey();
+        snprintf(reply, 100, "OK - calc key set and saved (hash %02X), calc is %s", calc_chan.hash[0], calc_on ? "on" : "off");
+      }
+    }
+  } else {
+    strcpy(reply, "Err - calcchan [get]|set <key or #name>|clear|on|off|say <text>");
   }
 }
 
@@ -3894,8 +4058,8 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
       while (*key == ' ') key++;
       uint8_t ctmp[32];
       int clen = parseChanKey(key, ctmp);
-      bool is_bot_key = false, is_test_key = false;   // the command channel must differ from the trail bot and test channels
-      if (clen > 0 && (bot_key_set || testCount() > 0)) {
+      bool is_bot_key = false, is_test_key = false, is_calc_key = false;   // the command channel must differ from the trail bot, test and calculator channels
+      if (clen > 0 && (bot_key_set || testCount() > 0 || calc_key_set)) {
         mesh::GroupChannel cc;
         memset(&cc, 0, sizeof(cc));
         memcpy(cc.secret, ctmp, clen);
@@ -3905,11 +4069,14 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
           if (test_slot_set[ti] && (memcmp(cc.secret, test_chans[ti].secret, sizeof(cc.secret)) == 0 || cc.hash[0] == test_chans[ti].hash[0]))
             is_test_key = true;
         }
+        is_calc_key = calc_key_set && (memcmp(cc.secret, calc_chan.secret, sizeof(cc.secret)) == 0 || cc.hash[0] == calc_chan.hash[0]);
       }
       if (is_bot_key) {
         strcpy(reply, "Err - that key (or its hash) is the trail bot channel");
       } else if (is_test_key) {
         strcpy(reply, "Err - that key (or its hash) is a test channel");
+      } else if (is_calc_key) {
+        strcpy(reply, "Err - that key (or its hash) is the calculator channel");
       } else if (setChannelKey(key)) {
         saveChannelKey();
         strcpy(reply, "OK - channel key set and saved");
@@ -4267,6 +4434,12 @@ bool MyMesh::handleSleepCommandsInner(uint32_t sender_timestamp, char* command, 
     testChanCommand(sub, reply);
     return true;
   }
+  if (memcmp(command, "calcchan", 8) == 0 && (command[8] == 0 || command[8] == ' ')) {   // calculator channel: get / set / clear / on / off / say
+    const char* sub = command + 8;
+    while (*sub == ' ') sub++;
+    calcChanCommand(sub, reply);
+    return true;
+  }
 
   return false;
 }
@@ -4542,6 +4715,64 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   }
 }
 
+// ---- reminders (RemindBot.h) -------------------------------------------------------------------------------------------------
+// The decision (post / wake / sleep again) is remindSleepStep() in RemindBot.h, a pure function that is simulated on a computer.
+//   RS_POST        a reminder is due and the radio is awake: queue "@[name] reminder: text" on the bot channel
+//   RS_WAKE        asleep in a sleep CYCLE, battery not low, the normal wake is not near: wake the radio now for the reminder
+//   RS_SLEEP_AGAIN the radio was woken only for a reminder and it has gone out: sleep until the ORIGINAL wake time
+// A manual "sleep <mins>" / "sleep until" and a low-battery cycle are never woken early: the reminder goes out at the next wake.
+int MyMesh::remindDecide(bool radio_quiet, uint32_t* now_out) {
+  if (rem_awake && (sleeping || !cycle_active)) rem_awake = false;   // somebody else put the radio to sleep, or stopped the cycle: nothing to restore
+  if (!rem_awake && remindCount() == 0) return RS_NONE;
+  uint32_t now = getRTCClock()->getCurrentTime();
+  *now_out = now;
+  RemindSleepIn in;
+  memset(&in, 0, sizeof(in));
+  in.clock_ok = now >= CLOCK_VALID_AFTER;
+  in.now_utc = now;
+  if (in.clock_ok) remindPurge(now);   // more than 2 hours late: dropped
+  in.next_due = remindNextDue();
+  in.bot_ready = bot_key_set && bot_on;
+  in.sleeping = sleeping;
+  in.cycle_active = cycle_active;
+  in.rem_awake = rem_awake;
+  in.queue_room = bot_ans_n < BOT_ANS_MAX;
+  in.queue_empty = bot_q_n == 0 && chan_q_n == 0 && !relay_active && !hasPendingWork();
+  in.radio_quiet = radio_quiet;
+  in.ms_to_wake = (long)((rem_awake ? rem_back_at : sleep_wake_at) - millis());
+  if (sleeping && cycle_active && in.next_due != 0 && in.clock_ok && now + (uint32_t)REM_LEAD_S >= in.next_due)
+    in.batt_ok = board.getBattMilliVolts() >= BATT_LOW_MV;   // the battery is read only when a wake is being considered
+  return remindSleepStep(&in);
+}
+
+void MyMesh::remindService() {
+  uint32_t now = 0;
+  int act = remindDecide(!busy_armed || millisHasNowPassed(busy_until), &now);
+  if (act == RS_POST) {
+    RemindItem it;
+    if (remindTakeDue(now, &it)) {
+      int prefix = (int)strlen(_prefs.node_name) + 2;   // the channel shows "<node name>: <text>"
+      if (prefix > 39) prefix = 39;
+      remindFormat(&it, now, BOT_MSG_MAX - prefix, bot_q[bot_q_n], sizeof(bot_q[0]));
+      botCommit(BOT_CH_BOT, 0, 1, false);   // nobody asked just now: no cooldown, and no random 3 to 15 s delay
+    }
+  } else if (act == RS_WAKE) {
+    rem_back_at = sleep_wake_at;   // the normal wake time: restored when the reminder has gone out
+    rem_awake = true;
+    radioWake();
+  }
+}
+
+bool MyMesh::remindSleepBack(bool radio_quiet) {
+  uint32_t now = 0;
+  if (remindDecide(radio_quiet, &now) != RS_SLEEP_AGAIN) return false;
+  rem_awake = false;
+  long remain = (long)(rem_back_at - millis());
+  if (remain < 1000) remain = 1000;   // (the normal wake is due: the next pass wakes the radio the normal way)
+  radioSleep((uint32_t)remain);
+  return true;
+}
+
 void MyMesh::loop() {
   cmdbotNow();   // keeps the command channel bot clock from missing a millis() wrap
   watchdogService();   // radio health checks (item 43)
@@ -4579,6 +4810,7 @@ void MyMesh::loop() {
   dailyReport();           // 24h report timer (counts while asleep too)
   blockNoticeService();    // announce newly auto-blocked repeaters
   discoverReportService();   // item 52
+  remindService();   // reminders: post one that is due, or wake the radio just for it (sleep cycle only)
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
   if (!sleeping) botService();    // post queued trail bot replies while the radio is awake
   if (!sleeping) relayService();  // trail bot relay: collect the replies, then queue the results
@@ -4590,6 +4822,7 @@ void MyMesh::loop() {
     busy_until = futureMillis(TX_QUIET_MS);
   }
   bool radio_quiet = !busy_armed || millisHasNowPassed(busy_until);
+  if (rem_awake && remindSleepBack(radio_quiet)) return;   // woken only for a reminder, and it has gone out: back to sleep until the normal wake time
 
   // item 46: 'reboot' over the channel restarts as soon as its reply has gone out: nothing queued, nothing in flight and the
   // radio back in receive mode. REBOOT_WAIT_MS is the longest it waits. (The CLI 'reboot' is still immediate.)
@@ -4644,7 +4877,7 @@ void MyMesh::loop() {
     }
   }
   // end of an awake window: back to sleep (an admin login stops the cycle before this)
-  if (cycle_active && !sleeping && !sleep_pending && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet
+  if (cycle_active && !sleeping && !sleep_pending && !rem_awake && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet
       && bot_q_n == 0 && !relay_active) {
     radioSleep(CYCLE_SLEEP_MS);
     return;
