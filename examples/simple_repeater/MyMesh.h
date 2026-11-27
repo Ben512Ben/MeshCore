@@ -36,6 +36,7 @@
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
 #include "RateLimiter.h"
+#include "PollBot.h"      // poll bot: neighbour lists of selected repeaters, read with a guest login (pure functions and data)
 
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
@@ -269,6 +270,15 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   RelayEntry relay_ent[BOT_RELAY_REPLIES];
   uint32_t last_post_ts;        // timestamp of the last message this node posted on the command channel
 
+  // poll bot (PollBot.h): logs in to repeaters you select (<poll add name|key>) as a guest and keeps their neighbour lists.
+  // Works only on a trail bot (bot channel key set) with the command channel key set. Allocated on first use. RAM only.
+  PollRep* poll_reps;           // selected repeaters (POLL_MAX_REPS), NULL until the first poll command
+  PollSeen* poll_seen;          // adverts heard from repeaters, so 'poll add <name>' can find them
+  bool poll_auto;               // '<poll auto on|off>': poll selected repeaters after their adverts (on after boot)
+  int8_t poll_cur;              // slot being polled, -1 = none
+  bool poll_gap_on;             // waiting out the gap after the last poll
+  unsigned long poll_gap_until;
+
   int16_t cmd_hops;             // hops the channel command being run took to reach us (-1 = not from the channel)
   bool sleep_cmd_flag;          // set by startSleep(): the command being run started a sleep
   bool neighbor_alert_enabled;   // item 53: post 'New neighbour discovered' (RAM only, on after boot)
@@ -395,6 +405,21 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void relayService();
   void relayDeliver();
   void relayCommand(const char* sub, char* reply);
+  bool pollEnabled() const { return bot_key_set && chan_key_set; }   // poll bot: only a trail bot polls
+  bool pollInitSeen();
+  bool pollInitReps();
+  void pollAbort();
+  void pollAdvertSeen(const mesh::Packet* packet, const mesh::Identity& id, const uint8_t* app_data, size_t app_len);
+  bool pollQueueNow(int slot);
+  void pollService();
+  void pollSendPacket(PollRep* r, mesh::Packet* pkt, bool direct);
+  void pollSendLogin(PollRep* r);
+  void pollSendReq(PollRep* r);
+  void pollFinish(PollRep* r, bool ok);
+  void pollOnResponse(int slot, const uint8_t* data, size_t len);
+  void pollListReply(bool stale);
+  void pollChannelCommand(const char* args);
+  void pollRelayMerge();
   void testChanCommand(const char* sub, char* reply);
   void chanEnqueueSoon(const char* text, bool is_relay = false);                   // items 52 and 53: an automatic message that goes out as soon as possible
   void neighbourAlert(const mesh::Identity& id, int8_t snr4);   // item 53
@@ -555,7 +580,7 @@ public:
   // true while timed channel work is waiting (ESP32 only): the main loop must not light-sleep for up to 30 s then
   bool needsFastLoop() const {
 #if defined(ESP32)
-    return sleep_pending || ((chan_q_n > 0 || bot_q_n > 0 || relay_active) && !sleeping);
+    return sleep_pending || ((chan_q_n > 0 || bot_q_n > 0 || relay_active || poll_cur >= 0) && !sleeping);
 #else
     return false;
 #endif

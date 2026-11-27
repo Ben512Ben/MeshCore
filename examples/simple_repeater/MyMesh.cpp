@@ -1,6 +1,8 @@
 #include "MyMesh.h"
 #include "HikeBot.h"    // one bot for every "!" message: trails, hiking help, signal test and chat (uses TrailBot.h, ChatBot.h)
 #include "CmdBot.h"     // command channel bot: remembers what the repeaters post there and answers "!" questions (pure functions)
+#include "PollBot.h"    // poll bot: neighbour lists of selected repeaters (pure functions; the radio side is in the "poll bot" section below)
+#include <new>
 #include <algorithm>
 #ifdef HELTEC_LORA_V4
 #include <driver/gpio.h>   // gpio_pulldown_en() for DIO1 while the radio sleeps
@@ -694,11 +696,21 @@ int MyMesh::searchPeersByHash(const uint8_t *hash) {
       matching_peer_indexes[n++] = i; // store the INDEXES of matching contacts (for subsequent 'peer' methods)
     }
   }
+  // poll bot: while a repeater is being polled, its answers must be recognised too (slot number with POLL_PEER_FLAG)
+  if (poll_reps != NULL && poll_cur >= 0 && n < MAX_CLIENTS && poll_reps[poll_cur].state != PS_IDLE
+      && memcmp(poll_reps[poll_cur].pub, hash, PATH_HASH_SIZE) == 0) {
+    matching_peer_indexes[n++] = POLL_PEER_FLAG | poll_cur;
+  }
   return n;
 }
 
 void MyMesh::getPeerSharedSecret(uint8_t *dest_secret, int peer_idx) {
   int i = matching_peer_indexes[peer_idx];
+  if (i >= 0 && (i & POLL_PEER_FLAG)) {   // a repeater being polled
+    int s = i & 0xFF;
+    if (poll_reps != NULL && s < POLL_MAX_REPS) memcpy(dest_secret, poll_reps[s].secret, PUB_KEY_SIZE);
+    return;
+  }
   if (i >= 0 && i < acl.getNumClients()) {
     // lookup pre-calculated shared_secret
     memcpy(dest_secret, acl.getClientByIdx(i)->shared_secret, PUB_KEY_SIZE);
@@ -734,11 +746,17 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
       putNeighbour(id, timestamp, packet->getSNR());
     }
   }
+
+  pollAdvertSeen(packet, id, app_data, app_data_len);   // poll bot: remember the repeater, and poll it if it is selected and due
 }
 
 void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, const uint8_t *secret,
                             uint8_t *data, size_t len) {
   int i = matching_peer_indexes[sender_idx];
+  if (i >= 0 && (i & POLL_PEER_FLAG)) {   // an answer from a repeater being polled
+    if (type == PAYLOAD_TYPE_RESPONSE) pollOnResponse(i & 0xFF, data, len);
+    return;
+  }
   if (i < 0 || i >= acl.getNumClients()) { // get from our known_clients table (sender SHOULD already be known in this context)
     MESH_DEBUG_PRINTLN("onPeerDataRecv: invalid peer idx: %d", i);
     return;
@@ -843,6 +861,22 @@ bool MyMesh::onPeerPathRecv(mesh::Packet *packet, int sender_idx, const uint8_t 
                             uint8_t path_len, uint8_t extra_type, uint8_t *extra, uint8_t extra_len) {
   // TODO: prevent replay attacks
   int i = matching_peer_indexes[sender_idx];
+
+  if (i >= 0 && (i & POLL_PEER_FLAG)) {   // poll bot: the route to a repeater being polled, and often its answer as well
+    int s = i & 0xFF;
+    if (poll_reps != NULL && s < POLL_MAX_REPS) {
+      PollRep* pr = &poll_reps[s];
+      size_t bytes = (size_t)(path_len & 63) * (size_t)((path_len >> 6) + 1);
+      if (bytes <= POLL_PATH_MAX) {
+        pr->out_len = path_len;
+        if (bytes) memcpy(pr->out_path, path, bytes);
+      } else {
+        pr->out_len = POLL_OUT_UNKNOWN;
+      }
+      if (extra_type == PAYLOAD_TYPE_RESPONSE) pollOnResponse(s, extra, extra_len);
+    }
+    return false;   // no reciprocal path
+  }
 
   if (i >= 0 && i < acl.getNumClients()) { // get from our known_clients table (sender SHOULD already be known in this context)
     MESH_DEBUG_PRINTLN("PATH to client, path_len=%d", (uint32_t)path_len);
@@ -1043,6 +1077,12 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   relay_deadline = 0;
   relay_count = relay_over = 0;
   last_post_ts = 0;
+  poll_reps = NULL;   // poll bot: allocated on first use
+  poll_seen = NULL;
+  poll_auto = true;
+  poll_cur = -1;
+  poll_gap_on = false;
+  poll_gap_until = 0;
   chan_q_n = 0;
   chan_enq_count = 0;
   reboot_pending = false;
@@ -1377,6 +1417,7 @@ void MyMesh::radioSleep(uint32_t duration_ms) {
   if (!sleeping) radio_on_total_ms += (uint32_t)(millis() - radio_on_since_ms);   // radio-on time (item 34)
   sleeping = true;
   botQueueClear();   // trail bot replies still waiting are dropped, not held for the next wake
+  pollAbort();       // a poll in progress (or waiting) is dropped too
   sleep_wake_at = futureMillis(duration_ms);
   radio_driver.powerOff();
 #ifdef HELTEC_T096
@@ -3106,6 +3147,7 @@ void MyMesh::relayService() {
 // Write the results into the bot queue: "<repeater>: <reply>" entries joined with " | ", as many to a message as fit, at most
 // BOT_Q_MAX messages, then "(N replied)" for a relay to 'all'. A named repeater that did not answer gives "<name>: no reply".
 void MyMesh::relayDeliver() {
+  pollRelayMerge();   // poll bot: add the selected repeaters' answers to the real ones (a 'snr' relay only)
   int prefix = (int)strlen(_prefs.node_name) + 2;
   if (prefix > 39) prefix = 39;
   const int budget = BOT_MSG_MAX - prefix;
@@ -3280,6 +3322,647 @@ void MyMesh::relayCommand(const char* sub, char* reply) {
   strcpy(reply, "Err - botchan relay [list]|add <cmd> [arg] <all|named|both>|remove <cmd>|clear");
 }
 // RELAY-END
+
+// ---------------------- poll bot (PollBot.h) ----------------------
+// The trail bot logs in to repeaters that YOU select, as a GUEST (blank guest password), and asks for their whole neighbour
+// list: how loud each of them hears its neighbours, and when. It only does this when this node has a bot channel key set
+// (pollEnabled()) and the command channel key is set (the results are posted there). Everything is kept in RAM, separate
+// from the command channel ledger (CmdBot.h): selected repeaters never appear in the ledger and the ledger's answers are
+// never changed by it. Nothing is selected automatically.
+//
+// Select with <poll add name|key>. A selected repeater is polled on an advert: a zero hop repeater on its first advert after
+// 24..36 hours (random) since its last poll, any other repeater on every advert but at least 24 hours apart. One poll at a
+// time, at least 60 s between automatic polls. Each poll fetches up to 52 neighbours in 4 requests of 13. Two tries: along
+// the route learned from its advert (or flooded if there is none), then flooded. A page that does not come is asked for once
+// more (flooded), then the poll ends with what it has. Each poll posts "<name>: Neighbours 12, best ..." on the command
+// channel, or "<name>: poll failed, no reply".
+// Commands (command channel): <poll add name|key>, <poll name|key>, <poll remove name>, <poll snr <id> all|name>,
+// <poll repeaters all|name>, <poll stale>, <poll auto on|off>. Only a trail bot answers these.
+
+static void pollSetRoute(PollRep* r, uint8_t out_len, const uint8_t* path) {
+  if (out_len == POLL_OUT_UNKNOWN) {
+    r->out_len = POLL_OUT_UNKNOWN;
+    return;
+  }
+  size_t bytes = (size_t)(out_len & 63) * (size_t)((out_len >> 6) + 1);
+  if (bytes > POLL_PATH_MAX) {
+    r->out_len = POLL_OUT_UNKNOWN;
+    return;
+  }
+  r->out_len = out_len;
+  if (bytes) memcpy(r->out_path, path, bytes);
+}
+
+// selected repeaters that match a name, the start of a key (4 or more hex characters) or a full 64 character key.
+// Returns how many match; *first = the slot of the first.
+static int pollMatchReps(const PollRep* reps, const char* arg, int* first) {
+  uint8_t hx[32];
+  size_t al = strlen(arg);
+  int hn = (al >= 4 && al <= 64) ? pollParseHex(arg, hx, 32) : 0;
+  int n = 0;
+  for (int i = 0; i < POLL_MAX_REPS; i++) {
+    if (!reps[i].used) continue;
+    if (pollNameEq(reps[i].name, arg) || (hn > 0 && memcmp(reps[i].pub, hx, hn) == 0)) {
+      if (n == 0) *first = i;
+      n++;
+    }
+  }
+  return n;
+}
+
+// the same for repeaters whose advert was heard
+static int pollMatchSeen(const PollSeen* seen, const char* arg, int* first) {
+  uint8_t hx[32];
+  size_t al = strlen(arg);
+  int hn = (al >= 4 && al <= 64) ? pollParseHex(arg, hx, 32) : 0;
+  int n = 0;
+  for (int i = 0; i < POLL_SEEN_MAX; i++) {
+    if (!seen[i].used) continue;
+    if (pollNameEq(seen[i].name, arg) || (hn > 0 && memcmp(seen[i].pub, hx, hn) == 0)) {
+      if (n == 0) *first = i;
+      n++;
+    }
+  }
+  return n;
+}
+
+bool MyMesh::pollInitSeen() {
+  if (poll_seen != NULL) return true;
+  poll_seen = new (std::nothrow) PollSeen[POLL_SEEN_MAX];
+  if (poll_seen == NULL) return false;   // no memory: the poll bot stays off
+  memset(poll_seen, 0, sizeof(PollSeen) * POLL_SEEN_MAX);
+  return true;
+}
+
+bool MyMesh::pollInitReps() {
+  if (poll_reps != NULL) return true;
+  poll_reps = new (std::nothrow) PollRep[POLL_MAX_REPS];
+  if (poll_reps == NULL) return false;
+  memset(poll_reps, 0, sizeof(PollRep) * POLL_MAX_REPS);
+  poll_cur = -1;
+  return true;
+}
+
+// the radio is going to sleep (or the channel key went): nothing is being polled, nothing waits. No failure is posted.
+void MyMesh::pollAbort() {
+  if (poll_reps == NULL) return;
+  for (int i = 0; i < POLL_MAX_REPS; i++) {
+    poll_reps[i].state = PS_IDLE;
+    poll_reps[i].pend = 0;
+  }
+  poll_cur = -1;
+}
+
+// an advert was heard: remember the repeater (so 'poll add <name>' can find it) and, if it is selected, poll it when due
+void MyMesh::pollAdvertSeen(const mesh::Packet* packet, const mesh::Identity& id, const uint8_t* app_data, size_t app_len) {
+  if (!pollEnabled() || sleeping) return;
+  if (isShare(packet)) return;
+  AdvertDataParser parser(app_data, (uint8_t)app_len);
+  if (!parser.isValid() || parser.getType() != ADV_TYPE_REPEATER || !parser.hasName()) return;
+  if (id.matches(self_id)) return;
+  if (!pollInitSeen()) return;
+
+  uint8_t hops = packet->getPathHashCount();
+  uint8_t rev[POLL_PATH_MAX];
+  uint8_t out_len = pollReversePath(packet->path, packet->path_len, rev, sizeof(rev));   // the route back to the advertiser
+  pollSeenPut(poll_seen, POLL_SEEN_MAX, id.pub_key, parser.getName(), hops, out_len, rev, millis() / 1000);
+
+  if (poll_reps == NULL) return;   // nothing selected yet
+  int slot = pollFindRep(poll_reps, POLL_MAX_REPS, id.pub_key);
+  if (slot < 0) return;            // not a selected repeater
+  PollRep* r = &poll_reps[slot];
+  uint32_t rtc = getRTCClock()->getCurrentTime();
+  strncpy(r->name, parser.getName(), POLL_NAME_MAX);
+  r->name[POLL_NAME_MAX] = 0;
+  r->hops = hops;
+  if (rtc >= CLOCK_VALID_AFTER) r->last_adv = rtc;
+  if (r->state == PS_IDLE) pollSetRoute(r, out_len, rev);
+  if (!poll_auto || r->state != PS_IDLE || r->pend) return;
+  if (rtc < CLOCK_VALID_AFTER || rtc < r->next_ok) return;   // not due yet (or no clock to tell)
+  r->pend = 1;
+  r->due_ms = futureMillis(getRNG()->nextInt((int)POLL_DELAY_MIN_MS, (int)POLL_DELAY_MAX_MS + 1));
+}
+
+// poll this repeater now (a command asked for it): it starts within a second, whatever the timers say.
+// False if it is already being polled or is waiting to be.
+bool MyMesh::pollQueueNow(int slot) {
+  PollRep* r = &poll_reps[slot];
+  if (r->state != PS_IDLE || r->pend) return false;
+  r->pend = 2;
+  r->due_ms = futureMillis(1000);
+  return true;
+}
+
+void MyMesh::pollSendPacket(PollRep* r, mesh::Packet* pkt, bool direct) {
+  r->deadline_ms = futureMillis(direct ? POLL_TO_DIRECT_MS : POLL_TO_FLOOD_MS);
+  if (pkt == NULL) return;   // packet pool empty: the wait runs out and the next try follows
+  if (direct) sendDirect(pkt, r->out_path, r->out_len, 0);
+  else sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+}
+
+// login with a blank password: a repeater whose guest password is empty lets us in as a guest
+// (first try goes along the known route, if there is one; the second try is flooded)
+void MyMesh::pollSendLogin(PollRep* r) {
+  uint8_t temp[4];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &ts, 4);
+  mesh::Identity dest(r->pub);
+  mesh::Packet* pkt = createAnonDatagram(PAYLOAD_TYPE_ANON_REQ, self_id, dest, r->secret, temp, sizeof(temp));
+  r->state = PS_WAIT_LOGIN;
+  pollSendPacket(r, pkt, r->attempt == 0 && r->out_len != POLL_OUT_UNKNOWN);
+}
+
+// neighbours request: newest first, POLL_PAGE_COUNT entries from page * POLL_PAGE_COUNT, POLL_KEY_LEN bytes of each key
+void MyMesh::pollSendReq(PollRep* r) {
+  uint8_t temp[15];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &ts, 4);
+  temp[4] = REQ_TYPE_GET_NEIGHBOURS;
+  temp[5] = 0;                          // request version
+  temp[6] = POLL_PAGE_COUNT;
+  uint16_t off = (uint16_t)(r->page * POLL_PAGE_COUNT);
+  memcpy(&temp[7], &off, 2);
+  temp[9] = 0;                          // 0 = newest to oldest
+  temp[10] = POLL_KEY_LEN;
+  getRNG()->random(&temp[11], 4);       // makes every request packet different
+  mesh::Identity dest(r->pub);
+  mesh::Packet* pkt = createDatagram(PAYLOAD_TYPE_REQ, dest, r->secret, temp, sizeof(temp));
+  r->req_ts = ts;
+  r->state = PS_WAIT_REQ;
+  // along the route on the first try; flooded on the second try and once a page had to be asked for again
+  pollSendPacket(r, pkt, r->attempt == 0 && r->out_len != POLL_OUT_UNKNOWN && !r->pretry);
+}
+
+void MyMesh::pollFinish(PollRep* r, bool ok) {
+  r->state = PS_IDLE;
+  r->pend = 0;
+  if (poll_cur >= 0 && &poll_reps[poll_cur] == r) poll_cur = -1;
+  poll_gap_on = true;   // the next automatic poll waits POLL_GAP_MS
+  poll_gap_until = futureMillis(POLL_GAP_MS);
+  char msg[CHAN_MSG_MAX + 1];
+  if (ok) {
+    bool complete = pollEndPoll(r);   // whole list fetched: neighbours that are gone are dropped
+    r->ok = 1;
+    r->last_ok = getRTCClock()->getCurrentTime();
+    int prefix = (int)strlen(_prefs.node_name) + 2;
+    if (prefix > 39) prefix = 39;
+    int limit = CHAN_MSG_MAX - prefix - (int)strlen(r->name) - 2;
+    char sum[CHAN_MSG_MAX];
+    pollSummaryText(r, sum, sizeof(sum), limit);
+    if (!complete && (int)strlen(sum) + 10 <= limit) strcat(sum, " (partial)");
+    snprintf(msg, sizeof(msg), "%s: %s", r->name, sum);   // like 'neighbors summary', with the repeater's name in front
+  } else {
+    r->session = 0;
+    snprintf(msg, sizeof(msg), "%s: poll failed, no reply", r->name);
+  }
+  chanEnqueueSoon(msg);
+}
+
+// the decrypted answer of the repeater being polled: to the login, or to a neighbours request
+void MyMesh::pollOnResponse(int slot, const uint8_t* data, size_t len) {
+  if (poll_reps == NULL || slot < 0 || slot >= POLL_MAX_REPS || slot != poll_cur) return;
+  PollRep* r = &poll_reps[slot];
+  if (r->state == PS_WAIT_LOGIN) {
+    if (len < 8 || data[4] != RESP_SERVER_LOGIN_OK) return;
+    r->session = 1;
+    r->page = 0;
+    pollSendReq(r);
+    return;
+  }
+  if (r->state == PS_WAIT_REQ) {
+    uint32_t tag;
+    if (len < 8) return;
+    memcpy(&tag, data, 4);
+    if (tag != r->req_ts) return;   // not the answer to our request
+    uint16_t total = 0;
+    int got = pollParseNeighbours(r, data, len, getRTCClock()->getCurrentTime(), &total);
+    if (got < 0) return;
+    r->total = total;
+    r->page++;
+    if (got == POLL_PAGE_COUNT && r->page < POLL_MAX_PAGES && (unsigned)(r->page * POLL_PAGE_COUNT) < total) {
+      pollSendReq(r);   // a full page and more to get
+    } else {
+      pollFinish(r, true);
+    }
+  }
+}
+
+void MyMesh::pollService() {
+  if (poll_reps == NULL) return;
+  if (!pollEnabled()) {   // the channel key or the bot key went: stop
+    pollAbort();
+    return;
+  }
+  if (poll_cur >= 0) {
+    PollRep* r = &poll_reps[poll_cur];
+    if (r->state == PS_IDLE) {
+      poll_cur = -1;
+      return;
+    }
+    if (!millisHasNowPassed(r->deadline_ms)) return;
+    if (r->state == PS_WAIT_REQ && r->page > 0) {   // a later page did not come
+      if (!r->pretry) {
+        r->pretry = 1;      // ask for it once more, flooded
+        pollSendReq(r);
+      } else {
+        pollFinish(r, true);   // keep what arrived
+      }
+      return;
+    }
+    r->session = 0;
+    if (r->attempt == 0) {
+      r->attempt = 1;
+      pollSendLogin(r);   // second try: flooded
+    } else {
+      pollFinish(r, false);
+    }
+    return;
+  }
+  if (chan_q_n >= CHAN_Q_MAX - 1) return;   // the result must have room on the channel queue
+  if (poll_gap_on && millisHasNowPassed(poll_gap_until)) poll_gap_on = false;
+  int pick = -1;
+  for (int i = 0; i < POLL_MAX_REPS; i++) {
+    const PollRep& c = poll_reps[i];
+    if (!c.used || !c.pend || !millisHasNowPassed(c.due_ms)) continue;
+    if (c.pend == 1 && poll_gap_on) continue;   // an automatic poll waits out the gap after the last poll; a command does not
+    if (pick < 0 || (long)(c.due_ms - poll_reps[pick].due_ms) < 0) pick = i;
+  }
+  if (pick < 0) return;
+  PollRep* r = &poll_reps[pick];
+  r->pend = 0;
+  poll_cur = (int8_t)pick;
+  r->attempt = 0;
+  r->page = 0;
+  r->pretry = 0;
+  uint32_t rtc = getRTCClock()->getCurrentTime();
+  r->last_try = rtc;
+  // when an advert may start the next poll: a zero hop repeater after 24..36 hours (random), any other after 24 hours
+  r->next_ok = rtc + (r->hops == 0 ? (uint32_t)getRNG()->nextInt((int)POLL_ZERO_MIN_S, (int)POLL_ZERO_MAX_S + 1) : POLL_REPOLL_S);
+  pollBeginPoll(r);
+  self_id.calcSharedSecret(r->secret, r->pub);
+  if (r->session) pollSendReq(r);   // a login worked before: try without one (the repeater may still know us)
+  else pollSendLogin(r);
+}
+
+// "Polled 3: Tuna 1h, Hill 5h" (stale = false: repeaters that have been polled successfully, with the time since the last good
+// poll) or "Stale 2: Hill adv 20d poll 20d, Creek adv 3d poll never" (stale = true: selected repeaters with no good poll
+// for 14 days, with the time since their last advert). Packed into as many messages as the channel queue has room for.
+void MyMesh::pollListReply(bool stale) {
+  uint32_t now = getRTCClock()->getCurrentTime();
+  if (stale && now < CLOCK_VALID_AFTER) {
+    chanEnqueueSoon("Stale: clock not set");
+    return;
+  }
+  int prefix = (int)strlen(_prefs.node_name) + 2;
+  if (prefix > 39) prefix = 39;
+  const int budget = CHAN_MSG_MAX - prefix;
+  int count = 0;
+  for (int i = 0; i < POLL_MAX_REPS; i++) {
+    const PollRep& r = poll_reps[i];
+    if (r.used && (stale ? pollIsStale(&r, now, CLOCK_VALID_AFTER) : r.ok)) count++;
+  }
+  if (count == 0) {
+    chanEnqueueSoon(stale ? "No stale repeaters" : "No poll data");
+    return;
+  }
+  char cur[CHAN_MSG_MAX + 1];
+  int clen = snprintf(cur, sizeof(cur), stale ? "Stale %d:" : "Polled %d:", count);
+  int msgs_left = CHAN_Q_MAX - (int)chan_q_n - 1;
+  if (msgs_left < 1) msgs_left = 1;
+  int dropped = 0;
+  bool header = true;   // the message being built starts with the header
+  bool empty = true;    // and has no repeater in it yet
+  for (int i = 0; i < POLL_MAX_REPS; i++) {
+    const PollRep& r = poll_reps[i];
+    if (!r.used || !(stale ? pollIsStale(&r, now, CLOCK_VALID_AFTER) : r.ok)) continue;
+    char a1[12], a2[12], nm[POLL_NAME_MAX + 40];
+    pollAgeStr(a2, sizeof(a2), now, r.last_ok, CLOCK_VALID_AFTER);
+    int nl;
+    if (stale) {
+      pollAgeStr(a1, sizeof(a1), now, r.last_adv, CLOCK_VALID_AFTER);
+      nl = snprintf(nm, sizeof(nm), "%s adv %s poll %s", r.name, a1[0] ? a1 : "never", r.last_ok && a2[0] ? a2 : "never");
+    } else {
+      nl = snprintf(nm, sizeof(nm), "%s%s%s", r.name, a2[0] ? " " : "", a2);
+    }
+    if (nl >= (int)sizeof(nm)) nl = (int)sizeof(nm) - 1;
+    int sepl = empty ? (header ? 1 : 0) : 2;   // " " after the header, ", " between repeaters
+    if (!empty && clen + sepl + nl > budget) {   // message full: send it and carry on in the next, if the queue has room
+      if (msgs_left <= 1) {
+        dropped++;
+        continue;
+      }
+      chanEnqueueSoon(cur);
+      msgs_left--;
+      clen = 0;
+      cur[0] = 0;
+      header = false;
+      empty = true;
+      sepl = 0;
+    }
+    if (sepl == 1) {
+      cur[clen++] = ' ';
+    } else if (sepl == 2) {
+      cur[clen++] = ',';
+      cur[clen++] = ' ';
+    }
+    memcpy(&cur[clen], nm, nl);
+    clen += nl;
+    cur[clen] = 0;
+    empty = false;
+  }
+  if (dropped > 0) {
+    char more[16];
+    int ml = snprintf(more, sizeof(more), " (+%d more)", dropped);
+    if (clen + ml <= budget) memcpy(&cur[clen], more, ml + 1);
+  }
+  chanEnqueueSoon(cur);
+}
+
+// ---- the poll commands on the command channel (the text after "poll ") ----
+void MyMesh::pollChannelCommand(const char* args) {
+  if (!pollInitSeen() || !pollInitReps()) {
+    chanEnqueueSoon("poll: out of memory");
+    return;
+  }
+  while (*args == ' ') args++;
+  uint32_t now = getRTCClock()->getCurrentTime();
+  int prefix = (int)strlen(_prefs.node_name) + 2;
+  if (prefix > 39) prefix = 39;
+  const int budget = CHAN_MSG_MAX - prefix;
+  char msg[CHAN_MSG_MAX + 1];
+
+  if (strncmp(args, "snr ", 4) == 0) {   // <poll snr 2f1e all> or <poll snr 2f1e Tuna>: the last stored answers
+    const char* p = args + 4;
+    while (*p == ' ') p++;
+    char hex[8];
+    int hl = 0;
+    while (p[hl] && p[hl] != ' ' && hl < 7) {
+      hex[hl] = p[hl];
+      hl++;
+    }
+    hex[hl] = 0;
+    uint8_t key[3];
+    int klen = (p[hl] == ' ') ? parseHexId(hex, key) : 0;
+    p += hl;
+    while (*p == ' ') p++;
+    if (klen == 0 || *p == 0) {
+      chanEnqueueSoon("Err - poll snr <id> <all|name>, id is 2, 4 or 6 hex chars");
+      return;
+    }
+    bool to_all = pollNameEq(p, "all");
+    if (!to_all) {
+      int s = pollFindRepByName(poll_reps, POLL_MAX_REPS, p);
+      if (s < 0 || !poll_reps[s].ok) {
+        snprintf(msg, sizeof(msg), "%s: no poll data", p);
+        chanEnqueueSoon(msg);
+        return;
+      }
+      char txt[100];
+      pollSnrText(&poll_reps[s], key, klen, now, CLOCK_VALID_AFTER, txt, sizeof(txt));
+      snprintf(msg, sizeof(msg), "%s: %s", poll_reps[s].name, txt);
+      chanEnqueueSoon(msg);
+      return;
+    }
+    // all selected repeaters that have data: the ones that heard the id first, then the rest. As many to a message as fit.
+    char cur[CHAN_MSG_MAX + 1];
+    int clen = 0, shown = 0, dropped = 0;
+    int msgs_left = CHAN_Q_MAX - (int)chan_q_n - 1;
+    if (msgs_left < 1) msgs_left = 1;
+    cur[0] = 0;
+    for (int pass = 0; pass < 2; pass++) {
+      for (int i = 0; i < POLL_MAX_REPS; i++) {
+        const PollRep& r = poll_reps[i];
+        if (!r.used || !r.ok) continue;
+        char txt[100];
+        int kind = pollSnrText(&r, key, klen, now, CLOCK_VALID_AFTER, txt, sizeof(txt));
+        if ((pass == 0) != (kind == POLL_ANS_FOUND)) continue;
+        char item[CHAN_MSG_MAX + 1];
+        int il = snprintf(item, sizeof(item), "%s: %s", r.name, txt);
+        if (il >= (int)sizeof(item)) il = (int)sizeof(item) - 1;
+        if (il > budget) il = budget;
+        if (clen > 0 && clen + 3 + il > budget) {   // this message is full: send it and start the next, if the queue has room
+          if (msgs_left <= 1) {
+            dropped++;
+            continue;
+          }
+          chanEnqueueSoon(cur);
+          clen = 0;
+          cur[0] = 0;
+          msgs_left--;
+        }
+        if (clen > 0) {
+          memcpy(&cur[clen], " | ", 3);
+          clen += 3;
+        }
+        memcpy(&cur[clen], item, il);
+        clen += il;
+        cur[clen] = 0;
+        shown++;
+      }
+    }
+    if (shown == 0) {
+      chanEnqueueSoon("No poll data");
+      return;
+    }
+    if (dropped > 0) {
+      char more[16];
+      int ml = snprintf(more, sizeof(more), " (+%d more)", dropped);
+      if (clen + ml <= budget) {
+        memcpy(&cur[clen], more, ml + 1);
+        clen += ml;
+      }
+    }
+    chanEnqueueSoon(cur);
+    return;
+  }
+
+  if (strncmp(args, "repeaters ", 10) == 0) {   // <poll repeaters all> / <poll repeaters Tuna>: only repeaters polled successfully
+    const char* p = args + 10;
+    while (*p == ' ') p++;
+    if (*p == 0) {
+      chanEnqueueSoon("Err - poll repeaters <all|name>");
+      return;
+    }
+    if (pollNameEq(p, "all")) {
+      pollListReply(false);
+      return;
+    }
+    int s = pollFindRepByName(poll_reps, POLL_MAX_REPS, p);
+    if (s < 0 || !poll_reps[s].ok) {
+      snprintf(msg, sizeof(msg), "%s: no poll data", p);
+    } else {
+      const PollRep& r = poll_reps[s];
+      char age[12];
+      pollAgeStr(age, sizeof(age), now, r.last_ok, CLOCK_VALID_AFTER);
+      int n = r.total > r.nn ? r.total : r.nn;
+      snprintf(msg, sizeof(msg), "%s: %u hop%s%s%s%s, %d neighbours", r.name, (unsigned)(r.hops == 0xFF ? 0 : r.hops),
+               r.hops == 1 ? "" : "s", age[0] ? ", polled " : "", age, age[0] ? " ago" : "", n);
+    }
+    chanEnqueueSoon(msg);
+    return;
+  }
+
+  if (strcmp(args, "stale") == 0) {   // <poll stale>: selected repeaters with no good poll for 14 days or more
+    pollListReply(true);
+    return;
+  }
+
+  if (strncmp(args, "remove ", 7) == 0) {   // <poll remove Tuna>: unselect it and forget its data
+    const char* p = args + 7;
+    while (*p == ' ') p++;
+    int first = -1;
+    int n = *p ? pollMatchReps(poll_reps, p, &first) : 0;
+    if (n > 1) {
+      snprintf(msg, sizeof(msg), "%s: more than one repeater, use more of the key", p);
+    } else if (n == 0) {
+      snprintf(msg, sizeof(msg), "%s: not selected", p);
+    } else {
+      snprintf(msg, sizeof(msg), "OK - %s removed", poll_reps[first].name);
+      if (poll_cur == first) poll_cur = -1;
+      memset(&poll_reps[first], 0, sizeof(PollRep));
+    }
+    chanEnqueueSoon(msg);
+    return;
+  }
+
+  if (strncmp(args, "auto ", 5) == 0) {   // <poll auto on|off>: polling after adverts (polls told by a command are not affected)
+    const char* p = args + 5;
+    while (*p == ' ') p++;
+    if (pollNameEq(p, "on")) poll_auto = true;
+    else if (pollNameEq(p, "off")) poll_auto = false;
+    else {
+      chanEnqueueSoon("Err - poll auto on|off");
+      return;
+    }
+    chanEnqueueSoon(poll_auto ? "OK - poll auto on" : "OK - poll auto off");
+    return;
+  }
+
+  if (strncmp(args, "add ", 4) == 0) {   // <poll add Tuna> or <poll add 64-hex-key>: select it and poll it now
+    const char* p = args + 4;
+    while (*p == ' ') p++;
+    if (*p == 0) {
+      chanEnqueueSoon("Err - poll add <name|key>");
+      return;
+    }
+    uint8_t pub[32];
+    int slot = -1, seen_i = -1, first = -1;
+    int mn = pollMatchReps(poll_reps, p, &first);
+    if (mn > 1) {
+      snprintf(msg, sizeof(msg), "%s: more than one repeater, use more of the key", p);
+      chanEnqueueSoon(msg);
+      return;
+    }
+    if (mn == 1) {   // already selected
+      slot = first;
+    } else {
+      bool known = false;
+      if (strlen(p) == 64 && pollParseHex(p, pub, 32) == 32) {   // a full key: no advert needed
+        known = true;
+        seen_i = pollSeenFind(poll_seen, POLL_SEEN_MAX, pub);
+      } else {
+        int sn = pollMatchSeen(poll_seen, p, &first);   // a name or key start of a repeater whose advert was heard
+        if (sn > 1) {
+          snprintf(msg, sizeof(msg), "%s: more than one repeater, use more of the key", p);
+          chanEnqueueSoon(msg);
+          return;
+        }
+        if (sn == 1) {
+          memcpy(pub, poll_seen[first].pub, 32);
+          seen_i = first;
+          known = true;
+        }
+      }
+      if (!known) {
+        snprintf(msg, sizeof(msg), "%s: not heard, use the full 64 character key", p);
+        chanEnqueueSoon(msg);
+        return;
+      }
+      slot = pollFindRep(poll_reps, POLL_MAX_REPS, pub);   // a full key may be selected already
+    }
+    bool is_new = false;
+    if (slot < 0) {
+      slot = pollFreeSlot(poll_reps, POLL_MAX_REPS);
+      if (slot < 0) {   // never replaces a selected repeater
+        chanEnqueueSoon("poll: list full, remove one first");
+        return;
+      }
+      PollRep* n = &poll_reps[slot];
+      memset(n, 0, sizeof(PollRep));
+      n->used = 1;
+      memcpy(n->pub, pub, 32);
+      n->added = now;
+      n->hops = 0xFF;   // unknown until its advert is heard
+      n->out_len = POLL_OUT_UNKNOWN;
+      if (seen_i >= 0) {
+        strncpy(n->name, poll_seen[seen_i].name, POLL_NAME_MAX);
+        n->hops = poll_seen[seen_i].hops;
+        pollSetRoute(n, poll_seen[seen_i].out_len, poll_seen[seen_i].out_path);
+      } else {   // never heard: the start of the key stands in for the name
+        snprintf(n->name, sizeof(n->name), "%02X%02X%02X%02X", pub[0], pub[1], pub[2], pub[3]);
+      }
+      is_new = true;
+    }
+    if (!pollQueueNow(slot)) {
+      snprintf(msg, sizeof(msg), "%s: already polling", poll_reps[slot].name);
+    } else {
+      snprintf(msg, sizeof(msg), is_new ? "Added %s, polling..." : "Polling %s...", poll_reps[slot].name);
+    }
+    chanEnqueueSoon(msg);
+    return;
+  }
+
+  // <poll Tuna>: poll a selected repeater now, ignoring the timers (it counts as a poll for the timers)
+  if (*args == 0) {
+    chanEnqueueSoon("Err - poll add|remove <name|key>, poll <name>, poll snr <id> <all|name>, poll repeaters <all|name>, poll stale, poll auto on|off");
+    return;
+  }
+  int first = -1;
+  int n = pollMatchReps(poll_reps, args, &first);
+  if (n == 0) {
+    snprintf(msg, sizeof(msg), "%s: not selected, use poll add %s", args, args);
+  } else if (n > 1) {
+    snprintf(msg, sizeof(msg), "%s: more than one repeater, use more of the key", args);
+  } else if (!pollQueueNow(first)) {
+    snprintf(msg, sizeof(msg), "%s: already polling", poll_reps[first].name);
+  } else {
+    snprintf(msg, sizeof(msg), "Polling %s...", poll_reps[first].name);
+  }
+  chanEnqueueSoon(msg);
+}
+
+// A relayed "!snr 2F1E all" (or "!snr 2F1E Name"): the selected repeaters answer too. Their answers are added to the real
+// ones, in the same form, so the result reads as one list: found ones first, then "not heard". (relayDeliver calls this.)
+void MyMesh::pollRelayMerge() {
+  if (poll_reps == NULL || relay_unsent || relay_conflict) return;
+  if (strncmp(relay_line, "snr ", 4) != 0) return;
+  uint8_t key[3];
+  int klen = parseHexId(&relay_line[4], key);
+  if (klen == 0) return;
+  uint32_t now = getRTCClock()->getCurrentTime();
+  for (int pass = 0; pass < 2; pass++) {
+    for (int i = 0; i < POLL_MAX_REPS; i++) {
+      const PollRep& r = poll_reps[i];
+      if (!r.used || !r.ok) continue;
+      if (!relay_all && !pollNameEq(relay_target, r.name)) continue;
+      char txt[100];
+      int kind = pollSnrText(&r, key, klen, now, CLOCK_VALID_AFTER, txt, sizeof(txt));
+      if ((pass == 0) != (kind == POLL_ANS_FOUND)) continue;
+      bool dup = false;   // a repeater that answered itself is not added twice
+      for (int e = 0; e < relay_count; e++) {
+        if (pollNameEq(relay_ent[e].name, r.name)) dup = true;
+      }
+      if (dup) continue;
+      if (relay_count >= BOT_RELAY_REPLIES) {
+        if (relay_over < 255) relay_over++;
+        continue;
+      }
+      RelayEntry& en = relay_ent[relay_count++];
+      relayCopyCut(en.name, BOT_RELAY_NAME_MAX, r.name, (int)strlen(r.name));
+      relayCopyCut(en.text, BOT_RELAY_TEXT_MAX, txt, (int)strlen(txt));
+    }
+  }
+}
 
 int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
   int n = 0;
@@ -3807,6 +4490,17 @@ void MyMesh::handleChannelCommand(const char* text, uint32_t ts, int hops) {
   char buf[CHAN_MSG_MAX + 1];
   memcpy(buf, body + 1, inner);
   buf[inner] = 0;
+
+  if (strncmp(buf, "poll ", 5) == 0) {   // the poll bot: only a trail bot answers (the repeaters ignore it, it is not on their list).
+                                         // It is handled before the target check because the last word is the polled repeater.
+    if (!pollEnabled()) return;
+    if (ts <= last_cmd_ts) return;   // replayed or duplicate command
+    last_cmd_ts = ts;
+    int bl = inner;
+    while (bl > 0 && buf[bl - 1] == ' ') buf[--bl] = 0;
+    pollChannelCommand(buf + 5);
+    return;
+  }
 
   int cmd_len = -1;   // addressed to everyone, or to this repeater by name?
   bool to_all = endsWithTarget(buf, inner, "all", &cmd_len);
@@ -4737,7 +5431,7 @@ int MyMesh::remindDecide(bool radio_quiet, uint32_t* now_out) {
   in.cycle_active = cycle_active;
   in.rem_awake = rem_awake;
   in.queue_room = bot_ans_n < BOT_ANS_MAX;
-  in.queue_empty = bot_q_n == 0 && chan_q_n == 0 && !relay_active && !hasPendingWork();
+  in.queue_empty = bot_q_n == 0 && chan_q_n == 0 && !relay_active && poll_cur < 0 && !hasPendingWork();
   in.radio_quiet = radio_quiet;
   in.ms_to_wake = (long)((rem_awake ? rem_back_at : sleep_wake_at) - millis());
   if (sleeping && cycle_active && in.next_due != 0 && in.clock_ok && now + (uint32_t)REM_LEAD_S >= in.next_due)
@@ -4814,6 +5508,7 @@ void MyMesh::loop() {
   if (!sleeping) chanService();   // post queued channel messages while the radio is awake
   if (!sleeping) botService();    // post queued trail bot replies while the radio is awake
   if (!sleeping) relayService();  // trail bot relay: collect the replies, then queue the results
+  if (!sleeping) pollService();   // poll bot: start a due poll, wait for its answers, post the result
 
   // A packet leaves the send queue when its transmission STARTS, and the transmission takes seconds.
   // So after the last queued send, stay awake for a quiet period before the radio may go to sleep.
@@ -4834,7 +5529,7 @@ void MyMesh::loop() {
 
   // sleep (CLI: "sleep <mins>", "sleep until", or the sleep cycle): radio fully off, no RX/TX
   if (sleep_pending && millisHasNowPassed(sleep_start_at) && !hasPendingWork() && radio_quiet
-      && ((chan_q_n == 0 && bot_q_n == 0 && !relay_active) || millisHasNowPassed(sleep_deadline))) {
+      && ((chan_q_n == 0 && bot_q_n == 0 && !relay_active && poll_cur < 0) || millisHasNowPassed(sleep_deadline))) {
     sleep_pending = false;
     if (!(sleep_target_abs && millisHasNowPassed(sleep_target_at))) {   // (target already passed: nothing to sleep)
       radioSleep(sleep_duration_ms);
@@ -4878,7 +5573,7 @@ void MyMesh::loop() {
   }
   // end of an awake window: back to sleep (an admin login stops the cycle before this)
   if (cycle_active && !sleeping && !sleep_pending && !rem_awake && millisHasNowPassed(cycle_awake_until) && !hasPendingWork() && radio_quiet
-      && bot_q_n == 0 && !relay_active) {
+      && bot_q_n == 0 && !relay_active && poll_cur < 0) {
     radioSleep(CYCLE_SLEEP_MS);
     return;
   }
